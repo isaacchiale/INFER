@@ -1,0 +1,273 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Design system definition.
+ *
+ * The @theme inline block maps CSS custom properties to Tailwind utility
+ * classes (e.g. --color-primary -> bg-primary, text-primary).
+ *
+ * The :root and .dark blocks define the actual color values using oklch.
+ * All colors MUST use oklch format.
+ *
+ * To add a new semantic color:
+ * 1. Add the variable to :root (light value) and .dark (dark value)
+ * 2. Register it in @theme inline as --color-<name>: var(--<name>)
+ */
+
+@theme inline {
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  --color-route-normal: var(--route-normal);
+  --color-route-accessible: var(--route-accessible);
+  --color-route-emergency: var(--route-emergency);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-hazard: var(--hazard);
+  --color-verified: var(--verified);
+  --color-inferred: var(--inferred);
+  --color-invalid: var(--invalid);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-viewport: var(--viewport);
+  --color-viewport-grid: var(--viewport-grid);
+  --color-viewport-grid-strong: var(--viewport-grid-strong);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --radius-4xl: calc(var(--radius) + 16px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-ring-offset-background: var(--background);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+:root {
+  --radius: 0.375rem;
+  --background: oklch(0.995 0.001 247);
+  --foreground: oklch(0.21 0.015 250);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.21 0.015 250);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.21 0.015 250);
+  --primary: oklch(0.52 0.13 255);
+  --primary-foreground: oklch(0.99 0.002 247);
+  --secondary: oklch(0.955 0.004 247);
+  --secondary-foreground: oklch(0.3 0.015 250);
+  --muted: oklch(0.958 0.004 247);
+  --muted-foreground: oklch(0.47 0.014 253);
+  --accent: oklch(0.955 0.012 255);
+  --accent-foreground: oklch(0.36 0.09 255);
+  --destructive: oklch(0.52 0.19 27);
+  --destructive-foreground: oklch(0.99 0.002 247);
+  --border: oklch(0.925 0.004 250);
+  --input: oklch(0.895 0.006 250);
+  --ring: oklch(0.52 0.13 255);
+
+  --surface: oklch(0.975 0.003 247);
+  --surface-raised: oklch(1 0 0);
+  /* Viewport stays graphite-dark in both themes (CAD/GeoBIM readability) */
+  --viewport: oklch(0.1854 0.0052 248.1);
+  --viewport-grid: oklch(0.2958 0.0084 255.6);
+  --viewport-grid-strong: oklch(0.3388 0.0103 254);
+
+  --route-normal: oklch(0.5 0.11 232);
+  --route-accessible: oklch(0.52 0.1 175);
+  --route-emergency: oklch(0.56 0.19 32);
+  --warning: oklch(0.65 0.13 78);
+  --warning-foreground: oklch(0.32 0.08 78);
+  --hazard: oklch(0.55 0.2 22);
+  --verified: oklch(0.5 0.1 160);
+  --inferred: oklch(0.58 0.11 88);
+  --invalid: oklch(0.52 0.19 27);
+
+  --chart-1: oklch(0.5 0.11 232);
+  --chart-2: oklch(0.52 0.1 175);
+  --chart-3: oklch(0.58 0.11 88);
+  --chart-4: oklch(0.56 0.19 32);
+  --chart-5: oklch(0.47 0.014 253);
+  --sidebar: oklch(0.97 0.003 247);
+  --sidebar-foreground: oklch(0.28 0.015 250);
+  --sidebar-primary: oklch(0.47 0.09 232);
+  --sidebar-primary-foreground: oklch(0.99 0.002 247);
+  --sidebar-accent: oklch(0.93 0.012 232);
+  --sidebar-accent-foreground: oklch(0.34 0.05 232);
+  --sidebar-border: oklch(0.9 0.006 250);
+  --sidebar-ring: oklch(0.47 0.09 232);
+}
+
+
+.dark {
+  /* Neutral graphite — no blue cast */
+  --background: oklch(0.1763 0.0052 248.1);
+  --foreground: oklch(0.9637 0.0017 247.8);
+  --card: oklch(0.2033 0.0051 248.1);
+  --card-foreground: oklch(0.9637 0.0017 247.8);
+  --popover: oklch(0.2033 0.0051 248.1);
+  --popover-foreground: oklch(0.9637 0.0017 247.8);
+  --primary: oklch(0.72 0.035 250);
+  --primary-foreground: oklch(0.1763 0.0052 248.1);
+  --secondary: oklch(0.2332 0.0073 248.1);
+  --secondary-foreground: oklch(0.9637 0.0017 247.8);
+  --muted: oklch(0.2332 0.0073 248.1);
+  --muted-foreground: oklch(0.7128 0.0123 252.1);
+  --accent: oklch(0.2732 0.0092 248.1);
+  --accent-foreground: oklch(0.9637 0.0017 247.8);
+  --destructive: oklch(0.62 0.18 27);
+  --destructive-foreground: oklch(0.98 0.002 247);
+  --border: oklch(0.2948 0.0092 248.1);
+  --input: oklch(0.3348 0.0092 248.1);
+  --ring: oklch(0.55 0.02 250);
+  --surface: oklch(0.2033 0.0051 248.1);
+  --surface-raised: oklch(0.2332 0.0073 248.1);
+  --viewport: oklch(0.1854 0.0052 248.1);
+  --viewport-grid: oklch(0.2958 0.0084 255.6);
+  --viewport-grid-strong: oklch(0.3388 0.0103 254);
+  --route-normal: oklch(0.7 0.11 232);
+  --route-accessible: oklch(0.72 0.1 175);
+  --route-emergency: oklch(0.68 0.17 32);
+  --warning: oklch(0.78 0.12 78);
+  --warning-foreground: oklch(0.86 0.1 78);
+  --hazard: oklch(0.66 0.18 22);
+  --verified: oklch(0.7 0.1 160);
+  --inferred: oklch(0.76 0.1 88);
+  --invalid: oklch(0.66 0.17 27);
+  --chart-1: oklch(0.7 0.11 232);
+  --chart-2: oklch(0.72 0.1 175);
+  --chart-3: oklch(0.76 0.1 88);
+  --chart-4: oklch(0.68 0.17 32);
+  --chart-5: oklch(0.7128 0.0123 252.1);
+  --sidebar: oklch(0.2033 0.0051 248.1);
+  --sidebar-foreground: oklch(0.9637 0.0017 247.8);
+  --sidebar-primary: oklch(0.72 0.035 250);
+  --sidebar-primary-foreground: oklch(0.1763 0.0052 248.1);
+  --sidebar-accent: oklch(0.2732 0.0092 248.1);
+  --sidebar-accent-foreground: oklch(0.9637 0.0017 247.8);
+  --sidebar-border: oklch(0.2948 0.0092 248.1);
+  --sidebar-ring: oklch(0.55 0.02 250);
+}
+
+/*
+ * Scope for chrome that sits directly on the (always dark) 3D viewport:
+ * floating controls inherit graphite tokens in light mode too.
+ */
+.viewport-dark {
+  --background: oklch(0.1854 0.0052 248.1);
+  --foreground: oklch(0.9637 0.0017 247.8);
+  --card: oklch(0.2033 0.0051 248.1);
+  --card-foreground: oklch(0.9637 0.0017 247.8);
+  --popover: oklch(0.2033 0.0051 248.1);
+  --popover-foreground: oklch(0.9637 0.0017 247.8);
+  --muted: oklch(0.2332 0.0073 248.1);
+  --muted-foreground: oklch(0.7128 0.0123 252.1);
+  --accent: oklch(0.2732 0.0092 248.1);
+  --accent-foreground: oklch(0.9637 0.0017 247.8);
+  --border: oklch(0.2948 0.0092 248.1);
+  --input: oklch(0.3348 0.0092 248.1);
+  --route-normal: oklch(0.7 0.11 232);
+  --route-accessible: oklch(0.72 0.1 175);
+  --route-emergency: oklch(0.68 0.17 32);
+  --hazard: oklch(0.66 0.18 22);
+  --verified: oklch(0.7 0.1 160);
+  --inferred: oklch(0.76 0.1 88);
+  --invalid: oklch(0.66 0.17 27);
+  --warning: oklch(0.78 0.12 78);
+  color: var(--foreground);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv05", "ss01";
+    -webkit-font-smoothing: antialiased;
+    font-size: 13px;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+}
+
+@utility infer-grid {
+  background-image:
+    linear-gradient(to right, color-mix(in oklab, var(--color-foreground) 7%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in oklab, var(--color-foreground) 7%, transparent) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+@utility label-caps {
+  font-size: 0.6875rem;
+  line-height: 1rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+@utility hazard-pulse {
+  animation: hazard-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes hazard-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+

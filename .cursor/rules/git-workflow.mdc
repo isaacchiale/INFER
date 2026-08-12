@@ -1,0 +1,54 @@
+---
+description: Proactive git commit/branch/merge suggestions with user permission
+alwaysApply: true
+---
+
+# Git workflow (Isaac)
+
+Isaac is learning git. The agent must coach the process, not run ahead of it.
+
+## Hard rules
+
+- Never `git init`, commit, branch, merge, rebase, or push unless Isaac explicitly approves that action in the current turn.
+- Never amend, force-push, or skip hooks unless Isaac explicitly asks.
+- Do not update git config.
+
+## Proactive suggestions (required)
+
+After meaningful progress, the agent SHOULD briefly suggest the next git action and ask permission. Do not wait for Isaac to remember.
+
+### Suggest a commit when
+
+- A coherent slice is done (e.g. route API works, blockage overlay done, FE graph viz wired)
+- OpenSpec change tasks for a vertical are complete / about to archive
+- Risk of losing work (large refactor mid-flight, before a risky experiment)
+- `.gitignore` or project scaffolding was just fixed and a clean baseline is useful
+
+Ask like: “Good checkpoint — commit X? Proposed message: …”
+
+### Suggest a branch when
+
+- Work is experimental or likely to be reverted
+- Parallel tracks would collide (e.g. route-engine vs FE redesign)
+- About to start a multi-commit feature that shouldn’t sit half-done on `main`/`master`
+
+Ask like: “This looks like a feature branch (`route-engine`). Create it and work there?”
+
+### Suggest merge back to main when
+
+- Feature branch goals are met and build/tests look healthy
+- Isaac wants a stable baseline before the next topic
+- OpenSpec change is implemented and ready to archive
+
+Ask like: “`route-engine` looks ready — merge into `main`?”
+
+## Defaults for this POC
+
+- Early on, commits on `main`/`master` are fine for small sequential work.
+- Prefer branches for multi-file features spanning more than one session or risky refactors.
+- Keep commits focused; message = why (1–2 sentences).
+- Never stage secrets, `.env`, `data/` IFCs, `node_modules/`, `.venv/`.
+
+## Teaching tone
+
+When performing an approved git step, say in one short line what happened (e.g. “Created commit on `main`; snapshot saved locally only”).

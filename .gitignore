@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node (if a frontend is ever re-added locally)
+node_modules/
+dist/
+dist-ssr/
+*.local
+npm-debug.log*
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Logs
+logs/
+*.log
+
+# Local IFC uploads / derived artifacts (repo root only)
+/data/
+
+# Disposable local backups
+_fe_assets_backup/
+
+# Cursor (keep shared project rules)
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**

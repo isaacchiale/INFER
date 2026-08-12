@@ -1,0 +1,1 @@
+"""INFER FastAPI application package."""

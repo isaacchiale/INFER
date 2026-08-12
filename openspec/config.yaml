@@ -1,0 +1,54 @@
+schema: spec-driven
+
+# Included in every OpenSpec request. Full constitution: openspec/project.md
+# Decision record: docs/stack-research.md
+context: |
+  Project: INFER (Intelligent Navigation and Facility Environment Reasoning)
+  POC internship Aug-Dec 2026. IFC indoor navigation: extract, graph, route, readiness.
+
+  Architecture (updated 2026-08-06):
+  - This repo owns the BACKEND only (Python FastAPI + ifcopenshell planned).
+  - Frontend is developed ELSEWHERE; wire up later via HTTP API (CORS for local dev).
+  - Vite web-shell in this repo was discarded / superseded.
+
+  Backend direction:
+  - FastAPI (Python 3.11+)
+  - IFC semantic extract with ifcopenshell
+  - Normalised indoor schema (JSON)
+  - Space-door-vertical navigation graph
+  - Routing, dynamic blockages, readiness report APIs
+  - Local filesystem storage for uploaded/processed models (on-prem only)
+
+  Security non-negotiables (government):
+  - IFC stays on-prem; no cloud/SaaS or public LLM APIs for model content
+  - No Autodesk APS/Forge; avoid xeokit (AGPL) unless licensed
+  - Prefer MIT/MPL/LGPL with legal review
+  - AI product inferences labelled inferred + deterministic validation
+  - Never silently modify source IFC; nav entity <-> IFC GUID traceability
+  - Bind API to localhost by default for POC; document CORS allowlist
+
+  Completed: setup-backend, ifc-ingest-extract, temp-fe-backend-bridge.
+  Temporary frontend under frontend/ (modular, disposable).
+  Next: connectivity-graph API, then routing.
+
+rules:
+  proposal:
+    - This repo is backend-focused; do not scaffold a competing frontend unless asked
+    - Include Non-goals (no cloud IFC upload, no APS)
+    - Call out security implications for any new dependency
+  design:
+    - Prefer modular interfaces for IFC extract and routing engines
+    - Prefer MIT/MPL/LGPL; flag AGPL or proprietary SaaS
+    - Design HTTP APIs the external frontend can consume later
+  tasks:
+    - Keep tasks small and testable
+    - Include deterministic validation steps for any AI-assisted product features
+
+operations:
+  apply:
+    guidance:
+      - Do not add analytics, telemetry, or network calls that transmit IFC to third parties
+      - Default to localhost bind; no public exposure without explicit config
+  archive:
+    guidance:
+      - Summarize security-relevant decisions in the archive notes

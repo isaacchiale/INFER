@@ -1,0 +1,133 @@
+import { useRef, useState } from "react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
+import { cn } from "@/lib/utils";
+import { useInfer } from "@/state/infer-store";
+import { toast } from "sonner";
+
+const ACCEPT = [".ifc", ".ifczip"];
+
+export function IngestDialog() {
+  const { ingestOpen, setIngestOpen, queueIfcFile } = useInfer();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [dragging, setDragging] = useState(false);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const reset = () => {
+    setFileName(null);
+    setProgress(0);
+    setError(null);
+    setDragging(false);
+    setLoading(false);
+  };
+
+  const start = async (file: File) => {
+    const ok = ACCEPT.some((ext) => file.name.toLowerCase().endsWith(ext));
+    if (!ok) {
+      setFileName(file.name);
+      setProgress(0);
+      setError("Unsupported file. Use .ifc or .ifczip.");
+      return;
+    }
+
+    setError(null);
+    setFileName(file.name);
+    setLoading(true);
+    setProgress(15);
+
+    try {
+      setProgress(45);
+      await queueIfcFile(file);
+      setProgress(100);
+      toast.success(`Queued ${file.name} for 3D viewer`);
+      window.setTimeout(() => {
+        setIngestOpen(false);
+        reset();
+      }, 350);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to read IFC file");
+      setProgress(0);
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Dialog
+      open={ingestOpen}
+      onOpenChange={(v) => {
+        setIngestOpen(v);
+        if (!v) reset();
+      }}
+    >
+      <DialogContent className="max-w-md gap-4 rounded-[8px]">
+        <DialogHeader>
+          <DialogTitle className="text-[15px] font-semibold">Open model</DialogTitle>
+        </DialogHeader>
+
+        {fileName && !error ? (
+          <div className="space-y-3 py-2">
+            <p className="truncate text-[13px] text-foreground">{fileName}</p>
+            <Progress value={progress} className="h-1" aria-label="Load progress" />
+            <div className="flex items-center justify-between">
+              <span className="text-[12px] text-muted-foreground">
+                {loading ? "Sending to 3D viewer…" : `${progress}%`}
+              </span>
+              <Button size="sm" variant="ghost" className="h-7 rounded-[5px] text-[12px]" onClick={reset}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragging(true);
+            }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragging(false);
+              const file = e.dataTransfer.files?.[0];
+              if (file) void start(file);
+            }}
+            className={cn(
+              "flex flex-col items-center justify-center gap-3 rounded-[6px] border border-dashed border-border px-6 py-12 text-center transition-colors duration-150",
+              dragging && "border-primary bg-accent/40",
+            )}
+          >
+            <p className="text-[13px] text-muted-foreground">Drop IFC here</p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 rounded-[5px] text-[13px]"
+              onClick={() => inputRef.current?.click()}
+            >
+              Choose file
+            </Button>
+            {error && <p className="text-[12px] text-destructive">{error}</p>}
+          </div>
+        )}
+
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".ifc,.ifczip"
+          className="sr-only"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) void start(file);
+            e.target.value = "";
+          }}
+        />
+
+        <p className="text-[11px] text-muted-foreground">
+          Uses That Open / web-ifc in the browser. .ifc · .ifczip
+        </p>
+      </DialogContent>
+    </Dialog>
+  );
+}
