@@ -3,13 +3,13 @@
  * Same discipline as That Open: wait for a non-zero container, own resize,
  * destroy once — do not recreate on every React state tick.
  *
- * Initial framing: bake scale/translate into preset positions so zoom=1
- * already fills the pane (cy.fit has been unreliable in the split layout).
+ * Framing preserves a minimum node margin; large graphs overflow the pane
+ * and are explored via pan/zoom instead of being squeezed until nodes collide.
  */
 
 import type { Core, ElementDefinition, StylesheetJson } from "cytoscape";
 import type { GraphLayout, GraphThemePalette } from "@/lib/graph-layout";
-import { graphPalette } from "@/lib/graph-layout";
+import { graphPalette, LAYOUT_NODE_W } from "@/lib/graph-layout";
 
 export type CytoscapeRuntime = {
   setLayout: (layout: GraphLayout) => void;
@@ -21,6 +21,9 @@ export type CytoscapeRuntime = {
   onSpaceTap: (handler: (nodeId: string) => void) => void;
 };
 
+/** Minimum center-to-center spacing in screen pixels after framing. */
+const MIN_NODE_MARGIN_PX = LAYOUT_NODE_W + 28;
+
 function stylesheet(p: GraphThemePalette): StylesheetJson {
   return [
     {
@@ -30,14 +33,15 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
         "text-valign": "center",
         "text-halign": "center",
         "font-size": 11,
-        color: p.nodeLabel,
-        "background-color": "#60a5fa",
-        "border-width": 2,
-        "border-color": p.nodeBorder,
+        "text-wrap": "wrap",
+        "text-max-width": "70",
+        "background-color": p.spaceFill,
+        color: p.spaceLabel,
+        "border-width": 1.5,
+        "border-color": p.spaceBorder,
         width: 64,
         height: 64,
-        "text-wrap": "wrap",
-        "text-max-width": "90",
+        "z-index": 10,
       },
     },
     {
@@ -55,12 +59,15 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
         height: 1,
         "text-margin-x": 6,
         events: "no",
+        "z-index": 5,
       },
     },
     {
       selector: 'node[kind = "space"]',
       style: {
-        "background-color": "data(color)",
+        "background-color": p.spaceFill,
+        color: p.spaceLabel,
+        "border-color": p.spaceBorder,
         width: 64,
         height: 64,
       },
@@ -69,27 +76,36 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       selector: 'node[kind = "stair"], node[kind = "lift"]',
       style: {
         shape: "round-rectangle",
-        "background-color": "data(color)",
-        color: "#ffffff",
+        "background-color": p.portalFill,
+        color: p.portalLabel,
+        "border-color": p.portalBorder,
+        "border-width": 1.5,
         width: 80,
         height: 44,
+        "font-size": 10,
       },
     },
     {
       selector: "node[onPath = 1]",
       style: {
-        "border-width": 4,
-        "border-color": p.path,
+        "border-width": 5,
+        "border-color": p.pathNode,
+        "underlay-color": p.pathUnderlay,
+        "underlay-padding": 7,
+        "underlay-opacity": 0.35,
+        "underlay-shape": "ellipse",
+        "z-index": 50,
       },
     },
     {
       selector: "edge",
       style: {
-        width: 2,
+        width: 1.5,
         "line-color": p.edge,
         "curve-style": "bezier",
         "target-arrow-shape": "none",
-        opacity: 0.85,
+        opacity: p.edgeOpacity,
+        "z-index": 1,
       },
     },
     {
@@ -97,7 +113,9 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       style: {
         "line-style": "dashed",
         "line-color": p.vertical,
-        width: 2.5,
+        width: 1.25,
+        opacity: p.verticalOpacity,
+        "z-index": 1,
       },
     },
     {
@@ -113,20 +131,22 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
   ];
 }
 
-type Frame = { scaleX: number; scaleY: number; ox: number; oy: number };
+type Frame = { scale: number; ox: number; oy: number };
 
-/** Map layout coords into the container so the graph fills width AND height at zoom=1. */
+/**
+ * Uniform scale that fits when possible, but never shrinks below
+ * MIN_NODE_MARGIN_PX center spacing (graph may overflow → pan/zoom).
+ */
 function frameForContainer(
   layout: GraphLayout,
   containerW: number,
   containerH: number,
-  padding = 28,
+  padding = 32,
 ): Frame {
   const content = layout.nodes.filter((n) => n.kind !== "label");
-  // Prefer rooms/portals for framing, but fall back to all nodes.
   const use = content.length ? content : layout.nodes;
   if (!use.length || containerW < 4 || containerH < 4) {
-    return { scaleX: 1, scaleY: 1, ox: 0, oy: 0 };
+    return { scale: 1, ox: 0, oy: 0 };
   }
 
   let minX = Infinity;
@@ -141,21 +161,27 @@ function frameForContainer(
   }
   const bw = Math.max(maxX - minX, 1);
   const bh = Math.max(maxY - minY, 1);
-  // Independent axes so a tall storey stack still uses the full pane width.
-  const scaleX = (containerW - padding * 2) / bw;
-  const scaleY = (containerH - padding * 2) / bh;
-  const ox = padding - scaleX * minX;
-  const oy = padding - scaleY * minY;
-  return { scaleX, scaleY, ox, oy };
+
+  const fitScale = Math.min((containerW - padding * 2) / bw, (containerH - padding * 2) / bh);
+  const cell = Math.min(layout.cellW || LAYOUT_NODE_W + 56, layout.cellH || LAYOUT_NODE_W + 48);
+  const minScaleForSpacing = MIN_NODE_MARGIN_PX / cell;
+  // Prefer readable spacing over forcing everything into the pane.
+  const scale = Math.max(fitScale, minScaleForSpacing);
+
+  const contentW = bw * scale;
+  const contentH = bh * scale;
+  const ox = (containerW - contentW) / 2 - scale * minX;
+  const oy = (containerH - contentH) / 2 - scale * minY;
+  return { scale, ox, oy };
 }
 
 export function layoutToCyElements(
   layout: GraphLayout,
-  frame: Frame = { scaleX: 1, scaleY: 1, ox: 0, oy: 0 },
+  frame: Frame = { scale: 1, ox: 0, oy: 0 },
 ): ElementDefinition[] {
   const elements: ElementDefinition[] = [];
   const seen = new Set<string>();
-  const { scaleX, scaleY, ox, oy } = frame;
+  const { scale, ox, oy } = frame;
 
   for (const node of layout.nodes) {
     if (seen.has(node.id)) continue;
@@ -168,10 +194,9 @@ export function layoutToCyElements(
         id: node.id,
         label: node.label,
         kind: node.kind,
-        color: node.color === "transparent" ? "#000000" : node.color,
         onPath: 0,
       },
-      position: { x: ox + scaleX * cx, y: oy + scaleY * cy },
+      position: { x: ox + scale * cx, y: oy + scale * cy },
       selectable: node.kind === "space",
       grabbable: false,
     });
@@ -196,7 +221,6 @@ export function layoutToCyElements(
 }
 
 function waitForSize(el: HTMLElement, timeoutMs = 4000): Promise<void> {
-  // Prefer a real pane size, not the old min-h 200px trap.
   const ready = () => el.clientWidth > 80 && el.clientHeight > 120;
   if (ready()) return Promise.resolve();
   return new Promise((resolve) => {
@@ -237,15 +261,16 @@ export async function createCytoscapeRuntime(
   const mod = await import("cytoscape");
   const cytoscape = mod.default;
   const palette = graphPalette(theme);
+  container.style.background = palette.bg;
 
   const cy: Core = cytoscape({
     container,
     elements: [],
     layout: { name: "preset", fit: false },
     style: stylesheet(palette),
-    minZoom: 0.2,
-    maxZoom: 8,
-    wheelSensitivity: 1.4,
+    minZoom: 0.15,
+    maxZoom: 6,
+    wheelSensitivity: 1.2,
     boxSelectionEnabled: false,
     autoungrabify: true,
     pixelRatio: "auto",
@@ -271,7 +296,7 @@ export async function createCytoscapeRuntime(
     const w = Math.max(container.clientWidth, 1);
     const h = Math.max(container.clientHeight, 1);
     lastWh = { w, h };
-    const frame = frameForContainer(layout, w, h, 24);
+    const frame = frameForContainer(layout, w, h, 32);
     const elements = layoutToCyElements(layout, frame);
 
     suppressViewFlag = true;
@@ -299,7 +324,6 @@ export async function createCytoscapeRuntime(
         lastWh = { w, h };
         return;
       }
-      // Pane grew/shrunk (split drag or flex finally resolving) — always re-fill.
       if (Math.abs(w - lastWh.w) > 4 || Math.abs(h - lastWh.h) > 4) {
         lastWh = { w, h };
         userAdjustedView = false;
@@ -329,7 +353,6 @@ export async function createCytoscapeRuntime(
         cy.elements().remove();
         return;
       }
-      // Wait a frame so the panel has its real size after ingest / split settle.
       requestAnimationFrame(() => {
         cy.resize();
         applyLayoutToCy(layout);
@@ -369,8 +392,9 @@ export async function createCytoscapeRuntime(
       });
     },
     setTheme(next) {
-      cy.style().fromJson(stylesheet(graphPalette(next))).update();
-      container.style.background = graphPalette(next).bg;
+      const p = graphPalette(next);
+      cy.style().fromJson(stylesheet(p)).update();
+      container.style.background = p.bg;
     },
     resize,
     fit() {
