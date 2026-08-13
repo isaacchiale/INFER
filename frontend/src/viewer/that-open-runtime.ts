@@ -17,6 +17,9 @@ export async function createThatOpenRuntime(
   container: HTMLElement,
   onStatus?: StatusFn,
 ): Promise<ThatOpenRuntime> {
+  // WebGL fails if the canvas is created at 0×0 (common in split panes).
+  await waitForSize(container);
+
   const OBC = await import("@thatopen/components");
 
   const components = new OBC.Components();
@@ -68,6 +71,18 @@ export async function createThatOpenRuntime(
     },
   });
 
+  const resize = () => {
+    try {
+      world.renderer?.resize();
+    } catch {
+      /* ignore */
+    }
+  };
+  const ro = new ResizeObserver(() => resize());
+  ro.observe(container);
+  window.addEventListener("resize", resize);
+  resize();
+
   onStatus?.("3D viewer ready.", "info");
 
   const clear = async () => {
@@ -81,6 +96,7 @@ export async function createThatOpenRuntime(
     async loadBuffer(buffer, name) {
       onStatus?.(`Loading ${name} in 3D…`, "loading");
       await clear();
+      resize();
       await ifcLoader.load(buffer, false, name, {
         processData: {
           progressCallback: (value: number) => {
@@ -91,9 +107,12 @@ export async function createThatOpenRuntime(
           },
         },
       });
+      resize();
       onStatus?.(`3D view loaded: ${name}`, "info");
     },
     dispose() {
+      window.removeEventListener("resize", resize);
+      ro.disconnect();
       try {
         components.dispose();
       } catch {
@@ -101,4 +120,32 @@ export async function createThatOpenRuntime(
       }
     },
   };
+}
+
+function waitForSize(el: HTMLElement, timeoutMs = 4000): Promise<void> {
+  if (el.clientWidth > 1 && el.clientHeight > 1) return Promise.resolve();
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const ro = new ResizeObserver(() => {
+      if (el.clientWidth > 1 && el.clientHeight > 1) {
+        ro.disconnect();
+        resolve();
+      }
+    });
+    ro.observe(el);
+    const tick = () => {
+      if (el.clientWidth > 1 && el.clientHeight > 1) {
+        ro.disconnect();
+        resolve();
+        return;
+      }
+      if (Date.now() - started > timeoutMs) {
+        ro.disconnect();
+        resolve();
+        return;
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
 }

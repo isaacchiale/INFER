@@ -146,50 +146,51 @@ def build_connectivity_graph(model_id: str, ifc_file_path: str) -> ConnectivityG
         )
         boundary_linked_doors.add(door_gid)
 
-    for door_gid, storey in doors:
-        if door_gid in boundary_linked_doors:
+    # Doors without space boundaries: do NOT link to every space on the storey
+    # (that caused tens of thousands of edges). Leave them as isolated portal
+    # nodes until a better adjacency heuristic is available.
+
+    # Weak same-storey circulation: chain spaces on each storey by name so
+    # rooms remain reachable when IFC space boundaries are missing.
+    for storey, space_ids in spaces_by_storey.items():
+        if not storey or len(space_ids) < 2:
             continue
-        door_id = _node_id("door", door_gid)
-        for space_id in spaces_by_storey.get(storey, []):
-            space_gid = nodes[space_id].global_id
-            edge_id = f"space_door:{space_gid}:{door_gid}:fallback"
+        ordered = sorted(space_ids, key=lambda sid: (nodes[sid].name or nodes[sid].global_id).lower())
+        for left, right in zip(ordered, ordered[1:]):
+            edge_id = f"space_chain:{nodes[left].global_id}:{nodes[right].global_id}"
             add_edge(
                 GraphEdge(
                     id=edge_id,
                     kind="space_door",
-                    source=space_id,
-                    target=door_id,
-                    global_id=door_gid,
+                    source=left,
+                    target=right,
                     method="same_storey_fallback",
                     bidirectional=True,
                 )
             )
 
     storeys_with_spaces = [s for s in spaces_by_storey.keys() if s]
-    vertical_nodes = [
-        n for n in nodes.values() if n.kind in ("stair", "lift")
-    ]
+    vertical_nodes = [n for n in nodes.values() if n.kind in ("stair", "lift")]
+
+    # Star topology through the vertical hub: every space on a storey links to
+    # each stair/lift so multi-storey routes do not depend on a single hub room.
     for vertical in vertical_nodes:
-        # Star-link spaces across storeys through the vertical connector.
-        for i, storey_a in enumerate(storeys_with_spaces):
-            for storey_b in storeys_with_spaces[i + 1 :]:
-                for space_a in spaces_by_storey.get(storey_a, []):
-                    for space_b in spaces_by_storey.get(storey_b, []):
-                        edge_id = (
-                            f"vertical:{vertical.global_id}:"
-                            f"{nodes[space_a].global_id}:{nodes[space_b].global_id}"
-                        )
-                        add_edge(
-                            GraphEdge(
-                                id=edge_id,
-                                kind="vertical",
-                                source=space_a,
-                                target=space_b,
-                                global_id=vertical.global_id,
-                                method="vertical_storey_link",
-                                bidirectional=True,
-                            )
-                        )
+        for storey in storeys_with_spaces:
+            for space_id in spaces_by_storey.get(storey) or []:
+                edge_id = (
+                    f"vertical:{vertical.global_id}:{nodes[space_id].global_id}"
+                )
+                add_edge(
+                    GraphEdge(
+                        id=edge_id,
+                        kind="vertical",
+                        source=space_id,
+                        target=vertical.id,
+                        global_id=vertical.global_id,
+                        method="vertical_storey_link",
+                        bidirectional=True,
+                    )
+                )
 
     return ConnectivityGraph(
         model_id=model_id,

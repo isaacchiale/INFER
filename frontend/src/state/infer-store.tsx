@@ -16,6 +16,8 @@ import type {
   RouteRestriction,
   ScenarioCondition,
 } from "@/types/infer";
+import type { ConnectivityGraph } from "@/types/graph";
+import type { EntitiesExtract } from "@/api/models";
 
 export type WorkMode = "model" | "navigate" | "layers" | "validate" | "scenario";
 
@@ -94,6 +96,18 @@ interface InferState {
   viewerStatus: string;
   setViewerStatus: (message: string, kind?: "info" | "error" | "loading") => void;
   viewerStatusKind: "info" | "error" | "loading";
+
+  // Backend model + connectivity graph (null graph ⇒ demo fallback in viewer)
+  backendModelId: string | null;
+  connectivityGraph: ConnectivityGraph | null;
+  entitiesExtract: EntitiesExtract | null;
+  graphSource: "demo" | "model" | "none";
+  setModelGraph: (payload: {
+    modelId: string;
+    graph: ConnectivityGraph;
+    entities: EntitiesExtract;
+  }) => void;
+  clearModelGraph: () => void;
 }
 
 const Ctx = createContext<InferState | null>(null);
@@ -129,6 +143,9 @@ export function InferProvider({ children }: { children: ReactNode }) {
   const [viewerStatusKind, setViewerStatusKind] = useState<"info" | "error" | "loading">(
     "info",
   );
+  const [backendModelId, setBackendModelId] = useState<string | null>(null);
+  const [connectivityGraph, setConnectivityGraph] = useState<ConnectivityGraph | null>(null);
+  const [entitiesExtract, setEntitiesExtract] = useState<EntitiesExtract | null>(null);
   const removedRef = useRef<ScenarioCondition | null>(null);
 
   const queueIfcFile = useCallback(async (file: File) => {
@@ -137,6 +154,21 @@ export function InferProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const clearPendingIfc = useCallback(() => setPendingIfc(null), []);
+
+  const setModelGraph = useCallback(
+    (payload: { modelId: string; graph: ConnectivityGraph; entities: EntitiesExtract }) => {
+      setBackendModelId(payload.modelId);
+      setConnectivityGraph(payload.graph);
+      setEntitiesExtract(payload.entities);
+    },
+    [],
+  );
+
+  const clearModelGraph = useCallback(() => {
+    setBackendModelId(null);
+    setConnectivityGraph(null);
+    setEntitiesExtract(null);
+  }, []);
 
   const setViewerStatus = useCallback(
     (message: string, kind: "info" | "error" | "loading" = "info") => {
@@ -259,6 +291,12 @@ export function InferProvider({ children }: { children: ReactNode }) {
       viewerStatus,
       setViewerStatus,
       viewerStatusKind,
+      backendModelId,
+      connectivityGraph,
+      entitiesExtract,
+      graphSource: connectivityGraph ? "model" : "none",
+      setModelGraph,
+      clearModelGraph,
     }),
     [
       workMode,
@@ -297,6 +335,11 @@ export function InferProvider({ children }: { children: ReactNode }) {
       viewerStatus,
       setViewerStatus,
       viewerStatusKind,
+      backendModelId,
+      connectivityGraph,
+      entitiesExtract,
+      setModelGraph,
+      clearModelGraph,
     ],
   );
 

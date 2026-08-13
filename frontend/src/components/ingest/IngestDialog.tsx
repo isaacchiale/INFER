@@ -4,22 +4,25 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { useInfer } from "@/state/infer-store";
+import { buildModelGraph, extractModel, uploadModel } from "@/api/models";
 import { toast } from "sonner";
 
 const ACCEPT = [".ifc", ".ifczip"];
 
 export function IngestDialog() {
-  const { ingestOpen, setIngestOpen, queueIfcFile } = useInfer();
+  const { ingestOpen, setIngestOpen, queueIfcFile, setModelGraph, setViewerStatus } = useInfer();
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
+  const [status, setStatus] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const reset = () => {
     setFileName(null);
     setProgress(0);
+    setStatus("");
     setError(null);
     setDragging(false);
     setLoading(false);
@@ -37,21 +40,48 @@ export function IngestDialog() {
     setError(null);
     setFileName(file.name);
     setLoading(true);
-    setProgress(15);
+    setProgress(8);
+    setStatus("Loading into 3D viewer…");
+    setViewerStatus(`Loading ${file.name}`, "loading");
 
     try {
-      setProgress(45);
       await queueIfcFile(file);
+      setProgress(25);
+      setStatus("Uploading to backend…");
+
+      const meta = await uploadModel(file);
+      setProgress(45);
+      setStatus("Extracting spaces / doors / stairs…");
+
+      const entities = await extractModel(meta.model_id);
+      setProgress(70);
+      setStatus("Building connectivity graph…");
+
+      const graph = await buildModelGraph(meta.model_id);
+      setProgress(95);
+
+      setModelGraph({ modelId: meta.model_id, graph, entities });
       setProgress(100);
-      toast.success(`Queued ${file.name} for 3D viewer`);
+      setStatus("Ready");
+      setViewerStatus(
+        `Graph ready · ${entities.spaces.length} spaces · ${graph.nodes.length} nodes`,
+        "info",
+      );
+      toast.success(
+        `Ingested ${file.name}: ${entities.spaces.length} spaces, ${graph.edges.length} links`,
+      );
       window.setTimeout(() => {
         setIngestOpen(false);
         reset();
-      }, 350);
+      }, 400);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to read IFC file");
+      const message = err instanceof Error ? err.message : "Ingest failed";
+      setError(message);
       setProgress(0);
+      setStatus("");
       setLoading(false);
+      setViewerStatus(message, "error");
+      toast.error(message);
     }
   };
 
@@ -72,9 +102,9 @@ export function IngestDialog() {
           <div className="space-y-3 py-2">
             <p className="truncate text-[13px] text-foreground">{fileName}</p>
             <Progress value={progress} className="h-1" aria-label="Load progress" />
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <span className="text-[12px] text-muted-foreground">
-                {loading ? "Sending to 3D viewer…" : `${progress}%`}
+                {loading ? status || "Working…" : `${progress}%`}
               </span>
               <Button size="sm" variant="ghost" className="h-7 rounded-[5px] text-[12px]" onClick={reset}>
                 Cancel
@@ -125,7 +155,8 @@ export function IngestDialog() {
         />
 
         <p className="text-[11px] text-muted-foreground">
-          Uses That Open / web-ifc in the browser. .ifc · .ifczip
+          Loads 3D locally, then upload → extract → graph on the backend for the graph viewer. Backend
+          must be running on :8000.
         </p>
       </DialogContent>
     </Dialog>

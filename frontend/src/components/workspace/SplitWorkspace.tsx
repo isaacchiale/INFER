@@ -132,7 +132,9 @@ export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
           collapsed={rightCollapsed}
           onToggle={toggleRight}
         >
-          <GraphViewer />
+          <div className="relative h-full min-h-0">
+            <GraphViewer className="h-full" />
+          </div>
         </PaneChrome>
       </Panel>
     </PanelGroup>
