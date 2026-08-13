@@ -36,7 +36,15 @@ export async function createThatOpenRuntime(
 
   world.renderer = new OBC.SimpleRenderer(components, container);
   world.camera = new OBC.OrthoPerspectiveCamera(components);
-  await world.camera.controls.setLookAt(20, 15, 20, 0, 0, 0);
+  // That Open defaults: dollyToCursor=true, infinityDolly=true, maxDistance≈300.
+  // infinityDolly lets you zoom *through* the orbit target; past the pivot the
+  // controls collapse (dolly dead / weird FP-like state). Keep classic orbit.
+  const controls = world.camera.controls;
+  controls.dollyToCursor = false;
+  controls.infinityDolly = false;
+  controls.minDistance = 1;
+  controls.maxDistance = 10_000;
+  await controls.setLookAt(20, 15, 20, 0, 0, 0);
 
   components.init();
   components.get(OBC.Grids).create(world);
