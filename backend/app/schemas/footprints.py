@@ -1,0 +1,57 @@
+from datetime import datetime, timezone
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class Point2D(BaseModel):
+    x: float
+    y: float
+
+
+class StoreyFootprintMeta(BaseModel):
+    global_id: str
+    name: str = ""
+    elevation: float | None = None  # metres (SI), not project mm
+
+
+class SpaceFootprint(BaseModel):
+    """2D plan polygon for a navigation-graph space (XY metres, IFC world)."""
+
+    global_id: str
+    name: str = ""
+    storey_global_id: str | None = None
+    # Ring in XY; empty when incomplete.
+    polygon: list[Point2D] = Field(default_factory=list)
+    incomplete: bool = False
+    method: Literal[
+        "ifc_mesh_xy_hull",
+        "ifc_placement_bbox",
+        "unavailable",
+    ] = "unavailable"
+
+
+class DoorPortal(BaseModel):
+    """Point (or short segment) where a path may cross a door opening."""
+
+    global_id: str
+    name: str = ""
+    storey_global_id: str | None = None
+    point: Point2D | None = None
+    segment: list[Point2D] = Field(default_factory=list)
+    incomplete: bool = False
+    method: Literal[
+        "ifc_mesh_xy_centroid",
+        "ifc_object_placement",
+        "unavailable",
+    ] = "unavailable"
+
+
+class FootprintsDocument(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    model_id: str
+    built_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    coordinate_system: Literal["ifc_world_xy_metres"] = "ifc_world_xy_metres"
+    storeys: list[StoreyFootprintMeta] = Field(default_factory=list)
+    spaces: list[SpaceFootprint] = Field(default_factory=list)
+    doors: list[DoorPortal] = Field(default_factory=list)

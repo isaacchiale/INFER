@@ -11,6 +11,7 @@ from fastapi import UploadFile
 from app.config import Settings
 from app.schemas.entities import EntitiesExtract, ModelMetadata
 from app.schemas.graph import ConnectivityGraph
+from app.schemas.footprints import FootprintsDocument
 
 ALLOWED_EXTENSIONS = {".ifc", ".ifczip"}
 
@@ -49,6 +50,10 @@ def entities_path(settings: Settings, model_id: str) -> Path:
 
 def graph_path(settings: Settings, model_id: str) -> Path:
     return _derived_root(settings) / model_id / "graph.json"
+
+
+def footprints_path(settings: Settings, model_id: str) -> Path:
+    return _derived_root(settings) / model_id / "footprints.json"
 
 
 def _write_meta(path: Path, meta: ModelMetadata) -> None:
@@ -130,6 +135,20 @@ def read_graph(settings: Settings, model_id: str) -> ConnectivityGraph:
     if not path.is_file():
         raise ModelNotFoundError(f"graph for {model_id}")
     return ConnectivityGraph.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def save_footprints(settings: Settings, doc: FootprintsDocument) -> Path:
+    path = footprints_path(settings, doc.model_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")
+    return path
+
+
+def read_footprints(settings: Settings, model_id: str) -> FootprintsDocument:
+    path = footprints_path(settings, model_id)
+    if not path.is_file():
+        raise ModelNotFoundError(f"footprints for {model_id}")
+    return FootprintsDocument.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 def file_sha256(path: Path) -> str:

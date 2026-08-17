@@ -19,6 +19,7 @@ export interface GraphEdge {
   source: string;
   target: string;
   global_id?: string | null;
+  /** New graphs emit only ifc_rel_space_boundary; legacy methods may appear on older JSON. */
   method: "ifc_rel_space_boundary" | "same_storey_fallback" | "vertical_storey_link";
   bidirectional?: boolean;
 }

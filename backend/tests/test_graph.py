@@ -28,6 +28,9 @@ def test_build_graph_nodes_and_edges(tmp_path, monkeypatch):
     assert any(n["kind"] == "space" for n in graph["nodes"])
     assert any(n["kind"] == "door" for n in graph["nodes"])
     assert isinstance(graph["edges"], list)
+    # Strict IFC layer: no invented room chains or stair/lift stars.
+    assert all(e["method"] == "ifc_rel_space_boundary" for e in graph["edges"])
+    assert not any(e["kind"] == "space_door" and "space_chain" in e["id"] for e in graph["edges"])
     # Must stay well below combinatorial explosion.
     assert len(graph["edges"]) < 500
 

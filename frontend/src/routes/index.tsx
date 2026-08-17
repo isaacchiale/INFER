@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { building } from "@/data/mock";
 import { InferModelViewport } from "@/components/viewer/InferModelViewport";
-import { FloorSelector, RouteControls, ViewControls } from "@/components/viewer/ViewportControls";
+import { RouteControls, ViewControls } from "@/components/viewer/ViewportControls";
 import { Inspector } from "@/components/panels/Inspector";
 import { NavigatePanel } from "@/components/panels/NavigatePanel";
 import { ValidatePanel } from "@/components/panels/ValidatePanel";
@@ -56,9 +56,6 @@ function WorkspaceScreen() {
             onElementSelected={(id) => selectElement(id)}
           >
             <div className="viewport-dark contents">
-              {!animation.playing && workMode !== "layers" && workMode !== "navigate" && (
-                <FloorSelector />
-              )}
               {!animation.playing && <ViewControls />}
               <RouteControls />
             </div>

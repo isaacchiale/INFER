@@ -92,7 +92,7 @@ def find_shortest_path(
             destination_node_id=destination_node_id,
             blocked_node_ids=sorted(blocked_nodes),
             blocked_edge_ids=sorted(blocked_edges),
-            message="No path exists under the current blockages.",
+            message="No path exists.",
         )
     except nx.NodeNotFound:
         return RouteResult(

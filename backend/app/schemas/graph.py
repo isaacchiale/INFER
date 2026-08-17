@@ -18,6 +18,8 @@ class GraphEdge(BaseModel):
     source: str
     target: str
     global_id: str | None = None
+    # New graphs only emit ifc_rel_space_boundary. Legacy methods remain
+    # accepted so older derived graph.json files still load.
     method: Literal[
         "ifc_rel_space_boundary",
         "same_storey_fallback",

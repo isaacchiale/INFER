@@ -16,8 +16,9 @@ import type {
   RouteRestriction,
   ScenarioCondition,
 } from "@/types/infer";
-import type { ConnectivityGraph } from "@/types/graph";
+import type { ConnectivityGraph, RouteResult } from "@/types/graph";
 import type { EntitiesExtract } from "@/api/models";
+import type { FootprintsDocument } from "@/types/footprints";
 
 export type WorkMode = "model" | "navigate" | "layers" | "validate" | "scenario";
 
@@ -101,11 +102,15 @@ interface InferState {
   backendModelId: string | null;
   connectivityGraph: ConnectivityGraph | null;
   entitiesExtract: EntitiesExtract | null;
+  footprintsDocument: FootprintsDocument | null;
+  connectivityRoute: RouteResult | null;
+  setConnectivityRoute: (route: RouteResult | null) => void;
   graphSource: "demo" | "model" | "none";
   setModelGraph: (payload: {
     modelId: string;
     graph: ConnectivityGraph;
     entities: EntitiesExtract;
+    footprints?: FootprintsDocument | null;
   }) => void;
   clearModelGraph: () => void;
 }
@@ -146,20 +151,33 @@ export function InferProvider({ children }: { children: ReactNode }) {
   const [backendModelId, setBackendModelId] = useState<string | null>(null);
   const [connectivityGraph, setConnectivityGraph] = useState<ConnectivityGraph | null>(null);
   const [entitiesExtract, setEntitiesExtract] = useState<EntitiesExtract | null>(null);
+  const [footprintsDocument, setFootprintsDocument] = useState<FootprintsDocument | null>(null);
+  const [connectivityRoute, setConnectivityRoute] = useState<RouteResult | null>(null);
   const removedRef = useRef<ScenarioCondition | null>(null);
 
   const queueIfcFile = useCallback(async (file: File) => {
     const buffer = new Uint8Array(await file.arrayBuffer());
-    setPendingIfc({ name: file.name, buffer });
+    // Owned copy — web-ifc may detach the underlying ArrayBuffer during convert.
+    setPendingIfc({ name: file.name, buffer: buffer.slice() });
   }, []);
 
   const clearPendingIfc = useCallback(() => setPendingIfc(null), []);
 
   const setModelGraph = useCallback(
-    (payload: { modelId: string; graph: ConnectivityGraph; entities: EntitiesExtract }) => {
+    (payload: {
+      modelId: string;
+      graph: ConnectivityGraph;
+      entities: EntitiesExtract;
+      footprints?: FootprintsDocument | null;
+    }) => {
       setBackendModelId(payload.modelId);
       setConnectivityGraph(payload.graph);
       setEntitiesExtract(payload.entities);
+      setFootprintsDocument(payload.footprints ?? null);
+      setConnectivityRoute(null);
+      const firstStorey =
+        payload.footprints?.storeys[0]?.global_id ?? payload.entities.storeys[0]?.global_id;
+      if (firstStorey) setActiveStoreyId(firstStorey);
     },
     [],
   );
@@ -168,6 +186,9 @@ export function InferProvider({ children }: { children: ReactNode }) {
     setBackendModelId(null);
     setConnectivityGraph(null);
     setEntitiesExtract(null);
+    setFootprintsDocument(null);
+    setConnectivityRoute(null);
+    setPendingIfc(null);
   }, []);
 
   const setViewerStatus = useCallback(
@@ -294,6 +315,9 @@ export function InferProvider({ children }: { children: ReactNode }) {
       backendModelId,
       connectivityGraph,
       entitiesExtract,
+      footprintsDocument,
+      connectivityRoute,
+      setConnectivityRoute,
       graphSource: connectivityGraph ? "model" : "none",
       setModelGraph,
       clearModelGraph,
@@ -338,6 +362,8 @@ export function InferProvider({ children }: { children: ReactNode }) {
       backendModelId,
       connectivityGraph,
       entitiesExtract,
+      footprintsDocument,
+      connectivityRoute,
       setModelGraph,
       clearModelGraph,
     ],

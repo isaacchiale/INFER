@@ -12,6 +12,7 @@ from app.schemas.entities import (
     StairEntity,
     StoreyEntity,
 )
+from app.services.ifc_units import length_to_metres
 
 EXIT_MARKERS = ("exit", "evac", "fire escape", "emergency")
 
@@ -51,7 +52,9 @@ def extract_entities(model_id: str, ifc_file_path: str) -> EntitiesExtract:
             StoreyEntity(
                 global_id=_global_id(storey),
                 name=_name_of(storey),
-                elevation=float(elevation) if elevation is not None else None,
+                elevation=length_to_metres(
+                    ifc, float(elevation) if elevation is not None else None
+                ),
             )
         )
 

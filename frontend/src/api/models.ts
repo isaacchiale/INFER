@@ -1,4 +1,5 @@
 import type { ConnectivityGraph, RouteResult } from "@/types/graph";
+import type { FootprintsDocument } from "@/types/footprints";
 
 const apiBase = "/api";
 
@@ -81,4 +82,16 @@ export async function computeModelRoute(
   });
   if (!response.ok) throw new Error(await readError(response));
   return (await response.json()) as RouteResult;
+}
+
+export async function buildModelFootprints(modelId: string): Promise<FootprintsDocument> {
+  const response = await fetch(`${apiBase}/models/${modelId}/footprints`, { method: "POST" });
+  if (!response.ok) throw new Error(await readError(response));
+  return (await response.json()) as FootprintsDocument;
+}
+
+export async function getModelFootprints(modelId: string): Promise<FootprintsDocument> {
+  const response = await fetch(`${apiBase}/models/${modelId}/footprints`);
+  if (!response.ok) throw new Error(await readError(response));
+  return (await response.json()) as FootprintsDocument;
 }

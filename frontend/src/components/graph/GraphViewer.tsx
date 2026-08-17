@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Maximize2 } from "lucide-react";
 import { computeRoute } from "@/api/routing";
 import { computeModelRoute } from "@/api/models";
 import { useInfer } from "@/state/infer-store";
@@ -23,7 +24,13 @@ function shortLabel(node: GraphNode): string {
 }
 
 export function GraphViewer({ className }: { className?: string }) {
-  const { connectivityGraph, entitiesExtract, backendModelId, graphSource } = useInfer();
+  const {
+    connectivityGraph,
+    entitiesExtract,
+    backendModelId,
+    graphSource,
+    setConnectivityRoute,
+  } = useInfer();
   const theme = useAppTheme();
   const graph = connectivityGraph;
   const hasGraph = Boolean(graph && graph.nodes.length > 0);
@@ -66,6 +73,7 @@ export function GraphViewer({ className }: { className?: string }) {
       setOrigin("");
       setDestination("");
       setRoute(null);
+      setConnectivityRoute(null);
       setError(null);
       return;
     }
@@ -87,6 +95,7 @@ export function GraphViewer({ className }: { className?: string }) {
     let cancelled = false;
     if (!graph || !origin || !destination) {
       setRoute(null);
+      setConnectivityRoute(null);
       setBusy(false);
       return;
     }
@@ -107,11 +116,15 @@ export function GraphViewer({ className }: { className?: string }) {
 
     void run
       .then((result) => {
-        if (!cancelled) setRoute(result);
+        if (!cancelled) {
+          setRoute(result);
+          setConnectivityRoute(result);
+        }
       })
       .catch((err: unknown) => {
         if (!cancelled) {
           setRoute(null);
+          setConnectivityRoute(null);
           setError(err instanceof Error ? err.message : "Route failed");
         }
       })
@@ -178,12 +191,19 @@ export function GraphViewer({ className }: { className?: string }) {
   useEffect(() => {
     if (!engineReady || !runtimeRef.current) return;
     runtimeRef.current.setLayout(layout ?? EMPTY_LAYOUT);
+    // Default view: always fit the graph when layout (re)loads.
+    if (layout && layout.nodes.length) {
+      requestAnimationFrame(() => runtimeRef.current?.fit());
+    }
   }, [layout, engineReady]);
 
   useEffect(() => {
     if (!engineReady || !runtimeRef.current) return;
-    runtimeRef.current.setPath(route?.node_ids ?? [], route?.edge_ids ?? []);
-  }, [route, engineReady]);
+    const pathNodes = route?.found ? (route.node_ids ?? []) : [];
+    const pathEdges = route?.found ? (route.edge_ids ?? []) : [];
+    const selected = [origin, destination].filter(Boolean);
+    runtimeRef.current.setPath(pathNodes, pathEdges, selected);
+  }, [route, origin, destination, engineReady, layout]);
 
   const pathLabel = !hasGraph
     ? EMPTY
@@ -196,42 +216,51 @@ export function GraphViewer({ className }: { className?: string }) {
   return (
     <div
       className={cn(
-        "relative grid h-full min-h-0 grid-rows-[minmax(0,1fr)_auto] bg-background text-foreground",
+        "relative flex h-full min-h-0 flex-col bg-background text-foreground",
         className,
       )}
     >
-      <div
-        ref={hostRef}
-        className="min-h-0 min-w-0 select-none"
-        style={{ background: palette.bg }}
-        aria-label="Connectivity graph canvas"
-      />
-      {!hasGraph && (
-        <div className="pointer-events-none absolute inset-x-0 top-0 bottom-28 flex flex-col items-center justify-center gap-2 px-6 text-center">
-          <p className="text-sm font-medium">No graph loaded</p>
-          <p className="max-w-sm text-xs text-muted-foreground">
-            Open an IFC model to build the connectivity graph. Pan and zoom freely once loaded —
-            nothing is pre-filled.
-          </p>
-        </div>
-      )}
-      {hasGraph && !engineReady && !cyError && (
-        <div className="pointer-events-none absolute inset-x-0 top-0 bottom-28 grid place-items-center text-[13px] text-muted-foreground">
-          Starting graph viewer…
-        </div>
-      )}
-      {cyError && (
-        <div className="absolute inset-x-0 bottom-28 z-10 mx-3 rounded-md border border-destructive/40 bg-background/95 px-3 py-2 text-[11px] text-destructive">
-          Graph render error: {cyError}
-        </div>
-      )}
+      <div className="relative min-h-0 min-w-0 flex-1">
+        <div
+          ref={hostRef}
+          className="absolute inset-0 z-0 select-none"
+          style={{ background: palette.bg }}
+          aria-label="Connectivity graph canvas"
+        />
+        <button
+          type="button"
+          onClick={() => runtimeRef.current?.fit()}
+          disabled={!hasGraph || !engineReady}
+          className="pointer-events-auto absolute right-2 top-2 z-50 inline-flex items-center gap-1 rounded-[6px] border border-border bg-background/90 px-2 py-1 text-[11px] text-muted-foreground shadow-sm backdrop-blur-[2px] transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40"
+          title="Zoom to show the entire graph"
+        >
+          <Maximize2 className="size-3" />
+          Fit
+        </button>
+        {!hasGraph && (
+          <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 px-6 text-center">
+            <p className="text-sm font-medium">No graph loaded</p>
+            <p className="max-w-sm text-xs text-muted-foreground">
+              Open an IFC model to build the connectivity graph.
+            </p>
+          </div>
+        )}
+        {hasGraph && !engineReady && !cyError && (
+          <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center text-[13px] text-muted-foreground">
+            Starting graph viewer…
+          </div>
+        )}
+        {cyError && (
+          <div className="absolute inset-x-0 bottom-2 z-50 mx-3 rounded-md border border-destructive/40 bg-background/95 px-3 py-2 text-[11px] text-destructive">
+            Graph render error: {cyError}
+          </div>
+        )}
+      </div>
 
-      <div className="border-t border-border bg-surface-raised px-3 py-2 text-[12px]">
+      <div className="relative z-10 shrink-0 border-t border-border bg-surface-raised px-3 py-2 text-[12px]">
         <div className="mb-2 flex items-center justify-between gap-2">
-          <p className="truncate text-muted-foreground">
-            {hasGraph
-              ? "Scroll to zoom · drag background to pan · click rooms for Start / Destination"
-              : EMPTY}
+          <p className="min-w-0 truncate text-[11px] text-amber-500">
+            {!error && route && !route.found && hasGraph ? "No path exists" : null}
           </p>
           <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
             {graphSource === "model" ? "Live IFC graph · Cytoscape" : EMPTY}
@@ -290,9 +319,6 @@ export function GraphViewer({ className }: { className?: string }) {
             </select>
           </label>
           {error && <p className="text-[11px] text-destructive">{error}</p>}
-          {!error && route && !route.found && hasGraph && (
-            <p className="text-[11px] text-amber-500">{route.message}</p>
-          )}
         </div>
       </div>
     </div>

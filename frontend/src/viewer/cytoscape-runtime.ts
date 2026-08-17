@@ -3,26 +3,27 @@
  * Same discipline as That Open: wait for a non-zero container, own resize,
  * destroy once — do not recreate on every React state tick.
  *
- * Framing preserves a minimum node margin; large graphs overflow the pane
- * and are explored via pan/zoom instead of being squeezed until nodes collide.
+ * Node positions stay in layout model space. Viewport zoom/pan (including Fit)
+ * never rewrites coordinates or node sizes — only cy.zoom / cy.pan / cy.fit.
  */
 
 import type { Core, ElementDefinition, StylesheetJson } from "cytoscape";
 import type { GraphLayout, GraphThemePalette } from "@/lib/graph-layout";
-import { graphPalette, LAYOUT_NODE_W } from "@/lib/graph-layout";
+import { graphPalette } from "@/lib/graph-layout";
 
 export type CytoscapeRuntime = {
   setLayout: (layout: GraphLayout) => void;
-  setPath: (pathNodeIds: string[], pathEdgeIds?: string[]) => void;
+  setPath: (
+    pathNodeIds: string[],
+    pathEdgeIds?: string[],
+    selectedNodeIds?: string[],
+  ) => void;
   setTheme: (theme: "light" | "dark") => void;
   resize: () => void;
   fit: () => void;
   destroy: () => void;
   onSpaceTap: (handler: (nodeId: string) => void) => void;
 };
-
-/** Minimum center-to-center spacing in screen pixels after framing. */
-const MIN_NODE_MARGIN_PX = LAYOUT_NODE_W + 28;
 
 function stylesheet(p: GraphThemePalette): StylesheetJson {
   return [
@@ -131,63 +132,14 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
   ];
 }
 
-type Frame = { scale: number; ox: number; oy: number };
-
-/**
- * Uniform scale that fits when possible, but never shrinks below
- * MIN_NODE_MARGIN_PX center spacing (graph may overflow → pan/zoom).
- */
-function frameForContainer(
-  layout: GraphLayout,
-  containerW: number,
-  containerH: number,
-  padding = 32,
-): Frame {
-  const content = layout.nodes.filter((n) => n.kind !== "label");
-  const use = content.length ? content : layout.nodes;
-  if (!use.length || containerW < 4 || containerH < 4) {
-    return { scale: 1, ox: 0, oy: 0 };
-  }
-
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const n of use) {
-    minX = Math.min(minX, n.x);
-    minY = Math.min(minY, n.y);
-    maxX = Math.max(maxX, n.x + n.w);
-    maxY = Math.max(maxY, n.y + n.h);
-  }
-  const bw = Math.max(maxX - minX, 1);
-  const bh = Math.max(maxY - minY, 1);
-
-  const fitScale = Math.min((containerW - padding * 2) / bw, (containerH - padding * 2) / bh);
-  const cell = Math.min(layout.cellW || LAYOUT_NODE_W + 56, layout.cellH || LAYOUT_NODE_W + 48);
-  const minScaleForSpacing = MIN_NODE_MARGIN_PX / cell;
-  // Prefer readable spacing over forcing everything into the pane.
-  const scale = Math.max(fitScale, minScaleForSpacing);
-
-  const contentW = bw * scale;
-  const contentH = bh * scale;
-  const ox = (containerW - contentW) / 2 - scale * minX;
-  const oy = (containerH - contentH) / 2 - scale * minY;
-  return { scale, ox, oy };
-}
-
-export function layoutToCyElements(
-  layout: GraphLayout,
-  frame: Frame = { scale: 1, ox: 0, oy: 0 },
-): ElementDefinition[] {
+/** Positions in layout model space only — no container bake. */
+export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
   const elements: ElementDefinition[] = [];
   const seen = new Set<string>();
-  const { scale, ox, oy } = frame;
 
   for (const node of layout.nodes) {
     if (seen.has(node.id)) continue;
     seen.add(node.id);
-    const cx = node.x + node.w / 2;
-    const cy = node.y + node.h / 2;
     elements.push({
       group: "nodes",
       data: {
@@ -196,7 +148,7 @@ export function layoutToCyElements(
         kind: node.kind,
         onPath: 0,
       },
-      position: { x: ox + scale * cx, y: oy + scale * cy },
+      position: { x: node.x + node.w / 2, y: node.y + node.h / 2 },
       selectable: node.kind === "space",
       grabbable: false,
     });
@@ -268,7 +220,7 @@ export async function createCytoscapeRuntime(
     elements: [],
     layout: { name: "preset", fit: false },
     style: stylesheet(palette),
-    minZoom: 0.15,
+    minZoom: 0.02,
     maxZoom: 6,
     wheelSensitivity: 1.2,
     boxSelectionEnabled: false,
@@ -292,12 +244,25 @@ export async function createCytoscapeRuntime(
     { passive: true },
   );
 
-  const applyLayoutToCy = (layout: GraphLayout) => {
+  const fitViewport = () => {
+    if (!cy.elements().length) return;
+    suppressViewFlag = true;
+    try {
+      cy.resize();
+      cy.fit(cy.elements(), 48);
+    } finally {
+      requestAnimationFrame(() => {
+        suppressViewFlag = false;
+      });
+    }
+  };
+
+  /** Replace elements from layout model coords; camera via fitViewport separately. */
+  const applyLayoutToCy = (layout: GraphLayout, resetCamera: boolean) => {
     const w = Math.max(container.clientWidth, 1);
     const h = Math.max(container.clientHeight, 1);
     lastWh = { w, h };
-    const frame = frameForContainer(layout, w, h, 32);
-    const elements = layoutToCyElements(layout, frame);
+    const elements = layoutToCyElements(layout);
 
     suppressViewFlag = true;
     try {
@@ -306,8 +271,9 @@ export async function createCytoscapeRuntime(
         if (elements.length) cy.add(elements);
       });
       cy.resize();
-      cy.zoom(1);
-      cy.pan({ x: 0, y: 0 });
+      if (resetCamera && elements.length) {
+        cy.fit(cy.elements(), 48);
+      }
     } finally {
       requestAnimationFrame(() => {
         suppressViewFlag = false;
@@ -326,8 +292,8 @@ export async function createCytoscapeRuntime(
       }
       if (Math.abs(w - lastWh.w) > 4 || Math.abs(h - lastWh.h) > 4) {
         lastWh = { w, h };
-        userAdjustedView = false;
-        applyLayoutToCy(lastLayout);
+        // Pane size changed: keep model positions, only adjust camera if user hasn't panned/zoomed.
+        if (!userAdjustedView) fitViewport();
       }
     } catch {
       /* ignore */
@@ -353,19 +319,21 @@ export async function createCytoscapeRuntime(
         cy.elements().remove();
         return;
       }
+      // Fit after layout, then once more after paint so the pane has real size.
       requestAnimationFrame(() => {
         cy.resize();
-        applyLayoutToCy(layout);
+        applyLayoutToCy(layout, true);
         requestAnimationFrame(() => {
-          if (!userAdjustedView && lastLayout === layout) {
-            cy.resize();
-            applyLayoutToCy(layout);
+          if (lastLayout === layout) {
+            userAdjustedView = false;
+            fitViewport();
           }
         });
       });
     },
-    setPath(pathNodeIds, pathEdgeIds = []) {
+    setPath(pathNodeIds, pathEdgeIds = [], selectedNodeIds = []) {
       const pathNodes = new Set(pathNodeIds);
+      const selected = new Set(selectedNodeIds);
       const displayPath = pathNodeIds.filter(
         (id) =>
           id.startsWith("space:") || id.startsWith("stair:") || id.startsWith("lift:"),
@@ -380,7 +348,8 @@ export async function createCytoscapeRuntime(
       cy.batch(() => {
         cy.nodes().forEach((n) => {
           if (n.data("kind") === "label") return;
-          n.data("onPath", pathNodes.has(n.id()) ? 1 : 0);
+          const id = n.id();
+          n.data("onPath", pathNodes.has(id) || selected.has(id) ? 1 : 0);
         });
         cy.edges().forEach((e) => {
           const key = `${e.data("source")}|${e.data("target")}`;
@@ -399,7 +368,7 @@ export async function createCytoscapeRuntime(
     resize,
     fit() {
       userAdjustedView = false;
-      if (lastLayout && lastLayout.nodes.length) applyLayoutToCy(lastLayout);
+      fitViewport();
     },
     destroy() {
       window.removeEventListener("resize", resize);

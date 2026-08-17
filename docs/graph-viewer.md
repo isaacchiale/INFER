@@ -1,6 +1,6 @@
 # Graph Viewer
 
-The Graph Viewer is the right pane of the split workspace. It shows the **semantic connectivity graph** of an ingested IFC (rooms + vertical portals + links), lets you pick Start/Target, and highlights the **NetworkX shortest path** from the backend. It is separate from the That Open 3D viewer; both share the same ingest session.
+The Graph Viewer is one of the three equal workspace panes (3D | Floorplan | Graph). It shows the **semantic connectivity graph** of an ingested IFC (rooms + vertical portals + links), lets you pick Start/Target, and highlights the **NetworkX shortest path** from the backend. It is separate from the That Open 3D viewer; both share the same ingest session.
 
 ## Data pipeline
 
@@ -12,7 +12,7 @@ The Graph Viewer is the right pane of the split workspace. It shows the **semant
 ### Canonical graph (backend)
 
 - **Nodes:** `space`, `door`, `stair`, `lift`
-- **Edges:** `space_door` (boundary or same-storey fallback), `vertical` (star through stair/lift)
+- **Edges:** only from `IfcRelSpaceBoundary` (`method=ifc_rel_space_boundary`): `space_door` for doors, `vertical` for stair/lift when the IFC links them. No same-storey name chains or stair/lift stars.
 - **Storeys** are metadata on spaces, not graph nodes
 
 ## Display transform (not the routing graph)
@@ -33,7 +33,7 @@ Routing still uses the **full** backend graph (including doors).
 - Own **ResizeObserver**; destroy once
 - **Do not** remount on every route tick
 
-**Framing:** uniform scale centered in the pane at `zoom = 1`. A minimum node margin is enforced so nodes are never squeezed into collisions — large graphs overflow and are explored with pan/zoom. Pane resize re-bakes the frame unless the user has already panned/zoomed.
+**Framing:** nodes stay in layout model coordinates. Load / resize / **Fit** only change Cytoscape viewport zoom and pan (`cy.fit`) — they never rewrite node positions or sizes.
 
 ### Interaction
 

@@ -50,7 +50,7 @@ function InferModelViewportImpl({
   const [engineReady, setEngineReady] = useState(false);
   const [engineError, setEngineError] = useState<string | null>(null);
 
-  const { pendingIfc, clearPendingIfc, setViewerStatus } = useInfer();
+  const { pendingIfc, setViewerStatus } = useInfer();
 
   // Boot That Open once the host is mounted (client-only).
   useEffect(() => {
@@ -91,13 +91,15 @@ function InferModelViewportImpl({
     };
   }, [modelId, onViewerReady, setViewerStatus]);
 
-  // Load IFC queued by IngestDialog (or future backend bridge).
+  // Load / reload IFC retained in the store. Closing the 3D pane disposes the
+  // WebGL runtime; reopening must rehydrate from this buffer (do not clear it).
   useEffect(() => {
     if (!pendingIfc || !engineReady || !runtimeRef.current) return;
     let cancelled = false;
     void (async () => {
       try {
-        await runtimeRef.current?.loadBuffer(pendingIfc.buffer, pendingIfc.name);
+        // Pass a copy so the store buffer stays intact for the floorplan pane.
+        await runtimeRef.current?.loadBuffer(pendingIfc.buffer.slice(), pendingIfc.name);
       } catch (error) {
         if (!cancelled) {
           setViewerStatus(
@@ -105,14 +107,12 @@ function InferModelViewportImpl({
             "error",
           );
         }
-      } finally {
-        if (!cancelled) clearPendingIfc();
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [pendingIfc, engineReady, clearPendingIfc, setViewerStatus]);
+  }, [pendingIfc, engineReady, setViewerStatus]);
 
   // Keep route/hazard props available for future overlays (not drawn by placeholder).
   void highlightedRoute;

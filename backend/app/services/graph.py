@@ -55,38 +55,34 @@ def build_connectivity_graph(model_id: str, ifc_file_path: str) -> ConnectivityG
     def add_edge(edge: GraphEdge) -> None:
         edges[edge.id] = edge
 
-    spaces_by_storey: dict[str | None, list[str]] = {}
     for space in ifc.by_type("IfcSpace"):
         gid = _gid(space)
         if not gid:
             continue
         storey = _storey_gid(ifc, space)
-        node = GraphNode(
-            id=_node_id("space", gid),
-            kind="space",
-            global_id=gid,
-            name=_name(space),
-            storey_global_id=storey,
+        add_node(
+            GraphNode(
+                id=_node_id("space", gid),
+                kind="space",
+                global_id=gid,
+                name=_name(space),
+                storey_global_id=storey,
+            )
         )
-        add_node(node)
-        spaces_by_storey.setdefault(storey, []).append(node.id)
 
-    doors: list[tuple[str, str | None]] = []
     for door in ifc.by_type("IfcDoor"):
         gid = _gid(door)
         if not gid:
             continue
-        storey = _storey_gid(ifc, door)
         add_node(
             GraphNode(
                 id=_node_id("door", gid),
                 kind="door",
                 global_id=gid,
                 name=_name(door),
-                storey_global_id=storey,
+                storey_global_id=_storey_gid(ifc, door),
             )
         )
-        doors.append((gid, storey))
 
     for stair in ifc.by_type("IfcStair"):
         gid = _gid(stair)
@@ -116,81 +112,69 @@ def build_connectivity_graph(model_id: str, ifc_file_path: str) -> ConnectivityG
             )
         )
 
-    boundary_linked_doors: set[str] = set()
+    # Strict IFC layer only: space ↔ portal via IfcRelSpaceBoundary.
+    # No name-chain room adjacency and no stair/lift star topology.
+    # Geometry fallbacks (e.g. topologicpy) belong in a later layer.
     for rel in ifc.by_type("IfcRelSpaceBoundary"):
         space = getattr(rel, "RelatingSpace", None)
         element = getattr(rel, "RelatedBuildingElement", None)
         if space is None or element is None:
             continue
-        if not element.is_a("IfcDoor"):
-            continue
+
         space_gid = _gid(space)
-        door_gid = _gid(element)
-        if not space_gid or not door_gid:
+        element_gid = _gid(element)
+        if not space_gid or not element_gid:
             continue
+
         space_id = _node_id("space", space_gid)
-        door_id = _node_id("door", door_gid)
-        if space_id not in nodes or door_id not in nodes:
+        if space_id not in nodes:
             continue
-        edge_id = f"space_door:{space_gid}:{door_gid}:boundary"
-        add_edge(
-            GraphEdge(
-                id=edge_id,
-                kind="space_door",
-                source=space_id,
-                target=door_id,
-                global_id=_gid(rel) or None,
-                method="ifc_rel_space_boundary",
-                bidirectional=True,
-            )
-        )
-        boundary_linked_doors.add(door_gid)
 
-    # Doors without space boundaries: do NOT link to every space on the storey
-    # (that caused tens of thousands of edges). Leave them as isolated portal
-    # nodes until a better adjacency heuristic is available.
-
-    # Weak same-storey circulation: chain spaces on each storey by name so
-    # rooms remain reachable when IFC space boundaries are missing.
-    for storey, space_ids in spaces_by_storey.items():
-        if not storey or len(space_ids) < 2:
-            continue
-        ordered = sorted(space_ids, key=lambda sid: (nodes[sid].name or nodes[sid].global_id).lower())
-        for left, right in zip(ordered, ordered[1:]):
-            edge_id = f"space_chain:{nodes[left].global_id}:{nodes[right].global_id}"
+        if element.is_a("IfcDoor"):
+            portal_id = _node_id("door", element_gid)
+            if portal_id not in nodes:
+                continue
             add_edge(
                 GraphEdge(
-                    id=edge_id,
+                    id=f"space_door:{space_gid}:{element_gid}:boundary",
                     kind="space_door",
-                    source=left,
-                    target=right,
-                    method="same_storey_fallback",
+                    source=space_id,
+                    target=portal_id,
+                    global_id=_gid(rel) or None,
+                    method="ifc_rel_space_boundary",
                     bidirectional=True,
                 )
             )
-
-    storeys_with_spaces = [s for s in spaces_by_storey.keys() if s]
-    vertical_nodes = [n for n in nodes.values() if n.kind in ("stair", "lift")]
-
-    # Star topology through the vertical hub: every space on a storey links to
-    # each stair/lift so multi-storey routes do not depend on a single hub room.
-    for vertical in vertical_nodes:
-        for storey in storeys_with_spaces:
-            for space_id in spaces_by_storey.get(storey) or []:
-                edge_id = (
-                    f"vertical:{vertical.global_id}:{nodes[space_id].global_id}"
+        elif element.is_a("IfcStair"):
+            portal_id = _node_id("stair", element_gid)
+            if portal_id not in nodes:
+                continue
+            add_edge(
+                GraphEdge(
+                    id=f"vertical:{element_gid}:{space_gid}:boundary",
+                    kind="vertical",
+                    source=space_id,
+                    target=portal_id,
+                    global_id=_gid(rel) or None,
+                    method="ifc_rel_space_boundary",
+                    bidirectional=True,
                 )
-                add_edge(
-                    GraphEdge(
-                        id=edge_id,
-                        kind="vertical",
-                        source=space_id,
-                        target=vertical.id,
-                        global_id=vertical.global_id,
-                        method="vertical_storey_link",
-                        bidirectional=True,
-                    )
+            )
+        elif element.is_a("IfcTransportElement"):
+            portal_id = _node_id("lift", element_gid)
+            if portal_id not in nodes:
+                continue
+            add_edge(
+                GraphEdge(
+                    id=f"vertical:{element_gid}:{space_gid}:boundary",
+                    kind="vertical",
+                    source=space_id,
+                    target=portal_id,
+                    global_id=_gid(rel) or None,
+                    method="ifc_rel_space_boundary",
+                    bidirectional=True,
                 )
+            )
 
     return ConnectivityGraph(
         model_id=model_id,

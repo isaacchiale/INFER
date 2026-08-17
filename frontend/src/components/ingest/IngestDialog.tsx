@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { useInfer } from "@/state/infer-store";
-import { buildModelGraph, extractModel, uploadModel } from "@/api/models";
+import { buildModelFootprints, buildModelGraph, extractModel, uploadModel } from "@/api/models";
 import { toast } from "sonner";
 
 const ACCEPT = [".ifc", ".ifczip"];
@@ -58,17 +58,21 @@ export function IngestDialog() {
       setStatus("Building connectivity graph…");
 
       const graph = await buildModelGraph(meta.model_id);
+      setProgress(85);
+      setStatus("Building space footprints…");
+
+      const footprints = await buildModelFootprints(meta.model_id);
       setProgress(95);
 
-      setModelGraph({ modelId: meta.model_id, graph, entities });
+      setModelGraph({ modelId: meta.model_id, graph, entities, footprints });
       setProgress(100);
       setStatus("Ready");
       setViewerStatus(
-        `Graph ready · ${entities.spaces.length} spaces · ${graph.nodes.length} nodes`,
+        `Graph + footprints ready · ${entities.spaces.length} spaces · ${footprints.spaces.filter((s) => !s.incomplete).length} plans`,
         "info",
       );
       toast.success(
-        `Ingested ${file.name}: ${entities.spaces.length} spaces, ${graph.edges.length} links`,
+        `Ingested ${file.name}: ${entities.spaces.length} spaces, ${graph.edges.length} links, footprints built`,
       );
       window.setTimeout(() => {
         setIngestOpen(false);

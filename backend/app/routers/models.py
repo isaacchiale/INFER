@@ -2,8 +2,10 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from app.config import get_settings
 from app.schemas.entities import EntitiesExtract, ModelMetadata
+from app.schemas.footprints import FootprintsDocument
 from app.schemas.graph import ConnectivityGraph
 from app.services import extract as extract_service
+from app.services import footprints as footprints_service
 from app.services import graph as graph_service
 from app.services import storage
 
@@ -98,4 +100,40 @@ def get_graph(model_id: str) -> ConnectivityGraph:
         raise HTTPException(
             status_code=404,
             detail="Graph not found. Run POST /models/{id}/graph first.",
+        ) from exc
+
+
+@router.post("/{model_id}/footprints", response_model=FootprintsDocument)
+def build_footprints(model_id: str) -> FootprintsDocument:
+    settings = get_settings()
+    try:
+        storage.read_meta(settings, model_id)
+    except storage.ModelNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Model not found") from exc
+
+    path = storage.ifc_path(settings, model_id)
+    try:
+        doc = footprints_service.build_footprints(model_id, str(path))
+        storage.save_footprints(settings, doc)
+        return doc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500, detail=f"Footprints build failed: {exc}"
+        ) from exc
+
+
+@router.get("/{model_id}/footprints", response_model=FootprintsDocument)
+def get_footprints(model_id: str) -> FootprintsDocument:
+    settings = get_settings()
+    try:
+        storage.read_meta(settings, model_id)
+    except storage.ModelNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Model not found") from exc
+
+    try:
+        return storage.read_footprints(settings, model_id)
+    except storage.ModelNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="Footprints not found. Run POST /models/{id}/footprints first.",
         ) from exc
