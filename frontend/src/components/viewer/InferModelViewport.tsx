@@ -1,11 +1,16 @@
 import { memo, useEffect, useRef, useState } from "react";
+import { Move3d, PersonStanding } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { HazardZone, Route } from "@/types/infer";
 import { useInfer } from "@/state/infer-store";
 import {
   createThatOpenRuntime,
+  type NavMode,
   type ThatOpenRuntime,
 } from "@/viewer/that-open-runtime";
+
+const GLASS =
+  "rounded-[6px] border border-border bg-background/90 shadow-sm backdrop-blur-[2px]";
 
 /**
  * INFER ⇄ BIM viewer integration boundary.
@@ -49,8 +54,14 @@ function InferModelViewportImpl({
   const runtimeRef = useRef<ThatOpenRuntime | null>(null);
   const [engineReady, setEngineReady] = useState(false);
   const [engineError, setEngineError] = useState<string | null>(null);
+  const [navMode, setNavMode] = useState<NavMode>("orbit");
 
   const { pendingIfc, setViewerStatus } = useInfer();
+
+  const switchNavMode = (mode: NavMode) => {
+    setNavMode(mode);
+    void runtimeRef.current?.setNavMode(mode);
+  };
 
   // Boot That Open once the host is mounted (client-only).
   useEffect(() => {
@@ -72,6 +83,7 @@ function InferModelViewportImpl({
         runtimeRef.current = runtime;
         setEngineReady(true);
         setEngineError(null);
+        setNavMode(runtime.getNavMode());
       } catch (error) {
         console.error(error);
         if (!disposed) {
@@ -136,6 +148,49 @@ function InferModelViewportImpl({
         tabIndex={0}
         className="viewport-dark absolute inset-0 outline-none"
       />
+
+      {engineReady && !engineError && (
+        <div className="pointer-events-none absolute left-3 top-3 z-20 flex flex-col gap-2">
+          <div className={cn(GLASS, "pointer-events-auto flex overflow-hidden")}>
+            <button
+              type="button"
+              onClick={() => switchNavMode("orbit")}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                navMode === "orbit"
+                  ? "bg-muted text-foreground"
+                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+              )}
+              title="Orbit camera"
+            >
+              <Move3d className="size-3.5" aria-hidden />
+              Orbit
+            </button>
+            <button
+              type="button"
+              onClick={() => switchNavMode("fly")}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                navMode === "fly"
+                  ? "bg-muted text-foreground"
+                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+              )}
+              title="First-person fly (WASD, Space, Shift)"
+            >
+              <PersonStanding className="size-3.5" aria-hidden />
+              Fly
+            </button>
+          </div>
+          {navMode === "fly" && (
+            <div className="pointer-events-none max-w-[220px] rounded-[6px] border border-border/70 bg-background/80 px-2 py-1.5 text-[10px] leading-relaxed text-muted-foreground backdrop-blur-[2px]">
+              <span className="font-medium text-foreground">WASD</span> move ·{" "}
+              <span className="font-medium text-foreground">Space</span> up ·{" "}
+              <span className="font-medium text-foreground">Shift</span> down ·{" "}
+              <span className="font-medium text-foreground">Ctrl</span> faster · drag to look
+            </div>
+          )}
+        </div>
+      )}
 
       {!engineReady && !engineError && (
         <div className="pointer-events-none absolute inset-0 grid place-items-center text-[13px] text-muted-foreground">

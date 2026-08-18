@@ -181,6 +181,10 @@ export function FloorplanViewer({ className }: { className?: string }) {
     for (const d of footprintsDocument.doors) {
       if (d.point && !d.incomplete) pts.push(d.point);
     }
+    for (const st of footprintsDocument.stairs ?? []) {
+      if (st.incomplete) continue;
+      for (const p of st.polygon) pts.push(p);
+    }
     return pts;
   }, [footprintsDocument]);
 
@@ -228,6 +232,20 @@ export function FloorplanViewer({ className }: { className?: string }) {
     );
   }, [footprintsDocument, activeStoreyId]);
 
+  /**
+   * Stairs often sit on one containment storey but represent a vertical shaft.
+   * Show on matching storey; if unassigned, show on every storey so they aren't lost.
+   */
+  const stairs = useMemo(() => {
+    const list = footprintsDocument?.stairs ?? [];
+    return list.filter((s) => {
+      if (s.incomplete || s.polygon.length < 3) return false;
+      if (activeStoreyId === "all") return true;
+      if (s.storey_global_id == null) return true;
+      return s.storey_global_id === activeStoreyId;
+    });
+  }, [footprintsDocument, activeStoreyId]);
+
   const overlay = useMemo(() => {
     if (!footprintsDocument || !connectivityRoute?.found) return null;
     return continuousPolylineForStorey(
@@ -261,7 +279,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
   useLayoutEffect(() => {
     if (draggingRef.current) return;
     applyCameraDom();
-  }, [applyCameraDom, buildingBounds, spaces, doors, pathD, activeStoreyId]);
+  }, [applyCameraDom, buildingBounds, spaces, doors, stairs, pathD, activeStoreyId]);
 
   // Stable overlay owns pointer/wheel so SVG re-renders never break capture mid-pan.
   useEffect(() => {
@@ -438,6 +456,24 @@ export function FloorplanViewer({ className }: { className?: string }) {
                       </path>
                     );
                   })}
+                  {stairs.map((s) => {
+                    const d =
+                      s.polygon.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ") +
+                      " Z";
+                    return (
+                      <path
+                        key={`stair:${s.global_id}`}
+                        d={d}
+                        fill="none"
+                        stroke="#7c3aed"
+                        strokeWidth={roomStroke + 0.5}
+                        strokeDasharray="6 4"
+                        vectorEffect="non-scaling-stroke"
+                      >
+                        <title>{s.name ? `Stair: ${s.name}` : "Stair"}</title>
+                      </path>
+                    );
+                  })}
                   {doors.map((d) =>
                     d.point ? (
                       <circle
@@ -536,6 +572,13 @@ export function FloorplanViewer({ className }: { className?: string }) {
               </span>
               <span className="inline-flex items-center gap-1">
                 <span className="inline-block size-2 rounded-full bg-[#f59e0b]" /> Door
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span
+                  className="inline-block h-0.5 w-4 border-t-2 border-dashed"
+                  style={{ borderColor: "#7c3aed" }}
+                />{" "}
+                Stair
               </span>
               <span className="min-w-0 flex-1 truncate">
                 {connectivityRoute?.found

@@ -23,6 +23,7 @@ from app.schemas.footprints import (
     FootprintsDocument,
     Point2D,
     SpaceFootprint,
+    StairFootprint,
     StoreyFootprintMeta,
 )
 from app.services.graph import _gid, _name, _storey_gid
@@ -186,10 +187,68 @@ def _door_portal(ifc, door) -> DoorPortal:
     )
 
 
+def _aggregated_parts(ifc, parent) -> list:
+    """Child products aggregated under parent (e.g. IfcStairFlight under IfcStair)."""
+    parts: list = []
+    for rel in ifc.by_type("IfcRelAggregates"):
+        relating = getattr(rel, "RelatingObject", None)
+        if relating != parent:
+            continue
+        parts.extend(list(getattr(rel, "RelatedObjects", None) or ()))
+    return parts
+
+
+def _stair_xy_points(ifc, stair) -> list[tuple[float, float]]:
+    """Collect XY verts from the stair and its flights/parts."""
+    points = list(_mesh_xy_points(stair))
+    for part in _aggregated_parts(ifc, stair):
+        points.extend(_mesh_xy_points(part))
+    return _unique_xy(points)
+
+
+def _stair_footprint(ifc, stair) -> StairFootprint:
+    gid = _gid(stair)
+    storey = _storey_gid(ifc, stair)
+    name = _name(stair)
+
+    xy = _stair_xy_points(ifc, stair)
+    if len(xy) >= 3:
+        hull = _convex_hull(xy)
+        if len(hull) >= 3:
+            return StairFootprint(
+                global_id=gid,
+                name=name,
+                storey_global_id=storey,
+                polygon=[Point2D(x=x, y=y) for x, y in hull],
+                incomplete=False,
+                method="ifc_mesh_xy_hull",
+            )
+
+    bbox = _bbox_polygon_from_placement(stair)
+    if bbox is not None:
+        return StairFootprint(
+            global_id=gid,
+            name=name,
+            storey_global_id=storey,
+            polygon=[Point2D(x=x, y=y) for x, y in bbox],
+            incomplete=False,
+            method="ifc_placement_bbox",
+        )
+
+    return StairFootprint(
+        global_id=gid,
+        name=name,
+        storey_global_id=storey,
+        polygon=[],
+        incomplete=True,
+        method="unavailable",
+    )
+
+
 def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
     """
-    Derive footprints for every IfcSpace / IfcDoor that enters the connectivity graph
-    (same population as graph space/door nodes).
+    Derive footprints for every IfcSpace / IfcDoor / IfcStair that enters the
+    connectivity graph (spaces + doors for path; stairs for plan overlay).
     """
     ifc = ifcopenshell.open(ifc_file_path)
 
@@ -217,9 +276,16 @@ def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
             continue
         doors.append(_door_portal(ifc, door))
 
+    stairs: list[StairFootprint] = []
+    for stair in ifc.by_type("IfcStair"):
+        if not _gid(stair):
+            continue
+        stairs.append(_stair_footprint(ifc, stair))
+
     return FootprintsDocument(
         model_id=model_id,
         storeys=storeys,
         spaces=spaces,
         doors=doors,
+        stairs=stairs,
     )

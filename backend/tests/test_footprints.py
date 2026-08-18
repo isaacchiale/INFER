@@ -45,6 +45,8 @@ def test_footprints_incomplete_on_sparse_fixture(client):
     assert doc["schema_version"] == "1.0"
     assert doc["coordinate_system"] == "ifc_world_xy_metres"
     assert any(s["global_id"] for s in doc["storeys"])
+    assert "stairs" in doc
+    assert isinstance(doc["stairs"], list)
     assert len(doc["spaces"]) >= 1
     assert all(s["incomplete"] for s in doc["spaces"])
     assert all(len(s["polygon"]) == 0 for s in doc["spaces"])

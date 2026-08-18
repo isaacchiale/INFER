@@ -46,16 +46,26 @@ export function GraphViewer({ className }: { className?: string }) {
     [graph, bands, hasGraph],
   );
 
+  /** Stable fingerprint so we don't rebuild Cytoscape on identical layouts. */
+  const layoutFingerprint = useMemo(() => {
+    if (!layout?.nodes.length) return "";
+    return layout.nodes.map((n) => `${n.id}:${n.x.toFixed(1)}:${n.y.toFixed(1)}`).join("|");
+  }, [layout]);
+
   const hostRef = useRef<HTMLDivElement | null>(null);
   const runtimeRef = useRef<CytoscapeRuntime | null>(null);
   const layoutRef = useRef<GraphLayout | null>(null);
   const themeRef = useRef(theme);
+  const fittedGraphIdRef = useRef<string | null>(null);
   const clickMode = useRef<"origin" | "destination">("origin");
   const [engineReady, setEngineReady] = useState(false);
   const [cyError, setCyError] = useState<string | null>(null);
 
   layoutRef.current = layout;
   themeRef.current = theme;
+  const graphId = graph?.model_id ?? null;
+  const graphIdRef = useRef(graphId);
+  graphIdRef.current = graphId;
 
   const spaceOptions = useMemo(
     () => (graph ? graph.nodes.filter((n) => n.kind === "space") : []),
@@ -163,7 +173,9 @@ export function GraphViewer({ className }: { className?: string }) {
         });
         // Apply whatever layout exists right now (hydration may already have finished).
         runtime.setTheme(themeRef.current);
-        runtime.setLayout(layoutRef.current ?? EMPTY_LAYOUT);
+        const initial = layoutRef.current ?? EMPTY_LAYOUT;
+        runtime.setLayout(initial, { fit: initial.nodes.length > 0 });
+        if (initial.nodes.length) fittedGraphIdRef.current = graphIdRef.current ?? "layout";
         setEngineReady(true);
         setCyError(null);
       } catch (err) {
@@ -190,20 +202,20 @@ export function GraphViewer({ className }: { className?: string }) {
 
   useEffect(() => {
     if (!engineReady || !runtimeRef.current) return;
-    runtimeRef.current.setLayout(layout ?? EMPTY_LAYOUT);
-    // Default view: always fit the graph when layout (re)loads.
-    if (layout && layout.nodes.length) {
-      requestAnimationFrame(() => runtimeRef.current?.fit());
-    }
-  }, [layout, engineReady]);
+    const next = layoutRef.current ?? EMPTY_LAYOUT;
+    const id = graphId ?? (next.nodes.length ? "layout" : null);
+    const shouldFit = Boolean(id && id !== fittedGraphIdRef.current && next.nodes.length);
+    if (shouldFit) fittedGraphIdRef.current = id;
+    runtimeRef.current.setLayout(next, { fit: shouldFit });
+  }, [layoutFingerprint, engineReady, graphId]);
 
   useEffect(() => {
     if (!engineReady || !runtimeRef.current) return;
     const pathNodes = route?.found ? (route.node_ids ?? []) : [];
-    const pathEdges = route?.found ? (route.edge_ids ?? []) : [];
+    const pathEdgeIds = route?.found ? (route.edge_ids ?? []) : [];
     const selected = [origin, destination].filter(Boolean);
-    runtimeRef.current.setPath(pathNodes, pathEdges, selected);
-  }, [route, origin, destination, engineReady, layout]);
+    runtimeRef.current.setPath(pathNodes, pathEdgeIds, selected);
+  }, [route, origin, destination, engineReady]);
 
   const pathLabel = !hasGraph
     ? EMPTY

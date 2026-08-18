@@ -21,6 +21,15 @@ export type DoorPortal = {
   method: "ifc_mesh_xy_centroid" | "ifc_object_placement" | "unavailable";
 };
 
+export type StairFootprint = {
+  global_id: string;
+  name: string;
+  storey_global_id: string | null;
+  polygon: Point2D[];
+  incomplete: boolean;
+  method: "ifc_mesh_xy_hull" | "ifc_placement_bbox" | "unavailable";
+};
+
 export type FootprintsDocument = {
   schema_version: "1.0";
   model_id: string;
@@ -29,4 +38,6 @@ export type FootprintsDocument = {
   storeys: Array<{ global_id: string; name: string; elevation: number | null }>;
   spaces: SpaceFootprint[];
   doors: DoorPortal[];
+  /** Optional for older footprints.json built before stair overlay. */
+  stairs?: StairFootprint[];
 };

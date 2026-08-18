@@ -1,8 +1,6 @@
-import { Maximize2, Minus, Plus, RotateCcw } from "lucide-react";
 import { storeys } from "@/data/mock";
 import { cn } from "@/lib/utils";
 import { useInfer } from "@/state/infer-store";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 export function FloorSelector() {
   const { activeStoreyId, setActiveStoreyId } = useInfer();
@@ -25,33 +23,6 @@ export function FloorSelector() {
           </button>
         );
       })}
-    </div>
-  );
-}
-
-export function ViewControls() {
-  const items = [
-    { icon: Plus, label: "Zoom in" },
-    { icon: Minus, label: "Zoom out" },
-    { icon: RotateCcw, label: "Reset view" },
-    { icon: Maximize2, label: "Fit model" },
-  ];
-  return (
-    <div className="pointer-events-auto absolute bottom-3 left-3 z-10 flex overflow-hidden rounded-[6px] border border-border bg-background/90 backdrop-blur-[2px]">
-      {items.map((i) => (
-        <Tooltip key={i.label}>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              className="grid size-8 place-items-center text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground"
-            >
-              <i.icon aria-hidden className="size-3.5" />
-              <span className="sr-only">{i.label}</span>
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="top">{i.label}</TooltipContent>
-        </Tooltip>
-      ))}
     </div>
   );
 }

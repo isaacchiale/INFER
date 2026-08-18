@@ -47,6 +47,21 @@ class DoorPortal(BaseModel):
     ] = "unavailable"
 
 
+class StairFootprint(BaseModel):
+    """2D plan outline for an IfcStair (top-down hull), for floorplan overlay."""
+
+    global_id: str
+    name: str = ""
+    storey_global_id: str | None = None
+    polygon: list[Point2D] = Field(default_factory=list)
+    incomplete: bool = False
+    method: Literal[
+        "ifc_mesh_xy_hull",
+        "ifc_placement_bbox",
+        "unavailable",
+    ] = "unavailable"
+
+
 class FootprintsDocument(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     model_id: str
@@ -55,3 +70,4 @@ class FootprintsDocument(BaseModel):
     storeys: list[StoreyFootprintMeta] = Field(default_factory=list)
     spaces: list[SpaceFootprint] = Field(default_factory=list)
     doors: list[DoorPortal] = Field(default_factory=list)
+    stairs: list[StairFootprint] = Field(default_factory=list)
