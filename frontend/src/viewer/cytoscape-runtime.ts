@@ -101,7 +101,7 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
     {
       selector: "edge",
       style: {
-        width: 1.5,
+        width: 3,
         "line-color": p.edge,
         "curve-style": "bezier",
         "target-arrow-shape": "none",
@@ -114,7 +114,7 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       style: {
         "line-style": "dashed",
         "line-color": p.vertical,
-        width: 1.25,
+        width: 2.5,
         opacity: p.verticalOpacity,
         "z-index": 1,
       },
@@ -122,7 +122,7 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
     {
       selector: "edge[onPath = 1]",
       style: {
-        width: 5,
+        width: 5.5,
         "line-color": p.path,
         "line-style": "solid",
         opacity: 1,
@@ -247,8 +247,8 @@ export async function createCytoscapeRuntime(
     { passive: true },
   );
 
-  const fitViewport = () => {
-    if (!cy.elements().length) return;
+  const fitViewport = (): boolean => {
+    if (!cy.elements().length) return false;
     if (container.clientWidth < 8 || container.clientHeight < 8) return false;
     suppressViewFlag = true;
     try {
@@ -288,7 +288,10 @@ export async function createCytoscapeRuntime(
     try {
       const w = container.clientWidth;
       const h = container.clientHeight;
+      // Stale container metrics make wheel zoom no-op until a hard remount/maximize.
       cy.resize();
+      cy.userZoomingEnabled(true);
+      cy.userPanningEnabled(true);
       if (!lastLayout?.nodes.length) {
         lastWh = { w, h };
         return;
@@ -296,8 +299,8 @@ export async function createCytoscapeRuntime(
       const sizeChanged = Math.abs(w - lastWh.w) > 4 || Math.abs(h - lastWh.h) > 4;
       lastWh = { w, h };
       if (!sizeChanged) return;
-      // Fit when pane gains real size and user hasn't taken over the camera.
-      if (!userAdjustedView && (!hasFittedWithSize || w > 8)) {
+      // Only auto-fit when we never framed a real-sized pane — never fight user zoom/pan.
+      if (!userAdjustedView && !hasFittedWithSize) {
         fitViewport();
       }
     } catch {
@@ -335,6 +338,7 @@ export async function createCytoscapeRuntime(
         const prevZoom = cy.zoom();
         const prevPan = { ...cy.pan() };
         const hadElements = cy.elements().length > 0;
+        const preserveCamera = hadElements && !shouldFit && userAdjustedView;
 
         applyLayoutToCy(layout);
 
@@ -350,8 +354,8 @@ export async function createCytoscapeRuntime(
           return;
         }
 
-        // Rebuild without fit — keep the user's camera.
-        if (hadElements) {
+        if (preserveCamera || hadElements) {
+          // Keep the user's (or previous) camera across element rebuilds.
           suppressViewFlag = true;
           try {
             cy.zoom(prevZoom);
@@ -361,8 +365,10 @@ export async function createCytoscapeRuntime(
               suppressViewFlag = false;
             });
           }
-        } else if (!hasFittedWithSize && !userAdjustedView) {
-          // First paint of elements without an explicit fit request.
+          return;
+        }
+
+        if (!hasFittedWithSize && !userAdjustedView) {
           const tryFit = (attempt: number) => {
             if (fitGeneration !== gen || userAdjustedView) return;
             if (fitViewport()) return;

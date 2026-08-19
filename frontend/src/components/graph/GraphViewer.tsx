@@ -64,8 +64,6 @@ export function GraphViewer({ className }: { className?: string }) {
   layoutRef.current = layout;
   themeRef.current = theme;
   const graphId = graph?.model_id ?? null;
-  const graphIdRef = useRef(graphId);
-  graphIdRef.current = graphId;
 
   const spaceOptions = useMemo(
     () => (graph ? graph.nodes.filter((n) => n.kind === "space") : []),
@@ -171,11 +169,9 @@ export function GraphViewer({ className }: { className?: string }) {
             clickMode.current = "origin";
           }
         });
-        // Apply whatever layout exists right now (hydration may already have finished).
         runtime.setTheme(themeRef.current);
-        const initial = layoutRef.current ?? EMPTY_LAYOUT;
-        runtime.setLayout(initial, { fit: initial.nodes.length > 0 });
-        if (initial.nodes.length) fittedGraphIdRef.current = graphIdRef.current ?? "layout";
+        // Layout + fit come only from the layout effect — avoid a double setLayout
+        // race that cancels the first fit and re-frames while the user zooms.
         setEngineReady(true);
         setCyError(null);
       } catch (err) {
@@ -236,7 +232,7 @@ export function GraphViewer({ className }: { className?: string }) {
         <div
           ref={hostRef}
           className="absolute inset-0 z-0 select-none"
-          style={{ background: palette.bg }}
+          style={{ background: palette.bg, touchAction: "none" }}
           aria-label="Connectivity graph canvas"
         />
         <button

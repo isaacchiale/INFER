@@ -201,7 +201,7 @@ export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
               minSize={16}
               className="min-w-0"
             >
-              <div ref={threeSlotRef} className="h-full w-full bg-viewport" />
+              <div ref={threeSlotRef} className="relative h-full w-full overflow-hidden bg-viewport" />
             </Panel>
             {(showFloor || showGraph) && <ResizeHandle />}
           </>
@@ -239,16 +239,23 @@ export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
     );
   };
 
-  // Keep a single 3D mount: dock into the layout slot when visible, else park off-screen.
+  // Keep a single 3D mount: reparent into the slot (or workspace when maximized).
+  // Never absolute-overlay the whole workspace at z-30 — a stale rect steals
+  // wheel/pan from the graph/floorplan panes until maximize "fixes" it.
   useLayoutEffect(() => {
     const host = threeHostRef.current;
     const workspace = workspaceRef.current;
     if (!host || !workspace) return;
 
     const park = () => {
+      if (host.parentElement !== workspace) {
+        workspace.appendChild(host);
+      }
       host.style.position = "fixed";
       host.style.left = "-10000px";
       host.style.top = "0px";
+      host.style.right = "auto";
+      host.style.bottom = "auto";
       host.style.width = `${KEEP_ALIVE.width}px`;
       host.style.height = `${KEEP_ALIVE.height}px`;
       host.style.opacity = "0";
@@ -257,27 +264,33 @@ export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
       host.setAttribute("aria-hidden", "true");
     };
 
-    const dockTo = (target: HTMLElement) => {
-      const wr = workspace.getBoundingClientRect();
-      const tr = target.getBoundingClientRect();
+    const dockInto = (target: HTMLElement) => {
+      if (getComputedStyle(target).position === "static") {
+        target.style.position = "relative";
+      }
+      if (host.parentElement !== target) {
+        target.appendChild(host);
+      }
       host.style.position = "absolute";
-      host.style.left = `${tr.left - wr.left}px`;
-      host.style.top = `${tr.top - wr.top}px`;
-      host.style.width = `${Math.max(tr.width, 1)}px`;
-      host.style.height = `${Math.max(tr.height, 1)}px`;
+      host.style.left = "0";
+      host.style.top = "0";
+      host.style.right = "0";
+      host.style.bottom = "0";
+      host.style.width = "100%";
+      host.style.height = "100%";
       host.style.opacity = "1";
       host.style.pointerEvents = "auto";
-      host.style.zIndex = "30";
+      host.style.zIndex = "1";
       host.setAttribute("aria-hidden", "false");
     };
 
     const sync = () => {
       if (maximizedId === "model3d") {
-        dockTo(workspace);
+        dockInto(workspace);
         return;
       }
       if (threeDocked && threeSlotRef.current) {
-        dockTo(threeSlotRef.current);
+        dockInto(threeSlotRef.current);
         return;
       }
       park();

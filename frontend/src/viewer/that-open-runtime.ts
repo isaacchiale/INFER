@@ -260,10 +260,7 @@ export async function createThatOpenRuntime(
       controls.verticalDragToForward = false;
       container.focus({ preventScroll: true });
       startFlyLoop();
-      onStatus?.(
-        "Fly mode: WASD move · Space up · Shift down · Ctrl faster · drag to look",
-        "info",
-      );
+      onStatus?.("Fly mode", "info");
     } else {
       stopFlyLoop();
       const pos = new THREE.Vector3();
@@ -289,7 +286,7 @@ export async function createThatOpenRuntime(
         target.z,
         false,
       );
-      onStatus?.("Orbit mode · pivot = building centre", "info");
+      onStatus?.("Orbit mode", "info");
     }
     void fragments.core.update(true);
   };

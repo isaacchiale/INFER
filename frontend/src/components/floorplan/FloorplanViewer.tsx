@@ -3,6 +3,7 @@ import { Check, ChevronDown, Maximize2 } from "lucide-react";
 import { useInfer } from "@/state/infer-store";
 import { continuousPolylineForStorey } from "@/lib/geometric-path";
 import { cn } from "@/lib/utils";
+import type { FootprintsDocument, SpaceFootprint } from "@/types/footprints";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -109,6 +110,23 @@ function cameraTransform(bounds: PlanView, cam: Camera): string {
   const cy = (bounds.minY + bounds.maxY) / 2;
   // Zoom about building centre, then pan in world XY (inside the Y-flip group).
   return `translate(${cam.panX} ${cam.panY}) translate(${cx} ${cy}) scale(${cam.zoom}) translate(${-cx} ${-cy})`;
+}
+
+function polygonPathD(polygon: Point2[]): string {
+  return polygon.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ") + " Z";
+}
+
+/** Resolve `space:<globalId>` from the route to a drawable footprint. */
+function spaceForRouteNode(
+  footprints: FootprintsDocument,
+  nodeId: string,
+): SpaceFootprint | null {
+  const idx = nodeId.indexOf(":");
+  if (idx <= 0 || nodeId.slice(0, idx) !== "space") return null;
+  const gid = nodeId.slice(idx + 1);
+  const space = footprints.spaces.find((s) => s.global_id === gid);
+  if (!space || space.incomplete || space.polygon.length < 3) return null;
+  return space;
 }
 
 /** Screen-pixel delta → SVG user units (viewBox space, Y down) via CTM. */
@@ -255,6 +273,27 @@ export function FloorplanViewer({ className }: { className?: string }) {
     );
   }, [footprintsDocument, connectivityRoute, activeStoreyId]);
 
+  /** Origin / destination IfcSpace polygons (not path centroids). */
+  const routeEndpointSpaces = useMemo(() => {
+    if (!footprintsDocument || !connectivityRoute?.found) {
+      return { start: null, end: null };
+    }
+    const onStorey = (storey: string | null) =>
+      activeStoreyId === "all" || storey == null || storey === activeStoreyId;
+    const start = spaceForRouteNode(
+      footprintsDocument,
+      connectivityRoute.origin_node_id,
+    );
+    const end = spaceForRouteNode(
+      footprintsDocument,
+      connectivityRoute.destination_node_id,
+    );
+    return {
+      start: start && onStorey(start.storey_global_id) ? start : null,
+      end: end && onStorey(end.storey_global_id) ? end : null,
+    };
+  }, [footprintsDocument, connectivityRoute, activeStoreyId]);
+
   const pathPoints = overlay?.points ?? [];
   const viewBox = buildingBounds ? toViewBox(buildingBounds) : "0 0 10 10";
 
@@ -263,8 +302,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
     : 10;
   const routeStroke = 5;
   const roomStroke = 1.25;
+  const endpointStroke = roomStroke + 1.5;
   const doorR = markerBase * 0.008;
-  const endR = markerBase * 0.012;
 
   const incompleteCount =
     footprintsDocument?.spaces.filter((s) => s.incomplete).length ?? 0;
@@ -440,13 +479,10 @@ export function FloorplanViewer({ className }: { className?: string }) {
               <g transform="scale(1,-1)">
                 <g ref={cameraGroupRef}>
                   {spaces.map((s) => {
-                    const d =
-                      s.polygon.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ") +
-                      " Z";
                     return (
                       <path
                         key={s.global_id}
-                        d={d}
+                        d={polygonPathD(s.polygon)}
                         fill="rgba(148,163,184,0.35)"
                         stroke="#64748b"
                         strokeWidth={roomStroke}
@@ -457,13 +493,10 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     );
                   })}
                   {stairs.map((s) => {
-                    const d =
-                      s.polygon.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ") +
-                      " Z";
                     return (
                       <path
                         key={`stair:${s.global_id}`}
-                        d={d}
+                        d={polygonPathD(s.polygon)}
                         fill="none"
                         stroke="#7c3aed"
                         strokeWidth={roomStroke + 0.5}
@@ -515,31 +548,35 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     />
                   ) : null}
 
-                  {pathPoints[0] ? (
-                    <circle
-                      cx={pathPoints[0].x}
-                      cy={pathPoints[0].y}
-                      r={endR}
-                      fill="#16a34a"
-                      stroke="#fff"
-                      strokeWidth={2}
+                  {routeEndpointSpaces.start ? (
+                    <path
+                      d={polygonPathD(routeEndpointSpaces.start.polygon)}
+                      fill="rgba(22,163,74,0.18)"
+                      stroke="#16a34a"
+                      strokeWidth={endpointStroke}
                       vectorEffect="non-scaling-stroke"
                     >
-                      <title>Start</title>
-                    </circle>
+                      <title>
+                        Start:{" "}
+                        {routeEndpointSpaces.start.name ||
+                          routeEndpointSpaces.start.global_id}
+                      </title>
+                    </path>
                   ) : null}
-                  {pathPoints.length > 1 ? (
-                    <circle
-                      cx={pathPoints[pathPoints.length - 1]!.x}
-                      cy={pathPoints[pathPoints.length - 1]!.y}
-                      r={endR}
-                      fill="#dc2626"
-                      stroke="#fff"
-                      strokeWidth={2}
+                  {routeEndpointSpaces.end ? (
+                    <path
+                      d={polygonPathD(routeEndpointSpaces.end.polygon)}
+                      fill="rgba(220,38,38,0.18)"
+                      stroke="#dc2626"
+                      strokeWidth={endpointStroke}
                       vectorEffect="non-scaling-stroke"
                     >
-                      <title>End (this floor)</title>
-                    </circle>
+                      <title>
+                        End:{" "}
+                        {routeEndpointSpaces.end.name ||
+                          routeEndpointSpaces.end.global_id}
+                      </title>
+                    </path>
                   ) : null}
                 </g>
               </g>
@@ -562,13 +599,21 @@ export function FloorplanViewer({ className }: { className?: string }) {
 
             <div className="pointer-events-none absolute bottom-2 left-2 right-2 flex flex-wrap items-center gap-3 rounded-md border border-border/80 bg-background/90 px-2 py-1.5 text-[11px] text-muted-foreground backdrop-blur-sm">
               <span className="inline-flex items-center gap-1">
-                <span className="inline-block size-2 rounded-full bg-[#16a34a]" /> Start
+                <span
+                  className="inline-block size-2.5 border-2 border-[#16a34a]"
+                  style={{ background: "rgba(22,163,74,0.25)" }}
+                />{" "}
+                Start
               </span>
               <span className="inline-flex items-center gap-1">
                 <span className="inline-block h-0.5 w-4 bg-[#1d4ed8]" /> Route
               </span>
               <span className="inline-flex items-center gap-1">
-                <span className="inline-block size-2 rounded-full bg-[#dc2626]" /> End
+                <span
+                  className="inline-block size-2.5 border-2 border-[#dc2626]"
+                  style={{ background: "rgba(220,38,38,0.25)" }}
+                />{" "}
+                End
               </span>
               <span className="inline-flex items-center gap-1">
                 <span className="inline-block size-2 rounded-full bg-[#f59e0b]" /> Door

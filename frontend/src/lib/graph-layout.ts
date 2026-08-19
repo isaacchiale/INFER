@@ -158,7 +158,280 @@ export type GraphLayout = {
   cellH: number;
 };
 
-/** Level-banded free layout — explicit per-cell margins so nodes never collide. */
+/** Stable 0..1 from id — keeps force seeds deterministic across reloads. */
+function hash01(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) / 4294967296;
+}
+
+/** Connected components over undirected edges (nodes with no edges are singleton comps). */
+function connectedComponents(
+  nodeIds: string[],
+  edges: Array<{ source: string; target: string }>,
+): string[][] {
+  const idSet = new Set(nodeIds);
+  const adj = new Map<string, string[]>();
+  for (const id of nodeIds) adj.set(id, []);
+  for (const e of edges) {
+    if (!idSet.has(e.source) || !idSet.has(e.target) || e.source === e.target) continue;
+    adj.get(e.source)!.push(e.target);
+    adj.get(e.target)!.push(e.source);
+  }
+
+  const seen = new Set<string>();
+  const comps: string[][] = [];
+  for (const id of nodeIds) {
+    if (seen.has(id)) continue;
+    const stack = [id];
+    const comp: string[] = [];
+    seen.add(id);
+    while (stack.length) {
+      const cur = stack.pop()!;
+      comp.push(cur);
+      for (const nb of adj.get(cur) ?? []) {
+        if (seen.has(nb)) continue;
+        seen.add(nb);
+        stack.push(nb);
+      }
+    }
+    comp.sort((a, b) => a.localeCompare(b));
+    comps.push(comp);
+  }
+  // Largest components first, then isolates — keeps the main cluster on the left.
+  comps.sort((a, b) => b.length - a.length || a[0]!.localeCompare(b[0]!));
+  return comps;
+}
+
+/**
+ * Force-directed layout for one connected component (local XY, centred near origin).
+ * Springs + repulsion + gravity → compact “blob” clusters.
+ */
+function forceLayoutComponent(
+  nodeIds: string[],
+  edges: Array<{ source: string; target: string }>,
+): Map<string, { x: number; y: number }> {
+  const n = nodeIds.length;
+  const out = new Map<string, { x: number; y: number }>();
+  if (n === 0) return out;
+  if (n === 1) {
+    out.set(nodeIds[0]!, { x: 0, y: 0 });
+    return out;
+  }
+
+  const ideal = LAYOUT_NODE_W + LAYOUT_NODE_GAP_X; // ~128
+  const minSep = LAYOUT_NODE_W + LAYOUT_NODE_GAP_X * 0.45;
+  const repulsion = ideal * 1.2;
+  const iterations = Math.min(400, 160 + n * 14);
+
+  const idSet = new Set(nodeIds);
+  const localEdges = edges.filter((e) => idSet.has(e.source) && idSet.has(e.target));
+
+  const radius = Math.max(ideal * 0.85, ideal * 0.4 * Math.sqrt(n));
+  const pos = nodeIds.map((id, i) => {
+    const base = (2 * Math.PI * i) / n;
+    const jitter = (hash01(id) - 0.5) * (Math.PI / Math.max(n, 1));
+    const a = base + jitter;
+    const r = radius * (0.85 + hash01(`${id}:r`) * 0.3);
+    return { id, x: Math.cos(a) * r, y: Math.sin(a) * r };
+  });
+  const index = new Map(pos.map((p, i) => [p.id, i]));
+
+  for (let iter = 0; iter < iterations; iter++) {
+    const cooling = 1 - iter / iterations;
+    const temp = 12 * cooling + 0.5;
+    const fx = new Float64Array(n);
+    const fy = new Float64Array(n);
+
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        let dx = pos[i]!.x - pos[j]!.x;
+        let dy = pos[i]!.y - pos[j]!.y;
+        let dist = Math.hypot(dx, dy);
+        if (dist < 1e-6) {
+          dx = (hash01(`${pos[i]!.id}|${pos[j]!.id}`) - 0.5) * 0.01;
+          dy = (hash01(`${pos[j]!.id}|${pos[i]!.id}`) - 0.5) * 0.01;
+          dist = Math.hypot(dx, dy) || 0.01;
+        }
+        const rep = (repulsion * repulsion) / (dist * dist);
+        const sep = dist < minSep ? ((minSep - dist) / dist) * 3 : 0;
+        const f = rep + sep;
+        const ux = (dx / dist) * f;
+        const uy = (dy / dist) * f;
+        fx[i]! += ux;
+        fy[i]! += uy;
+        fx[j]! -= ux;
+        fy[j]! -= uy;
+      }
+    }
+
+    for (const e of localEdges) {
+      const i = index.get(e.source);
+      const j = index.get(e.target);
+      if (i == null || j == null || i === j) continue;
+      let dx = pos[j]!.x - pos[i]!.x;
+      let dy = pos[j]!.y - pos[i]!.y;
+      let dist = Math.hypot(dx, dy) || 0.01;
+      const f = ((dist - ideal) / ideal) * 0.9;
+      const ux = (dx / dist) * f;
+      const uy = (dy / dist) * f;
+      fx[i]! += ux;
+      fy[i]! += uy;
+      fx[j]! -= ux;
+      fy[j]! -= uy;
+    }
+
+    // Stronger gravity → tighter, nicer blobs (only within this component).
+    const gravity = 0.035 + 0.05 * cooling;
+    for (let i = 0; i < n; i++) {
+      fx[i]! -= pos[i]!.x * gravity;
+      fy[i]! -= pos[i]!.y * gravity;
+    }
+
+    for (let i = 0; i < n; i++) {
+      let dx = fx[i]!;
+      let dy = fy[i]!;
+      const mag = Math.hypot(dx, dy);
+      if (mag > temp) {
+        dx = (dx / mag) * temp;
+        dy = (dy / mag) * temp;
+      }
+      pos[i]!.x += dx;
+      pos[i]!.y += dy;
+    }
+  }
+
+  for (const p of pos) out.set(p.id, { x: p.x, y: p.y });
+  return out;
+}
+
+function componentBBox(local: Map<string, { x: number; y: number }>, ids: string[]) {
+  const halfW = LAYOUT_NODE_W / 2;
+  const halfH = LAYOUT_NODE_H / 2;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const id of ids) {
+    const p = local.get(id)!;
+    minX = Math.min(minX, p.x - halfW);
+    minY = Math.min(minY, p.y - halfH);
+    maxX = Math.max(maxX, p.x + halfW);
+    maxY = Math.max(maxY, p.y + halfH);
+  }
+  if (!Number.isFinite(minX)) {
+    return { minX: 0, minY: 0, maxX: LAYOUT_NODE_W, maxY: LAYOUT_NODE_H, w: LAYOUT_NODE_W, h: LAYOUT_NODE_H };
+  }
+  return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY };
+}
+
+/** Clear air between separate connected clusters on one storey. */
+const CLUSTER_GAP = LAYOUT_NODE_GAP_X * 1.35;
+/** How far outside the cluster hull isolates sit. */
+const ISOLATE_MARGIN = LAYOUT_NODE_W * 0.85 + LAYOUT_NODE_GAP_X * 0.5;
+/** Gap between room clusters and the stair/lift column on the right. */
+const PORTAL_COLUMN_GAP = LAYOUT_NODE_GAP_X * 1.25;
+
+/**
+ * Force-layout connected clusters (with gravity), pack them so they never
+ * intersect, then sit isolates on a ring around the cluster hull — not inside.
+ */
+function forceLayoutStorey(
+  nodeIds: string[],
+  edges: Array<{ source: string; target: string }>,
+): Map<string, { x: number; y: number }> {
+  const out = new Map<string, { x: number; y: number }>();
+  if (!nodeIds.length) return out;
+
+  const comps = connectedComponents(nodeIds, edges);
+  const clusters = comps.filter((c) => c.length >= 2);
+  const isolateIds = comps.filter((c) => c.length === 1).map((c) => c[0]!);
+
+  // No edges at all — small ring / grid of isolates only.
+  if (!clusters.length) {
+    const n = isolateIds.length;
+    if (n === 1) {
+      out.set(isolateIds[0]!, { x: 0, y: 0 });
+      return out;
+    }
+    const r = Math.max(LAYOUT_NODE_W + LAYOUT_NODE_GAP_X, 40 * Math.sqrt(n));
+    isolateIds.forEach((id, i) => {
+      const a = (2 * Math.PI * i) / n + hash01(id) * 0.2;
+      out.set(id, { x: Math.cos(a) * r, y: Math.sin(a) * r });
+    });
+    return out;
+  }
+
+  let cursorX = 0;
+  let maxH = 0;
+  const placed: Array<{
+    ids: string[];
+    local: Map<string, { x: number; y: number }>;
+    bbox: ReturnType<typeof componentBBox>;
+    originX: number;
+  }> = [];
+
+  for (const ids of clusters) {
+    const local = forceLayoutComponent(ids, edges);
+    const bbox = componentBBox(local, ids);
+    placed.push({ ids, local, bbox, originX: cursorX });
+    cursorX += bbox.w + CLUSTER_GAP;
+    maxH = Math.max(maxH, bbox.h);
+  }
+
+  for (const block of placed) {
+    const yPad = (maxH - block.bbox.h) / 2;
+    for (const id of block.ids) {
+      const p = block.local.get(id)!;
+      out.set(id, {
+        x: p.x - block.bbox.minX + block.originX,
+        y: p.y - block.bbox.minY + yPad,
+      });
+    }
+  }
+
+  // Union hull of all clusters (centers already in `out`).
+  let uMinX = Infinity;
+  let uMinY = Infinity;
+  let uMaxX = -Infinity;
+  let uMaxY = -Infinity;
+  for (const block of placed) {
+    for (const id of block.ids) {
+      const p = out.get(id)!;
+      uMinX = Math.min(uMinX, p.x - LAYOUT_NODE_W / 2);
+      uMinY = Math.min(uMinY, p.y - LAYOUT_NODE_H / 2);
+      uMaxX = Math.max(uMaxX, p.x + LAYOUT_NODE_W / 2);
+      uMaxY = Math.max(uMaxY, p.y + LAYOUT_NODE_H / 2);
+    }
+  }
+  const cx = (uMinX + uMaxX) / 2;
+  const cy = (uMinY + uMaxY) / 2;
+  const rx = Math.max((uMaxX - uMinX) / 2 + ISOLATE_MARGIN, LAYOUT_NODE_W * 1.5);
+  const ry = Math.max((uMaxY - uMinY) / 2 + ISOLATE_MARGIN, LAYOUT_NODE_H * 1.5);
+
+  // Spread isolates around the outside; prefer right/bottom arc so they don't
+  // crowd the label gutter on the left when the band is later placed.
+  const nIso = isolateIds.length;
+  isolateIds.forEach((id, i) => {
+    // Start at ~-50° and sweep ~280° so the left label side stays clearer.
+    const t = nIso === 1 ? 0.15 : i / nIso;
+    const a = -Math.PI * 0.35 + t * Math.PI * 1.55 + (hash01(id) - 0.5) * 0.25;
+    out.set(id, {
+      x: cx + Math.cos(a) * rx,
+      y: cy + Math.sin(a) * ry,
+    });
+  });
+
+  return out;
+}
+
+/**
+ * Level-banded layout: each storey is force-directed; bands stack top→bottom
+ * in elevation order with a fixed {@link LAYOUT_BAND_GAP} between levels.
+ */
 export function buildGraphLayout(graph: ConnectivityGraph, bands: StoreyBand[]): GraphLayout {
   const display = toDisplayGraph(graph);
   const bandIndex = new Map(bands.map((b, i) => [b.id, i]));
@@ -167,7 +440,8 @@ export function buildGraphLayout(graph: ConnectivityGraph, bands: StoreyBand[]):
   const spacesByStorey = new Map<string, GraphNode[]>();
   for (const node of display.nodes) {
     if (node.kind !== "space") continue;
-    const key = node.storey_global_id ?? "__none__";
+    const raw = node.storey_global_id ?? "__none__";
+    const key = bandIndex.has(raw) ? raw : "__none__";
     const list = spacesByStorey.get(key) ?? [];
     list.push(node);
     spacesByStorey.set(key, list);
@@ -176,72 +450,175 @@ export function buildGraphLayout(graph: ConnectivityGraph, bands: StoreyBand[]):
     list.sort((a, b) => (a.name || a.global_id).localeCompare(b.name || b.global_id));
   }
 
-  const maxOnStorey = Math.max(1, ...[...spacesByStorey.values()].map((l) => l.length));
-  // Prefer wider rows over cramped multi-row stacks when possible.
-  const cols = Math.min(8, Math.max(3, Math.ceil(Math.sqrt(maxOnStorey))));
   const cellW = LAYOUT_NODE_W + LAYOUT_NODE_GAP_X;
   const cellH = LAYOUT_NODE_H + LAYOUT_NODE_GAP_Y;
 
-  const bandHeights = bands.map((band) => {
-    const count = (spacesByStorey.get(band.id) ?? []).length;
-    const rows = Math.max(1, Math.ceil(count / cols));
-    // Sparse floors keep a shorter band so empty storeys don't inflate gaps.
-    const top = count <= 2 ? 36 : LAYOUT_TOP_PAD;
-    const bottom = count <= 2 ? 28 : LAYOUT_BOTTOM_PAD;
-    return top + rows * cellH + bottom;
+  // Intra-storey edges only — vertical links don't pull rooms across floors.
+  const undirectedIntra: Array<{ source: string; target: string }> = [];
+  const seenIntra = new Set<string>();
+  for (const edge of display.edges) {
+    if (edge.kind === "vertical") continue;
+    const a = edge.source < edge.target ? edge.source : edge.target;
+    const b = edge.source < edge.target ? edge.target : edge.source;
+    const key = `${a}|${b}`;
+    if (seenIntra.has(key)) continue;
+    seenIntra.add(key);
+    undirectedIntra.push({ source: edge.source, target: edge.target });
+  }
+
+  type BandPack = {
+    band: StoreyBand;
+    height: number;
+    /** Max right edge of room nodes in band-local coords (top-left system). */
+    contentRight: number;
+    placements: Array<{ node: GraphNode; x: number; y: number }>;
+  };
+
+  const packs: BandPack[] = bands.map((band) => {
+    const siblings = spacesByStorey.get(band.id) ?? [];
+    if (!siblings.length) {
+      return {
+        band,
+        height: LAYOUT_TOP_PAD + cellH + LAYOUT_BOTTOM_PAD,
+        contentRight: 0,
+        placements: [],
+      };
+    }
+
+    const ids = siblings.map((s) => s.id);
+    const local = forceLayoutStorey(ids, undirectedIntra);
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const id of ids) {
+      const p = local.get(id)!;
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+    const halfW = LAYOUT_NODE_W / 2;
+    const halfH = LAYOUT_NODE_H / 2;
+    minX -= halfW;
+    minY -= halfH;
+    maxX += halfW;
+    maxY += halfH;
+
+    const contentH = Math.max(maxY - minY, LAYOUT_NODE_H);
+    const top = siblings.length <= 2 ? 36 : LAYOUT_TOP_PAD;
+    const bottom = siblings.length <= 2 ? 28 : LAYOUT_BOTTOM_PAD;
+    const height = top + contentH + bottom;
+
+    const placements = siblings.map((node) => {
+      const p = local.get(node.id)!;
+      return {
+        node,
+        x: p.x - halfW - minX,
+        y: p.y - halfH - minY + top,
+      };
+    });
+
+    const contentRight = Math.max(0, ...placements.map((p) => p.x + LAYOUT_NODE_W));
+
+    return { band, height, contentRight, placements };
   });
 
   let yCursor = 0;
   const bandOriginY: number[] = [];
-  bands.forEach((_, i) => {
+  packs.forEach((pack) => {
     bandOriginY.push(yCursor);
-    yCursor += (bandHeights[i] ?? 240) + LAYOUT_BAND_GAP;
+    yCursor += pack.height + LAYOUT_BAND_GAP;
   });
 
-  bands.forEach((band, i) => {
+  // Shared right column past the widest storey cluster so stairs never sit on labels.
+  const maxClusterRight =
+    LAYOUT_GUTTER_X + Math.max(LAYOUT_NODE_W * 2, ...packs.map((p) => p.contentRight));
+  const portalColumnX = maxClusterRight + PORTAL_COLUMN_GAP;
+
+  packs.forEach((pack, i) => {
+    const originY = bandOriginY[i] ?? 0;
     nodes.push({
-      id: `label:${band.id}`,
+      id: `label:${pack.band.id}`,
       kind: "label",
-      label: band.label,
+      label: pack.band.label,
       x: 16,
-      y: (bandOriginY[i] ?? 0) + (bandHeights[i] ?? 240) / 2 - 12,
+      y: originY + pack.height / 2 - 12,
       w: 140,
       h: 24,
     });
-  });
 
-  for (const node of display.nodes) {
-    if (node.kind === "space") {
-      const storey = node.storey_global_id ?? "__none__";
-      const idx = bandIndex.has(storey)
-        ? (bandIndex.get(storey) as number)
-        : (bandIndex.get("__none__") ?? Math.max(bands.length - 1, 0));
-      const siblings = spacesByStorey.get(storey) ?? [];
-      const order = Math.max(siblings.findIndex((n) => n.id === node.id), 0);
-      const col = order % cols;
-      const row = Math.floor(order / cols);
+    for (const { node, x, y } of pack.placements) {
       const label = node.name || node.global_id.slice(0, 8);
       nodes.push({
         id: node.id,
         kind: "space",
         label: label.length > 20 ? `${label.slice(0, 18)}…` : label,
-        x: LAYOUT_GUTTER_X + col * cellW,
-        y: (bandOriginY[idx] ?? 0) + LAYOUT_TOP_PAD + row * cellH,
+        x: LAYOUT_GUTTER_X + x,
+        y: originY + y,
         w: LAYOUT_NODE_W,
         h: LAYOUT_NODE_H,
       });
-    } else if (node.kind === "stair" || node.kind === "lift") {
-      const totalH = Math.max(yCursor - LAYOUT_BAND_GAP, 240);
-      const raw = node.name || node.kind;
+    }
+  });
+
+  // Stair / lift portals: right of every level's clusters (never over Level labels).
+  const spaceById = new Map(display.nodes.filter((n) => n.kind === "space").map((n) => [n.id, n]));
+  const portals = display.nodes.filter((n) => n.kind === "stair" || n.kind === "lift");
+  const portalsByBand = new Map<number, GraphNode[]>();
+
+  for (const portal of portals) {
+    let bandIdx: number | null = null;
+    const raw = portal.storey_global_id;
+    if (raw && bandIndex.has(raw)) {
+      bandIdx = bandIndex.get(raw)!;
+    } else {
+      // Prefer the highest connected storey (top of stack); else last band.
+      let bestElev = -Infinity;
+      for (const edge of display.edges) {
+        const otherId =
+          edge.source === portal.id ? edge.target : edge.target === portal.id ? edge.source : null;
+        if (!otherId) continue;
+        const space = spaceById.get(otherId);
+        if (!space) continue;
+        const key = space.storey_global_id ?? "__none__";
+        const idx = bandIndex.get(key) ?? bandIndex.get("__none__");
+        if (idx == null) continue;
+        const elev = bands[idx]?.elevation ?? -idx;
+        if (elev > bestElev) {
+          bestElev = elev;
+          bandIdx = idx;
+        }
+      }
+    }
+    if (bandIdx == null) bandIdx = Math.max(0, bands.length - 1);
+    const list = portalsByBand.get(bandIdx) ?? [];
+    list.push(portal);
+    portalsByBand.set(bandIdx, list);
+  }
+
+  for (const [bandIdx, list] of portalsByBand) {
+    list.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+    const pack = packs[bandIdx];
+    const originY = bandOriginY[bandIdx] ?? 0;
+    const bandH = pack?.height ?? cellH;
+    const stackGap = 12;
+    const totalStack =
+      list.length * LAYOUT_PORTAL_H + Math.max(0, list.length - 1) * stackGap;
+    let y = originY + Math.max(16, (bandH - totalStack) / 2);
+    for (const portal of list) {
+      const raw = portal.name || portal.kind;
       nodes.push({
-        id: node.id,
-        kind: node.kind,
-        label: raw.length > 16 ? node.kind : raw,
-        x: 48,
-        y: totalH / 2 + (node.kind === "lift" ? 56 : -56) - LAYOUT_PORTAL_H / 2,
+        id: portal.id,
+        kind: portal.kind as "stair" | "lift",
+        label: raw.length > 16 ? portal.kind : raw,
+        x: portalColumnX,
+        y,
         w: LAYOUT_PORTAL_W,
         h: LAYOUT_PORTAL_H,
       });
+      y += LAYOUT_PORTAL_H + stackGap;
     }
   }
 
@@ -302,10 +679,10 @@ export function graphPalette(theme: "light" | "dark"): GraphThemePalette {
       portalFill: "#7C2D12",
       portalLabel: "#FFEDD5",
       portalBorder: "#9A3412",
-      edge: "#1E293B",
-      edgeOpacity: 0.5,
-      vertical: "#B45309",
-      verticalOpacity: 0.25,
+      edge: "#64748B",
+      edgeOpacity: 0.9,
+      vertical: "#F59E0B",
+      verticalOpacity: 0.55,
       path: "#FFB703",
       pathNode: "#00E5FF",
       pathUnderlay: "#00E5FF",
@@ -320,10 +697,10 @@ export function graphPalette(theme: "light" | "dark"): GraphThemePalette {
     portalFill: "#FFEDD5",
     portalLabel: "#9A3412",
     portalBorder: "#FDBA74",
-    edge: "#CBD5E1",
-    edgeOpacity: 0.6,
+    edge: "#94A3B8",
+    edgeOpacity: 0.95,
     vertical: "#F97316",
-    verticalOpacity: 0.25,
+    verticalOpacity: 0.55,
     path: "#1D4ED8",
     pathNode: "#2563EB",
     pathUnderlay: "#2563EB",
