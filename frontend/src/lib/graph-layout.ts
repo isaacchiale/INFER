@@ -153,6 +153,8 @@ export type LayoutNode = {
   y: number;
   w: number;
   h: number;
+  /** Geometry rules: candidate nested parent (red circle in viewer). */
+  nestedParent?: boolean;
 };
 
 export type LayoutEdge = {
@@ -630,6 +632,7 @@ export function buildGraphLayout(graph: ConnectivityGraph, bands: StoreyBand[]):
         y: originY + y,
         w: LAYOUT_NODE_W,
         h: LAYOUT_NODE_H,
+        nestedParent: Boolean(node.nested_parent),
       });
     }
   });

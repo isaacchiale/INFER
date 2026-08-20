@@ -99,6 +99,18 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       },
     },
     {
+      // Nested IfcSpace parents (geometry rules) — red circle; keep after onPath
+      // so flagged parents stay circled even when also on the route.
+      selector: "node[nestedParent = 1]",
+      style: {
+        "underlay-color": "#ef4444",
+        "underlay-padding": 10,
+        "underlay-opacity": 0.55,
+        "underlay-shape": "ellipse",
+        "z-index": 45,
+      },
+    },
+    {
       selector: "edge",
       style: {
         width: 3,
@@ -166,6 +178,7 @@ export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
         label: node.label,
         kind: node.kind,
         onPath: 0,
+        nestedParent: node.nestedParent ? 1 : 0,
       },
       position: { x: node.x + node.w / 2, y: node.y + node.h / 2 },
       selectable: node.kind === "space",

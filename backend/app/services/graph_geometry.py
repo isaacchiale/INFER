@@ -6,12 +6,15 @@ import math
 from copy import deepcopy
 
 from app.schemas.footprints import FootprintsDocument, Point2D, SpaceFootprint
-from app.schemas.graph import ConnectivityGraph, GraphEdge
+from app.schemas.graph import ConnectivityGraph, GraphEdge, GraphNode
 
 
 DOOR_CLEARANCE_M = 1.0
 # Stair links require real footprint ∩ hull (no soft clearance — that linked whole floors).
 STAIR_INTERSECT_EPS = 1e-4
+# Nested-parent detection (geometry variant highlight only — no removal yet).
+NESTED_CHILD_VERTEX_IN_PARENT = 0.85
+NESTED_CHILD_AREA_RATIO_MAX = 0.98
 
 
 def _point_in_polygon(x: float, y: float, polygon: list[Point2D]) -> bool:
@@ -340,6 +343,70 @@ def _storey_ids_ordered_by_elevation(footprints: FootprintsDocument) -> list[str
     return [s.global_id for s in with_elev]
 
 
+def _footprint_contained(child: SpaceFootprint, parent: SpaceFootprint) -> bool:
+    """
+    True when child sits inside parent: centroid in parent and most ring
+    vertices in parent. Used to find nested IfcSpace parents without IFC
+    CompositionType / RelAggregates.
+    """
+    if len(child.polygon) < 3 or len(parent.polygon) < 3:
+        return False
+    inside = sum(
+        1 for p in child.polygon if _point_in_polygon(p.x, p.y, parent.polygon)
+    )
+    if inside / len(child.polygon) < NESTED_CHILD_VERTEX_IN_PARENT:
+        return False
+    cx = sum(p.x for p in child.polygon) / len(child.polygon)
+    cy = sum(p.y for p in child.polygon) / len(child.polygon)
+    return _point_in_polygon(cx, cy, parent.polygon)
+
+
+def find_nested_parent_gids(footprints: FootprintsDocument) -> set[str]:
+    """
+    Same-storey spaces that contain at least one smaller nested space.
+
+    These are candidates to remove (near-zero leftover / group label) or
+    reduce to parent−children residual corridor. Detection only — callers
+    flag graph nodes; they do not rewrite the graph yet.
+    """
+    by_storey: dict[str | None, list[SpaceFootprint]] = {}
+    for space in _all_complete_spaces(footprints):
+        by_storey.setdefault(space.storey_global_id, []).append(space)
+
+    parents: set[str] = set()
+    for group in by_storey.values():
+        areas = {s.global_id: _polygon_area(s.polygon) for s in group}
+        for parent in group:
+            pa = areas[parent.global_id]
+            if pa <= STAIR_INTERSECT_EPS:
+                continue
+            for child in group:
+                if child.global_id == parent.global_id:
+                    continue
+                ca = areas[child.global_id]
+                if ca >= pa * NESTED_CHILD_AREA_RATIO_MAX:
+                    continue
+                if _footprint_contained(child, parent):
+                    parents.add(parent.global_id)
+                    break
+    return parents
+
+
+def _annotate_nested_parents(
+    nodes: list[GraphNode], footprints: FootprintsDocument
+) -> list[GraphNode]:
+    parent_gids = find_nested_parent_gids(footprints)
+    if not parent_gids:
+        return nodes
+    out: list[GraphNode] = []
+    for node in nodes:
+        if node.kind == "space" and node.global_id in parent_gids:
+            out.append(node.model_copy(update={"nested_parent": True}))
+        else:
+            out.append(node)
+    return out
+
+
 def _stair_candidate_storeys(
     footprints: FootprintsDocument, stair_storey_gid: str | None
 ) -> set[str] | None:
@@ -504,9 +571,10 @@ def build_geometry_graph(
             edge_ids.add(eid)
             linked_stair_spaces.add((stair_id, space_id))
 
+    annotated = _annotate_nested_parents(nodes, footprints)
     return ConnectivityGraph(
         model_id=ifc_graph.model_id,
         variant="geometry",
-        nodes=deepcopy(nodes),
+        nodes=deepcopy(annotated),
         edges=edges,
     )

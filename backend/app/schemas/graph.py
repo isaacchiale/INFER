@@ -27,6 +27,12 @@ class GraphNode(BaseModel):
     global_id: str
     name: str = ""
     storey_global_id: str | None = None
+    """
+    True when this space geometrically contains other same-storey spaces
+    (candidate to remove or reduce to residual corridor). Geometry variant only;
+    nodes are flagged, not removed yet.
+    """
+    nested_parent: bool = False
 
 
 class GraphEdge(BaseModel):

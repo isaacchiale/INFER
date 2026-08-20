@@ -516,3 +516,61 @@ def test_merge_topologic_edges_marks_inferred():
     assert len(inferred) == 1
     assert inferred[0].method == "topologicpy_adjacency"
     assert inferred[0].kind == "space_space"
+
+
+def test_nested_parent_flagged_when_space_contains_children():
+    """Parent footprint containing smaller rooms → nested_parent on geometry graph."""
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:PARENT", kind="space", global_id="PARENT", storey_global_id="L1"),
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+            GraphNode(id="space:OTHER", kind="space", global_id="OTHER", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("PARENT", "L1", 0, 0, 20, 10),
+            _box_space("A", "L1", 1, 1, 5, 5),
+            _box_space("B", "L1", 12, 1, 18, 8),
+            _box_space("OTHER", "L1", 30, 0, 34, 4),
+        ],
+        doors=[],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    by_id = {n.id: n for n in geo.nodes}
+    assert by_id["space:PARENT"].nested_parent is True
+    assert by_id["space:A"].nested_parent is False
+    assert by_id["space:B"].nested_parent is False
+    assert by_id["space:OTHER"].nested_parent is False
+
+
+def test_adjacent_rooms_are_not_nested_parents():
+    """Side-by-side rooms must not flag each other as nested parents."""
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", 0, 0, 4, 4),
+            _box_space("B", "L1", 5, 0, 9, 4),
+        ],
+        doors=[],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    assert all(not n.nested_parent for n in geo.nodes)

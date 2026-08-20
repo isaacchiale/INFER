@@ -24,5 +24,11 @@ Edges with ``inferred: true`` (methods ``geom_door_space``, ``geom_stair_space``
 ``topologicpy_adjacency``) are drawn green in the Graph Viewer. Baseline
 ``ifc_rel_space_boundary`` edges stay grey.
 
+Nested parents (geometry)
+-------------------------
+Spaces whose footprints contain smaller same-storey spaces are flagged
+``nested_parent: true`` on the geometry graph. The Graph Viewer draws a red
+circle around them. Detection only — parents are not removed or reduced yet.
+
 Source IFC is never modified.
 """

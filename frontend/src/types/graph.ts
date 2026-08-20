@@ -8,6 +8,11 @@ export interface GraphNode {
   global_id: string;
   name: string;
   storey_global_id: string | null;
+  /**
+   * Geometry variant: space contains other same-storey spaces
+   * (candidate to remove or reduce to residual). Flagged only — not removed yet.
+   */
+  nested_parent?: boolean;
   /** Optional short code for labels (FE demo). */
   code?: string;
   /** Optional category for colouring (FE demo). */
