@@ -150,3 +150,116 @@ def test_storey_elevation_millimetres_converted_to_metres(tmp_path):
     doc = footprints_service.build_footprints("mm-model", str(ifc_path))
     assert len(doc.storeys) == 1
     assert doc.storeys[0].elevation == pytest.approx(3.0)
+
+
+def test_outline_from_extruded_box_uses_horizontal_faces():
+    """Closed prism: all-face projection has no boundary edges; floor faces still outline."""
+    # Unit box 0..2 x 0..3 x 0..1
+    verts = [
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (2.0, 3.0, 0.0),
+        (0.0, 3.0, 0.0),
+        (0.0, 0.0, 1.0),
+        (2.0, 0.0, 1.0),
+        (2.0, 3.0, 1.0),
+        (0.0, 3.0, 1.0),
+    ]
+    faces = [
+        # bottom
+        (0, 1, 2),
+        (0, 2, 3),
+        # top
+        (4, 6, 5),
+        (4, 7, 6),
+        # sides
+        (0, 1, 5),
+        (0, 5, 4),
+        (1, 2, 6),
+        (1, 6, 5),
+        (2, 3, 7),
+        (2, 7, 6),
+        (3, 0, 4),
+        (3, 4, 7),
+    ]
+    assert footprints_service._boundary_edges_xy(verts, faces) == []
+    outlined = footprints_service.outline_from_mesh_xy(verts, faces)
+    assert outlined is not None
+    exterior, holes = outlined
+    assert holes == []
+    xs = [p[0] for p in exterior]
+    ys = [p[1] for p in exterior]
+    assert min(xs) == pytest.approx(0.0)
+    assert max(xs) == pytest.approx(2.0)
+    assert min(ys) == pytest.approx(0.0)
+    assert max(ys) == pytest.approx(3.0)
+
+
+def test_outline_preserves_l_shape_concavity():
+    """Two-box L mesh must keep the indent (not fill like a convex hull)."""
+    # Vertical bar (0,0)-(2,0)-(2,6)-(0,6) + horizontal (2,0)-(6,0)-(6,2)-(2,2)
+    verts = [
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (0.0, 2.0, 0.0),
+        (2.0, 6.0, 0.0),
+        (0.0, 6.0, 0.0),
+        (6.0, 0.0, 0.0),
+        (6.0, 2.0, 0.0),
+    ]
+    # indices into verts
+    faces = [
+        (0, 1, 2),
+        (0, 2, 3),
+        (3, 2, 4),
+        (3, 4, 5),
+        (1, 6, 7),
+        (1, 7, 2),
+    ]
+    outlined = footprints_service.outline_from_mesh_xy(verts, faces)
+    assert outlined is not None
+    exterior, holes = outlined
+    assert holes == []
+    # Inner corner of the L near (2,2) should be on the outline (concave).
+    assert any(abs(p[0] - 2.0) < 0.15 and abs(p[1] - 2.0) < 0.15 for p in exterior)
+    # Point in the missing corner of the bounding box must be outside.
+    assert not footprints_service._point_in_ring(4.0, 4.0, exterior)
+
+
+def test_outline_extracts_inner_hole():
+    """Square with square courtyard: outer + one hole."""
+    # Outer 0..6, hole 2..4 — triangulate as a frame (8 triangles).
+    verts = [
+        (0.0, 0.0, 0.0),
+        (6.0, 0.0, 0.0),
+        (6.0, 6.0, 0.0),
+        (0.0, 6.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (4.0, 2.0, 0.0),
+        (4.0, 4.0, 0.0),
+        (2.0, 4.0, 0.0),
+    ]
+    faces = [
+        # bottom strip
+        (0, 1, 5),
+        (0, 5, 4),
+        # right strip
+        (1, 2, 6),
+        (1, 6, 5),
+        # top strip
+        (2, 3, 7),
+        (2, 7, 6),
+        # left strip
+        (3, 0, 4),
+        (3, 4, 7),
+    ]
+    outlined = footprints_service.outline_from_mesh_xy(verts, faces)
+    assert outlined is not None
+    exterior, holes = outlined
+    assert len(holes) == 1
+    assert footprints_service._point_in_ring(3.0, 3.0, holes[0])
+    assert footprints_service._point_in_ring(3.0, 3.0, exterior)
+    assert footprints_service._point_in_ring(1.0, 1.0, exterior)
+    assert not footprints_service._point_in_ring(1.0, 3.0, holes[0])
+    assert footprints_service._point_in_ring(1.0, 3.0, exterior)

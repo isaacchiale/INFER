@@ -116,6 +116,15 @@ function polygonPathD(polygon: Point2[]): string {
   return polygon.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ") + " Z";
 }
 
+/** Exterior + holes as one SVG path (evenodd voids). */
+function spacePathD(exterior: Point2[], holes?: Point2[][]): string {
+  let d = polygonPathD(exterior);
+  for (const hole of holes ?? []) {
+    if (hole.length >= 3) d += " " + polygonPathD(hole);
+  }
+  return d;
+}
+
 /** Resolve `space:<globalId>` from the route to a drawable footprint. */
 function spaceForRouteNode(
   footprints: FootprintsDocument,
@@ -129,20 +138,22 @@ function spaceForRouteNode(
   return space;
 }
 
-/** Screen-pixel delta → SVG user units (viewBox space, Y down) via CTM. */
-function screenDeltaToSvg(
+/** Screen-pixel drag → camera pan (viewBox units, Y-up inside the flip group). */
+function clientDeltaToPan(
   svg: SVGSVGElement,
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
+  bounds: PlanView,
+  dxClient: number,
+  dyClient: number,
 ): Point2 {
-  const ctm = svg.getScreenCTM();
-  if (!ctm) return { x: 0, y: 0 };
-  const inv = ctm.inverse();
-  const a = new DOMPoint(x0, y0).matrixTransform(inv);
-  const b = new DOMPoint(x1, y1).matrixTransform(inv);
-  return { x: b.x - a.x, y: b.y - a.y };
+  const rect = svg.getBoundingClientRect();
+  const w = Math.max(rect.width, 1);
+  const h = Math.max(rect.height, 1);
+  const vw = viewWidth(bounds);
+  const vh = viewHeight(bounds);
+  const fit = Math.min(w / vw, h / vh);
+  if (!(fit > 0) || !Number.isFinite(fit)) return { x: 0, y: 0 };
+  // meet letterboxing cancels in deltas; SVG Y-down → world panY flips.
+  return { x: dxClient / fit, y: -(dyClient / fit) };
 }
 
 export function FloorplanViewer({ className }: { className?: string }) {
@@ -318,19 +329,19 @@ export function FloorplanViewer({ className }: { className?: string }) {
   useLayoutEffect(() => {
     if (draggingRef.current) return;
     applyCameraDom();
-  }, [applyCameraDom, buildingBounds, spaces, doors, stairs, pathD, activeStoreyId]);
+  }, [applyCameraDom, buildingBounds, activeStoreyId, footprintsId]);
 
   // Stable overlay owns pointer/wheel so SVG re-renders never break capture mid-pan.
   useEffect(() => {
     const surface = surfaceRef.current;
-    const svg = svgRef.current;
-    if (!surface || !svg || !footprintsDocument) return;
+    if (!surface || !footprintsDocument) return;
 
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       e.stopPropagation();
       const bounds = boundsRef.current;
-      if (!bounds) return;
+      const svg = svgRef.current;
+      if (!bounds || !svg) return;
 
       const cam = cameraRef.current;
       const worldBefore = clientToWorld(e.clientX, e.clientY, svg, bounds, cam);
@@ -338,16 +349,21 @@ export function FloorplanViewer({ className }: { className?: string }) {
       const nextZoom = Math.min(Math.max(cam.zoom * factor, 0.25), 40);
       const cx = (bounds.minX + bounds.maxX) / 2;
       const cy = (bounds.minY + bounds.maxY) / 2;
-      cameraRef.current = {
+      const next = {
         zoom: nextZoom,
         panX: cam.panX + (worldBefore.x - cx) * (cam.zoom - nextZoom),
         panY: cam.panY + (worldBefore.y - cy) * (cam.zoom - nextZoom),
       };
+      if (!Number.isFinite(next.panX) || !Number.isFinite(next.panY) || !Number.isFinite(next.zoom)) {
+        return;
+      }
+      cameraRef.current = next;
       applyCameraDom();
     };
 
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return;
+      e.preventDefault();
       draggingRef.current = true;
       surface.setPointerCapture(e.pointerId);
       dragRef.current = { pointerId: e.pointerId, lastX: e.clientX, lastY: e.clientY };
@@ -356,16 +372,25 @@ export function FloorplanViewer({ className }: { className?: string }) {
     const onPointerMove = (e: PointerEvent) => {
       const drag = dragRef.current;
       if (!drag || drag.pointerId !== e.pointerId) return;
+      const bounds = boundsRef.current;
+      const svg = svgRef.current;
+      if (!bounds || !svg) return;
 
-      // CTM delta accounts for viewBox + letterboxing; Y-flip ⇒ panY uses −ΔsvgY.
-      const d = screenDeltaToSvg(svg, drag.lastX, drag.lastY, e.clientX, e.clientY);
+      const d = clientDeltaToPan(
+        svg,
+        bounds,
+        e.clientX - drag.lastX,
+        e.clientY - drag.lastY,
+      );
       drag.lastX = e.clientX;
       drag.lastY = e.clientY;
+      if (!Number.isFinite(d.x) || !Number.isFinite(d.y)) return;
+
       const cam = cameraRef.current;
       cameraRef.current = {
         ...cam,
         panX: cam.panX + d.x,
-        panY: cam.panY - d.y,
+        panY: cam.panY + d.y,
       };
       applyCameraDom();
     };
@@ -375,7 +400,9 @@ export function FloorplanViewer({ className }: { className?: string }) {
       dragRef.current = null;
       draggingRef.current = false;
       try {
-        surface.releasePointerCapture(e.pointerId);
+        if (surface.hasPointerCapture(e.pointerId)) {
+          surface.releasePointerCapture(e.pointerId);
+        }
       } catch {
         /* ignore */
       }
@@ -387,16 +414,16 @@ export function FloorplanViewer({ className }: { className?: string }) {
     surface.addEventListener("pointermove", onPointerMove);
     surface.addEventListener("pointerup", endDrag);
     surface.addEventListener("pointercancel", endDrag);
-    surface.addEventListener("lostpointercapture", endDrag);
     return () => {
       surface.removeEventListener("wheel", onWheel);
       surface.removeEventListener("pointerdown", onPointerDown);
       surface.removeEventListener("pointermove", onPointerMove);
       surface.removeEventListener("pointerup", endDrag);
       surface.removeEventListener("pointercancel", endDrag);
-      surface.removeEventListener("lostpointercapture", endDrag);
+      dragRef.current = null;
+      draggingRef.current = false;
     };
-  }, [footprintsDocument, applyCameraDom]);
+  }, [footprintsId, footprintsDocument, applyCameraDom]);
 
   const activeStoreyLabel = useMemo(() => {
     if (!storeys.length) return "No storeys";
@@ -482,8 +509,9 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     return (
                       <path
                         key={s.global_id}
-                        d={polygonPathD(s.polygon)}
+                        d={spacePathD(s.polygon, s.holes)}
                         fill="rgba(148,163,184,0.35)"
+                        fillRule="evenodd"
                         stroke="#64748b"
                         strokeWidth={roomStroke}
                         vectorEffect="non-scaling-stroke"
@@ -550,8 +578,12 @@ export function FloorplanViewer({ className }: { className?: string }) {
 
                   {routeEndpointSpaces.start ? (
                     <path
-                      d={polygonPathD(routeEndpointSpaces.start.polygon)}
+                      d={spacePathD(
+                        routeEndpointSpaces.start.polygon,
+                        routeEndpointSpaces.start.holes,
+                      )}
                       fill="rgba(22,163,74,0.18)"
+                      fillRule="evenodd"
                       stroke="#16a34a"
                       strokeWidth={endpointStroke}
                       vectorEffect="non-scaling-stroke"
@@ -565,8 +597,12 @@ export function FloorplanViewer({ className }: { className?: string }) {
                   ) : null}
                   {routeEndpointSpaces.end ? (
                     <path
-                      d={polygonPathD(routeEndpointSpaces.end.polygon)}
+                      d={spacePathD(
+                        routeEndpointSpaces.end.polygon,
+                        routeEndpointSpaces.end.holes,
+                      )}
                       fill="rgba(220,38,38,0.18)"
+                      fillRule="evenodd"
                       stroke="#dc2626"
                       strokeWidth={endpointStroke}
                       vectorEffect="non-scaling-stroke"
@@ -585,7 +621,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
             {/* Stable hit target — must not remount when geometry/route updates. */}
             <div
               ref={surfaceRef}
-              className="absolute inset-0 z-10 cursor-grab touch-none active:cursor-grabbing"
+              className="absolute inset-0 z-10 cursor-grab touch-none select-none active:cursor-grabbing"
               aria-label="Floorplan pan and zoom surface"
             />
 

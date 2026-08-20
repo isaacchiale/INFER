@@ -3,6 +3,23 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+GraphVariant = Literal["ifc", "geometry", "topologic"]
+
+EdgeMethod = Literal[
+    "ifc_rel_space_boundary",
+    "same_storey_fallback",
+    "vertical_storey_link",
+    "geom_door_space",
+    "geom_stair_space",
+    "topologicpy_adjacency",
+]
+
+IFC_BASELINE_METHODS: frozenset[str] = frozenset(
+    {
+        "ifc_rel_space_boundary",
+    }
+)
+
 
 class GraphNode(BaseModel):
     id: str
@@ -14,23 +31,20 @@ class GraphNode(BaseModel):
 
 class GraphEdge(BaseModel):
     id: str
-    kind: Literal["space_door", "vertical"]
+    kind: Literal["space_door", "vertical", "space_space"]
     source: str
     target: str
     global_id: str | None = None
-    # New graphs only emit ifc_rel_space_boundary. Legacy methods remain
-    # accepted so older derived graph.json files still load.
-    method: Literal[
-        "ifc_rel_space_boundary",
-        "same_storey_fallback",
-        "vertical_storey_link",
-    ]
+    method: EdgeMethod
     bidirectional: bool = True
+    """True when the edge was not authored via IfcRelSpaceBoundary."""
+    inferred: bool = False
 
 
 class ConnectivityGraph(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     model_id: str
+    variant: GraphVariant = "ifc"
     built_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     nodes: list[GraphNode] = Field(default_factory=list)
     edges: list[GraphEdge] = Field(default_factory=list)

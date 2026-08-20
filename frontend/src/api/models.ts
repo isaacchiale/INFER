@@ -54,14 +54,24 @@ export async function getModelEntities(modelId: string): Promise<EntitiesExtract
   return (await response.json()) as EntitiesExtract;
 }
 
-export async function buildModelGraph(modelId: string): Promise<ConnectivityGraph> {
-  const response = await fetch(`${apiBase}/models/${modelId}/graph`, { method: "POST" });
+export async function buildModelGraph(
+  modelId: string,
+  variant: "ifc" | "geometry" | "topologic" = "ifc",
+): Promise<ConnectivityGraph> {
+  const q = new URLSearchParams({ variant });
+  const response = await fetch(`${apiBase}/models/${modelId}/graph?${q}`, {
+    method: "POST",
+  });
   if (!response.ok) throw new Error(await readError(response));
   return (await response.json()) as ConnectivityGraph;
 }
 
-export async function getModelGraph(modelId: string): Promise<ConnectivityGraph> {
-  const response = await fetch(`${apiBase}/models/${modelId}/graph`);
+export async function getModelGraph(
+  modelId: string,
+  variant: "ifc" | "geometry" | "topologic" = "ifc",
+): Promise<ConnectivityGraph> {
+  const q = new URLSearchParams({ variant });
+  const response = await fetch(`${apiBase}/models/${modelId}/graph?${q}`);
   if (!response.ok) throw new Error(await readError(response));
   return (await response.json()) as ConnectivityGraph;
 }
@@ -73,6 +83,7 @@ export async function computeModelRoute(
     destination_node_id: string;
     blocked_node_ids?: string[];
     blocked_edge_ids?: string[];
+    graph_variant?: "ifc" | "geometry" | "topologic";
   },
 ): Promise<RouteResult> {
   const response = await fetch(`${apiBase}/models/${modelId}/route`, {

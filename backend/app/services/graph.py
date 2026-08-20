@@ -143,6 +143,7 @@ def build_connectivity_graph(model_id: str, ifc_file_path: str) -> ConnectivityG
                     global_id=_gid(rel) or None,
                     method="ifc_rel_space_boundary",
                     bidirectional=True,
+                    inferred=False,
                 )
             )
         elif element.is_a("IfcStair"):
@@ -158,6 +159,7 @@ def build_connectivity_graph(model_id: str, ifc_file_path: str) -> ConnectivityG
                     global_id=_gid(rel) or None,
                     method="ifc_rel_space_boundary",
                     bidirectional=True,
+                    inferred=False,
                 )
             )
         elif element.is_a("IfcTransportElement"):
@@ -173,11 +175,13 @@ def build_connectivity_graph(model_id: str, ifc_file_path: str) -> ConnectivityG
                     global_id=_gid(rel) or None,
                     method="ifc_rel_space_boundary",
                     bidirectional=True,
+                    inferred=False,
                 )
             )
 
     return ConnectivityGraph(
         model_id=model_id,
+        variant="ifc",
         nodes=list(nodes.values()),
         edges=list(edges.values()),
     )

@@ -1,15 +1,23 @@
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 
 from app.config import get_settings
 from app.schemas.entities import EntitiesExtract, ModelMetadata
 from app.schemas.footprints import FootprintsDocument
-from app.schemas.graph import ConnectivityGraph
+from app.schemas.graph import ConnectivityGraph, GraphVariant
 from app.services import extract as extract_service
 from app.services import footprints as footprints_service
 from app.services import graph as graph_service
+from app.services import graph_geometry
+from app.services import graph_topologic
 from app.services import storage
 
 router = APIRouter(prefix="/models", tags=["models"])
+
+_VARIANT_DETAIL = {
+    "ifc": "Graph not found. Run POST /models/{id}/graph?variant=ifc first.",
+    "geometry": "Geometry graph not found. Run POST /models/{id}/graph?variant=geometry first.",
+    "topologic": "Topologic graph not found. Run POST /models/{id}/graph?variant=topologic first.",
+}
 
 
 @router.post("", response_model=ModelMetadata, status_code=201)
@@ -67,8 +75,31 @@ def get_entities(model_id: str) -> EntitiesExtract:
         ) from exc
 
 
+def _ensure_ifc_graph(settings, model_id: str) -> ConnectivityGraph:
+    try:
+        return storage.read_graph(settings, model_id, "ifc")
+    except storage.ModelNotFoundError:
+        path = storage.ifc_path(settings, model_id)
+        graph = graph_service.build_connectivity_graph(model_id, str(path))
+        storage.save_graph(settings, graph, "ifc")
+        return graph
+
+
+def _ensure_footprints(settings, model_id: str) -> FootprintsDocument:
+    try:
+        return storage.read_footprints(settings, model_id)
+    except storage.ModelNotFoundError:
+        path = storage.ifc_path(settings, model_id)
+        doc = footprints_service.build_footprints(model_id, str(path))
+        storage.save_footprints(settings, doc)
+        return doc
+
+
 @router.post("/{model_id}/graph", response_model=ConnectivityGraph)
-def build_graph(model_id: str) -> ConnectivityGraph:
+def build_graph(
+    model_id: str,
+    variant: GraphVariant = Query("ifc"),
+) -> ConnectivityGraph:
     settings = get_settings()
     try:
         storage.read_meta(settings, model_id)
@@ -77,17 +108,41 @@ def build_graph(model_id: str) -> ConnectivityGraph:
 
     path = storage.ifc_path(settings, model_id)
     try:
-        graph = graph_service.build_connectivity_graph(model_id, str(path))
-        storage.save_graph(settings, graph)
+        if variant == "ifc":
+            graph = graph_service.build_connectivity_graph(model_id, str(path))
+            storage.save_graph(settings, graph, "ifc")
+            return graph
+
+        ifc_graph = _ensure_ifc_graph(settings, model_id)
+
+        if variant == "geometry":
+            footprints = _ensure_footprints(settings, model_id)
+            graph = graph_geometry.build_geometry_graph(ifc_graph, footprints)
+            storage.save_graph(settings, graph, "geometry")
+            return graph
+
+        # topologic
+        try:
+            graph = graph_topologic.build_topologic_graph(
+                model_id, str(path), ifc_graph
+            )
+        except graph_topologic.TopologicUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        storage.save_graph(settings, graph, "topologic")
         return graph
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
-            status_code=500, detail=f"Graph build failed: {exc}"
+            status_code=500, detail=f"Graph build failed ({variant}): {exc}"
         ) from exc
 
 
 @router.get("/{model_id}/graph", response_model=ConnectivityGraph)
-def get_graph(model_id: str) -> ConnectivityGraph:
+def get_graph(
+    model_id: str,
+    variant: GraphVariant = Query("ifc"),
+) -> ConnectivityGraph:
     settings = get_settings()
     try:
         storage.read_meta(settings, model_id)
@@ -95,11 +150,11 @@ def get_graph(model_id: str) -> ConnectivityGraph:
         raise HTTPException(status_code=404, detail="Model not found") from exc
 
     try:
-        return storage.read_graph(settings, model_id)
+        return storage.read_graph(settings, model_id, variant)
     except storage.ModelNotFoundError as exc:
         raise HTTPException(
             status_code=404,
-            detail="Graph not found. Run POST /models/{id}/graph first.",
+            detail=_VARIANT_DETAIL.get(variant, "Graph not found."),
         ) from exc
 
 

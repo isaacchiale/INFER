@@ -6,9 +6,16 @@ export type SpaceFootprint = {
   global_id: string;
   name: string;
   storey_global_id: string | null;
+  /** Exterior ring. */
   polygon: Point2D[];
+  /** Inner rings (voids). Optional for older footprints.json. */
+  holes?: Point2D[][];
   incomplete: boolean;
-  method: "ifc_mesh_xy_hull" | "ifc_placement_bbox" | "unavailable";
+  method:
+    | "ifc_mesh_xy_outline"
+    | "ifc_mesh_xy_hull"
+    | "ifc_placement_bbox"
+    | "unavailable";
 };
 
 export type DoorPortal = {

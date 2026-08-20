@@ -48,8 +48,11 @@ def entities_path(settings: Settings, model_id: str) -> Path:
     return _derived_root(settings) / model_id / "entities.json"
 
 
-def graph_path(settings: Settings, model_id: str) -> Path:
-    return _derived_root(settings) / model_id / "graph.json"
+def graph_path(settings: Settings, model_id: str, variant: str = "ifc") -> Path:
+    """IFC baseline stays at graph.json; other variants use graph.<variant>.json."""
+    if variant == "ifc":
+        return _derived_root(settings) / model_id / "graph.json"
+    return _derived_root(settings) / model_id / f"graph.{variant}.json"
 
 
 def footprints_path(settings: Settings, model_id: str) -> Path:
@@ -123,18 +126,27 @@ def read_entities(settings: Settings, model_id: str) -> EntitiesExtract:
     return EntitiesExtract.model_validate_json(path.read_text(encoding="utf-8"))
 
 
-def save_graph(settings: Settings, graph: ConnectivityGraph) -> Path:
-    path = graph_path(settings, graph.model_id)
+def save_graph(
+    settings: Settings, graph: ConnectivityGraph, variant: str | None = None
+) -> Path:
+    v = variant or getattr(graph, "variant", None) or "ifc"
+    path = graph_path(settings, graph.model_id, v)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(graph.model_dump_json(indent=2), encoding="utf-8")
     return path
 
 
-def read_graph(settings: Settings, model_id: str) -> ConnectivityGraph:
-    path = graph_path(settings, model_id)
+def read_graph(
+    settings: Settings, model_id: str, variant: str = "ifc"
+) -> ConnectivityGraph:
+    path = graph_path(settings, model_id, variant)
     if not path.is_file():
-        raise ModelNotFoundError(f"graph for {model_id}")
-    return ConnectivityGraph.model_validate_json(path.read_text(encoding="utf-8"))
+        raise ModelNotFoundError(f"graph ({variant}) for {model_id}")
+    graph = ConnectivityGraph.model_validate_json(path.read_text(encoding="utf-8"))
+    # Older graph.json files lack variant — treat as ifc.
+    if variant == "ifc" and graph.variant != "ifc":
+        graph = graph.model_copy(update={"variant": "ifc"})
+    return graph
 
 
 def save_footprints(settings: Settings, doc: FootprintsDocument) -> Path:

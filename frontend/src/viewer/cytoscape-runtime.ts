@@ -110,6 +110,15 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       },
     },
     {
+      selector: "edge[inferred = 1]",
+      style: {
+        width: 3.25,
+        "line-color": "#22c55e",
+        opacity: 0.95,
+        "z-index": 2,
+      },
+    },
+    {
       selector: "edge[vertical = 1]",
       style: {
         "line-style": "dashed",
@@ -117,6 +126,16 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
         width: 2.5,
         opacity: p.verticalOpacity,
         "z-index": 1,
+      },
+    },
+    {
+      selector: "edge[vertical = 1][inferred = 1]",
+      style: {
+        "line-style": "dashed",
+        "line-color": "#22c55e",
+        width: 2.75,
+        opacity: 0.95,
+        "z-index": 2,
       },
     },
     {
@@ -164,6 +183,7 @@ export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
         source: edge.source,
         target: edge.target,
         vertical: edge.vertical ? 1 : 0,
+        inferred: edge.inferred ? 1 : 0,
         onPath: 0,
       },
     });
@@ -225,6 +245,9 @@ export async function createCytoscapeRuntime(
     wheelSensitivity: 1.2,
     boxSelectionEnabled: false,
     autoungrabify: true,
+    // We own wheel zoom below — Cytoscape's handler no-ops while
+    // `scrollingPage` is true (any window scroll), which breaks the graph pane.
+    userZoomingEnabled: false,
     pixelRatio: "auto",
   });
 
@@ -239,13 +262,37 @@ export async function createCytoscapeRuntime(
   cy.on("pan zoom", () => {
     if (!suppressViewFlag) userAdjustedView = true;
   });
-  container.addEventListener(
-    "wheel",
-    () => {
-      userAdjustedView = true;
-    },
-    { passive: true },
-  );
+
+  // Same step as FloorplanViewer — Cytoscape's pow(10, delta/250) was extreme
+  // on Windows mice (deltaY ≈ 100 → ~3× per notch).
+  const ZOOM_STEP = 1.12;
+  const onWheel = (e: WheelEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.deltaY === 0) return;
+    userAdjustedView = true;
+
+    try {
+      cy.resize();
+      cy.userPanningEnabled(true);
+    } catch {
+      /* ignore */
+    }
+
+    const rect = container.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return;
+
+    const factor = e.deltaY > 0 ? 1 / ZOOM_STEP : ZOOM_STEP;
+    const level = Math.min(Math.max(cy.zoom() * factor, cy.minZoom()), cy.maxZoom());
+    cy.zoom({
+      level,
+      renderedPosition: {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+      },
+    });
+  };
+  container.addEventListener("wheel", onWheel, { passive: false, capture: true });
 
   const fitViewport = (): boolean => {
     if (!cy.elements().length) return false;
@@ -288,9 +335,8 @@ export async function createCytoscapeRuntime(
     try {
       const w = container.clientWidth;
       const h = container.clientHeight;
-      // Stale container metrics make wheel zoom no-op until a hard remount/maximize.
+      // Stale container metrics make pan/extents wrong after split resize.
       cy.resize();
-      cy.userZoomingEnabled(true);
       cy.userPanningEnabled(true);
       if (!lastLayout?.nodes.length) {
         lastWh = { w, h };
@@ -419,6 +465,7 @@ export async function createCytoscapeRuntime(
       fitViewport();
     },
     destroy() {
+      container.removeEventListener("wheel", onWheel, true);
       window.removeEventListener("resize", resize);
       ro.disconnect();
       try {

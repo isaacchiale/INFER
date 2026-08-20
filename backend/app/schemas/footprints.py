@@ -21,10 +21,13 @@ class SpaceFootprint(BaseModel):
     global_id: str
     name: str = ""
     storey_global_id: str | None = None
-    # Ring in XY; empty when incomplete.
+    # Exterior ring in XY; empty when incomplete.
     polygon: list[Point2D] = Field(default_factory=list)
+    # Inner rings (voids / atriums). Empty when none.
+    holes: list[list[Point2D]] = Field(default_factory=list)
     incomplete: bool = False
     method: Literal[
+        "ifc_mesh_xy_outline",
         "ifc_mesh_xy_hull",
         "ifc_placement_bbox",
         "unavailable",

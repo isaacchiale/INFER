@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Maximize2 } from "lucide-react";
+import { Check, ChevronDown, Maximize2 } from "lucide-react";
 import { computeRoute } from "@/api/routing";
-import { computeModelRoute } from "@/api/models";
+import {
+  buildModelGraph,
+  computeModelRoute,
+  getModelGraph,
+} from "@/api/models";
 import { useInfer } from "@/state/infer-store";
 import { useAppTheme } from "@/hooks/use-app-theme";
 import { buildGraphLayout, deriveStoreyBands, graphPalette } from "@/lib/graph-layout";
@@ -10,11 +14,26 @@ import {
   type CytoscapeRuntime,
 } from "@/viewer/cytoscape-runtime";
 import type { GraphLayout } from "@/lib/graph-layout";
-import type { GraphNode, RouteResult } from "@/types/graph";
+import type { GraphNode, GraphVariant, RouteResult } from "@/types/graph";
 import { cn } from "@/lib/utils";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 const EMPTY = "—";
 const EMPTY_LAYOUT: GraphLayout = { nodes: [], edges: [], width: 1, height: 1 };
+
+const VARIANT_OPTIONS: { id: GraphVariant; label: string }[] = [
+  { id: "ifc", label: "IFC relations" },
+  { id: "geometry", label: "Geometry rules" },
+  { id: "topologic", label: "TopologicPy" },
+];
+
+const GLASS =
+  "rounded-[6px] border border-border bg-background/90 shadow-sm backdrop-blur-[2px]";
 
 function shortLabel(node: GraphNode): string {
   if (node.code) return node.code;
@@ -30,11 +49,18 @@ export function GraphViewer({ className }: { className?: string }) {
     backendModelId,
     graphSource,
     setConnectivityRoute,
+    setConnectivityGraphOnly,
   } = useInfer();
   const theme = useAppTheme();
   const graph = connectivityGraph;
   const hasGraph = Boolean(graph && graph.nodes.length > 0);
   const palette = graphPalette(theme);
+
+  const [variant, setVariant] = useState<GraphVariant>(
+    () => connectivityGraph?.variant ?? "ifc",
+  );
+  const [variantBusy, setVariantBusy] = useState(false);
+  const [variantError, setVariantError] = useState<string | null>(null);
 
   const bands = useMemo(
     () => (graph ? deriveStoreyBands(graph, entitiesExtract) : []),
@@ -46,11 +72,13 @@ export function GraphViewer({ className }: { className?: string }) {
     [graph, bands, hasGraph],
   );
 
-  /** Stable fingerprint so we don't rebuild Cytoscape on identical layouts. */
+  /** Include edge inferred flags so green styling refreshes on variant switch. */
   const layoutFingerprint = useMemo(() => {
     if (!layout?.nodes.length) return "";
-    return layout.nodes.map((n) => `${n.id}:${n.x.toFixed(1)}:${n.y.toFixed(1)}`).join("|");
-  }, [layout]);
+    const nodes = layout.nodes.map((n) => `${n.id}:${n.x.toFixed(1)}:${n.y.toFixed(1)}`).join("|");
+    const edges = layout.edges.map((e) => `${e.id}:${e.inferred ? 1 : 0}`).join("|");
+    return `${nodes}#${edges}#${variant}`;
+  }, [layout, variant]);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
   const runtimeRef = useRef<CytoscapeRuntime | null>(null);
@@ -63,7 +91,7 @@ export function GraphViewer({ className }: { className?: string }) {
 
   layoutRef.current = layout;
   themeRef.current = theme;
-  const graphId = graph?.model_id ?? null;
+  const graphId = graph ? `${graph.model_id}:${variant}` : null;
 
   const spaceOptions = useMemo(
     () => (graph ? graph.nodes.filter((n) => n.kind === "space") : []),
@@ -75,6 +103,40 @@ export function GraphViewer({ className }: { className?: string }) {
   const [route, setRoute] = useState<RouteResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // Sync dropdown when a new model is ingested (defaults to IFC).
+  useEffect(() => {
+    if (!connectivityGraph) {
+      setVariant("ifc");
+      return;
+    }
+    if (connectivityGraph.variant) setVariant(connectivityGraph.variant);
+  }, [connectivityGraph?.model_id]);
+
+  const loadVariant = async (next: GraphVariant) => {
+    if (!backendModelId) {
+      setVariantError("Ingest a model to switch graph variants.");
+      return;
+    }
+    setVariantBusy(true);
+    setVariantError(null);
+    try {
+      let g;
+      try {
+        g = await getModelGraph(backendModelId, next);
+      } catch {
+        g = await buildModelGraph(backendModelId, next);
+      }
+      setConnectivityGraphOnly(g);
+      setVariant(next);
+      fittedGraphIdRef.current = null;
+      runtimeRef.current?.fit();
+    } catch (err) {
+      setVariantError(err instanceof Error ? err.message : "Failed to load graph variant");
+    } finally {
+      setVariantBusy(false);
+    }
+  };
 
   useEffect(() => {
     if (!graph) {
@@ -115,6 +177,7 @@ export function GraphViewer({ className }: { className?: string }) {
         ? computeModelRoute(backendModelId, {
             origin_node_id: origin,
             destination_node_id: destination,
+            graph_variant: variant,
           })
         : computeRoute({
             origin_node_id: origin,
@@ -143,7 +206,7 @@ export function GraphViewer({ className }: { className?: string }) {
     return () => {
       cancelled = true;
     };
-  }, [origin, destination, backendModelId, graphSource, graph]);
+  }, [origin, destination, backendModelId, graphSource, graph, variant, setConnectivityRoute]);
 
   // Boot Cytoscape once — same pattern as InferModelViewport / That Open.
   useEffect(() => {
@@ -231,10 +294,67 @@ export function GraphViewer({ className }: { className?: string }) {
       <div className="relative min-h-0 min-w-0 flex-1">
         <div
           ref={hostRef}
-          className="absolute inset-0 z-0 select-none"
-          style={{ background: palette.bg, touchAction: "none" }}
+          className="absolute inset-0 z-0 select-none overflow-hidden"
+          style={{
+            background: palette.bg,
+            touchAction: "none",
+            overscrollBehavior: "contain",
+          }}
           aria-label="Connectivity graph canvas"
         />
+        <div className="pointer-events-none absolute left-2 top-2 z-50 flex flex-col items-start gap-1.5">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                disabled={!backendModelId || variantBusy}
+                className={cn(
+                  GLASS,
+                  "pointer-events-auto inline-flex h-8 max-w-[220px] items-center gap-1.5 px-2.5 text-[11px] text-foreground disabled:opacity-40",
+                )}
+                title="Select connectivity graph variant"
+              >
+                <span className="truncate">
+                  {VARIANT_OPTIONS.find((o) => o.id === variant)?.label ?? variant}
+                </span>
+                <ChevronDown className="size-3.5 shrink-0 opacity-60" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="min-w-[12rem]">
+              {VARIANT_OPTIONS.map((o) => {
+                const active = variant === o.id;
+                return (
+                  <DropdownMenuItem
+                    key={o.id}
+                    className="text-[12px]"
+                    onSelect={() => {
+                      if (o.id !== variant) void loadVariant(o.id);
+                    }}
+                  >
+                    {active ? <Check className="size-3.5" /> : <span className="size-3.5" />}
+                    {o.label}
+                  </DropdownMenuItem>
+                );
+              })}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          {(variant === "geometry" || variant === "topologic") && (
+            <div className="pointer-events-none flex flex-wrap gap-2 rounded-md border border-border/80 bg-background/90 px-2 py-1 text-[10px] text-muted-foreground backdrop-blur-sm">
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block h-0.5 w-3 bg-slate-500" /> IFC
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block h-0.5 w-3 bg-[#22c55e]" /> Inferred
+              </span>
+            </div>
+          )}
+          {variantBusy && (
+            <span className="text-[10px] text-muted-foreground">Loading variant…</span>
+          )}
+          {variantError && (
+            <span className="max-w-[240px] text-[10px] text-destructive">{variantError}</span>
+          )}
+        </div>
         <button
           type="button"
           onClick={() => runtimeRef.current?.fit()}
@@ -271,7 +391,9 @@ export function GraphViewer({ className }: { className?: string }) {
             {!error && route && !route.found && hasGraph ? "No path exists" : null}
           </p>
           <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
-            {graphSource === "model" ? "Live IFC graph · Cytoscape" : EMPTY}
+            {graphSource === "model"
+              ? `Live · ${VARIANT_OPTIONS.find((o) => o.id === variant)?.label ?? variant}`
+              : EMPTY}
           </span>
         </div>
         <div className="mb-2 flex flex-wrap gap-x-3 gap-y-1">

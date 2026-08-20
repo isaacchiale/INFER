@@ -92,6 +92,8 @@ export function toDisplayGraph(graph: ConnectivityGraph): DisplayGraph {
   }
 
   const spacesByDoor = new Map<string, string[]>();
+  /** doorId → spaceId → link is inferred (geometry heal / non-IFC). */
+  const doorSpaceInferred = new Map<string, Map<string, boolean>>();
   for (const edge of graph.edges) {
     const doorId = edge.source.startsWith("door:")
       ? edge.source
@@ -107,21 +109,33 @@ export function toDisplayGraph(graph: ConnectivityGraph): DisplayGraph {
     const list = spacesByDoor.get(doorId) ?? [];
     if (!list.includes(spaceId)) list.push(spaceId);
     spacesByDoor.set(doorId, list);
+
+    const inferred =
+      Boolean(edge.inferred) ||
+      edge.method === "geom_door_space" ||
+      edge.method !== "ifc_rel_space_boundary";
+    const bySpace = doorSpaceInferred.get(doorId) ?? new Map<string, boolean>();
+    bySpace.set(spaceId, Boolean(bySpace.get(spaceId)) || inferred);
+    doorSpaceInferred.set(doorId, bySpace);
   }
 
   for (const [doorId, spaces] of spacesByDoor) {
+    const flags = doorSpaceInferred.get(doorId);
     for (let i = 0; i < spaces.length; i++) {
       for (let j = i + 1; j < spaces.length; j++) {
         const a = spaces[i];
         const b = spaces[j];
         if (!a || !b) continue;
+        // Green if either door↔space side was geometry-healed (partial IFC top-up too).
+        const inferred = Boolean(flags?.get(a) || flags?.get(b));
         pushEdge({
           id: `viz-door:${doorId}:${a}:${b}`,
           kind: "space_door",
           source: a,
           target: b,
-          method: "ifc_rel_space_boundary",
+          method: inferred ? "geom_door_space" : "ifc_rel_space_boundary",
           bidirectional: true,
+          inferred,
           collapsed: true,
         });
       }
@@ -146,6 +160,7 @@ export type LayoutEdge = {
   source: string;
   target: string;
   vertical: boolean;
+  inferred?: boolean;
 };
 
 export type GraphLayout = {
@@ -206,9 +221,52 @@ function connectedComponents(
   return comps;
 }
 
+/** Minimum clear air between node bounding-box edges (layout units ≈ px at 1:1). */
+export const LAYOUT_MIN_EDGE_GAP = 20;
+
+/**
+ * Hard constraint: push pairs apart until center distance >= minCenterDist.
+ * Runs after soft forces so gravity cannot leave nodes overlapping.
+ */
+function enforceMinCenterSeparation(
+  positions: Array<{ id: string; x: number; y: number }>,
+  minCenterDist: number,
+  rounds = 60,
+): void {
+  const n = positions.length;
+  if (n < 2 || minCenterDist <= 0) return;
+  for (let round = 0; round < rounds; round++) {
+    let moved = false;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const a = positions[i]!;
+        const b = positions[j]!;
+        let dx = a.x - b.x;
+        let dy = a.y - b.y;
+        let dist = Math.hypot(dx, dy);
+        if (dist < 1e-8) {
+          dx = (hash01(`${a.id}|${b.id}`) - 0.5) || 0.01;
+          dy = (hash01(`${b.id}|${a.id}`) - 0.5) || 0.01;
+          dist = Math.hypot(dx, dy) || 0.01;
+        }
+        if (dist >= minCenterDist) continue;
+        const push = (minCenterDist - dist) / 2;
+        const ux = (dx / dist) * push;
+        const uy = (dy / dist) * push;
+        a.x += ux;
+        a.y += uy;
+        b.x -= ux;
+        b.y -= uy;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+}
+
 /**
  * Force-directed layout for one connected component (local XY, centred near origin).
- * Springs + repulsion + gravity → compact “blob” clusters.
+ * Springs + repulsion + gravity → compact “blob” clusters, then a hard min-gap pass.
  */
 function forceLayoutComponent(
   nodeIds: string[],
@@ -223,8 +281,9 @@ function forceLayoutComponent(
   }
 
   const ideal = LAYOUT_NODE_W + LAYOUT_NODE_GAP_X; // ~128
-  const minSep = LAYOUT_NODE_W + LAYOUT_NODE_GAP_X * 0.45;
-  const repulsion = ideal * 1.2;
+  // Soft target during sim; hard pass below uses the same floor.
+  const minSep = LAYOUT_NODE_W + LAYOUT_MIN_EDGE_GAP;
+  const repulsion = ideal * 1.35;
   const iterations = Math.min(400, 160 + n * 14);
 
   const idSet = new Set(nodeIds);
@@ -257,7 +316,8 @@ function forceLayoutComponent(
           dist = Math.hypot(dx, dy) || 0.01;
         }
         const rep = (repulsion * repulsion) / (dist * dist);
-        const sep = dist < minSep ? ((minSep - dist) / dist) * 3 : 0;
+        // Strong separation so gravity cannot pin nodes on top of each other mid-sim.
+        const sep = dist < minSep ? ((minSep - dist) / dist) * 12 : 0;
         const f = rep + sep;
         const ux = (dx / dist) * f;
         const uy = (dy / dist) * f;
@@ -275,7 +335,9 @@ function forceLayoutComponent(
       let dx = pos[j]!.x - pos[i]!.x;
       let dy = pos[j]!.y - pos[i]!.y;
       let dist = Math.hypot(dx, dy) || 0.01;
-      const f = ((dist - ideal) / ideal) * 0.9;
+      // Do not pull springs tighter than the hard min gap.
+      const springTarget = Math.max(ideal, minSep);
+      const f = ((dist - springTarget) / springTarget) * 0.75;
       const ux = (dx / dist) * f;
       const uy = (dy / dist) * f;
       fx[i]! += ux;
@@ -284,8 +346,8 @@ function forceLayoutComponent(
       fy[j]! -= uy;
     }
 
-    // Stronger gravity → tighter, nicer blobs (only within this component).
-    const gravity = 0.035 + 0.05 * cooling;
+    // Gravity toward cluster origin — softer than before so min-gap can win.
+    const gravity = 0.02 + 0.03 * cooling;
     for (let i = 0; i < n; i++) {
       fx[i]! -= pos[i]!.x * gravity;
       fy[i]! -= pos[i]!.y * gravity;
@@ -304,6 +366,7 @@ function forceLayoutComponent(
     }
   }
 
+  enforceMinCenterSeparation(pos, minSep);
   for (const p of pos) out.set(p.id, { x: p.x, y: p.y });
   return out;
 }
@@ -362,6 +425,9 @@ function forceLayoutStorey(
       const a = (2 * Math.PI * i) / n + hash01(id) * 0.2;
       out.set(id, { x: Math.cos(a) * r, y: Math.sin(a) * r });
     });
+    const ring = [...out.entries()].map(([id, p]) => ({ id, x: p.x, y: p.y }));
+    enforceMinCenterSeparation(ring, LAYOUT_NODE_W + LAYOUT_MIN_EDGE_GAP);
+    for (const p of ring) out.set(p.id, { x: p.x, y: p.y });
     return out;
   }
 
@@ -424,6 +490,11 @@ function forceLayoutStorey(
       y: cy + Math.sin(a) * ry,
     });
   });
+
+  // Final storey-wide hard gap (clusters + isolates) so nothing touches.
+  const allPos = [...out.entries()].map(([id, p]) => ({ id, x: p.x, y: p.y }));
+  enforceMinCenterSeparation(allPos, LAYOUT_NODE_W + LAYOUT_MIN_EDGE_GAP);
+  for (const p of allPos) out.set(p.id, { x: p.x, y: p.y });
 
   return out;
 }
@@ -636,6 +707,7 @@ export function buildGraphLayout(graph: ConnectivityGraph, bands: StoreyBand[]):
       source: edge.source,
       target: edge.target,
       vertical: edge.kind === "vertical",
+      inferred: Boolean(edge.inferred) || edge.method !== "ifc_rel_space_boundary",
     });
   }
 

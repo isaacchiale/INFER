@@ -1,5 +1,6 @@
 export type GraphNodeKind = "space" | "door" | "stair" | "lift";
-export type GraphEdgeKind = "space_door" | "vertical";
+export type GraphEdgeKind = "space_door" | "vertical" | "space_space";
+export type GraphVariant = "ifc" | "geometry" | "topologic";
 
 export interface GraphNode {
   id: string;
@@ -19,14 +20,22 @@ export interface GraphEdge {
   source: string;
   target: string;
   global_id?: string | null;
-  /** New graphs emit only ifc_rel_space_boundary; legacy methods may appear on older JSON. */
-  method: "ifc_rel_space_boundary" | "same_storey_fallback" | "vertical_storey_link";
+  method:
+    | "ifc_rel_space_boundary"
+    | "same_storey_fallback"
+    | "vertical_storey_link"
+    | "geom_door_space"
+    | "geom_stair_space"
+    | "topologicpy_adjacency";
   bidirectional?: boolean;
+  /** True when not authored via IfcRelSpaceBoundary — draw green in the viewer. */
+  inferred?: boolean;
 }
 
 export interface ConnectivityGraph {
   schema_version: "1.0";
   model_id: string;
+  variant?: GraphVariant;
   built_at?: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -38,6 +47,7 @@ export interface RouteComputeRequest {
   blocked_node_ids?: string[];
   blocked_edge_ids?: string[];
   graph?: ConnectivityGraph;
+  graph_variant?: GraphVariant;
 }
 
 export interface RouteResult {

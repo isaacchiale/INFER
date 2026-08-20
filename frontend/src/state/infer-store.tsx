@@ -105,6 +105,8 @@ interface InferState {
   footprintsDocument: FootprintsDocument | null;
   connectivityRoute: RouteResult | null;
   setConnectivityRoute: (route: RouteResult | null) => void;
+  /** Swap graph variant (IFC / geometry / topologic) without clearing entities/footprints. */
+  setConnectivityGraphOnly: (graph: ConnectivityGraph) => void;
   graphSource: "demo" | "model" | "none";
   setModelGraph: (payload: {
     modelId: string;
@@ -189,6 +191,11 @@ export function InferProvider({ children }: { children: ReactNode }) {
     setFootprintsDocument(null);
     setConnectivityRoute(null);
     setPendingIfc(null);
+  }, []);
+
+  const setConnectivityGraphOnly = useCallback((graph: ConnectivityGraph) => {
+    setConnectivityGraph(graph);
+    setConnectivityRoute(null);
   }, []);
 
   const setViewerStatus = useCallback(
@@ -318,6 +325,7 @@ export function InferProvider({ children }: { children: ReactNode }) {
       footprintsDocument,
       connectivityRoute,
       setConnectivityRoute,
+      setConnectivityGraphOnly,
       graphSource: connectivityGraph ? "model" : "none",
       setModelGraph,
       clearModelGraph,
@@ -364,6 +372,7 @@ export function InferProvider({ children }: { children: ReactNode }) {
       entitiesExtract,
       footprintsDocument,
       connectivityRoute,
+      setConnectivityGraphOnly,
       setModelGraph,
       clearModelGraph,
     ],

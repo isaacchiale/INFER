@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 
-from app.schemas.graph import ConnectivityGraph
+from app.schemas.graph import ConnectivityGraph, GraphVariant
 
 
 class RouteComputeRequest(BaseModel):
@@ -9,6 +9,8 @@ class RouteComputeRequest(BaseModel):
     blocked_node_ids: list[str] = Field(default_factory=list)
     blocked_edge_ids: list[str] = Field(default_factory=list)
     graph: ConnectivityGraph | None = None
+    """When set (and graph body omitted), load this persisted variant for the model."""
+    graph_variant: GraphVariant | None = None
 
 
 class RouteResult(BaseModel):

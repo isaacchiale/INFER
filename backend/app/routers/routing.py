@@ -40,12 +40,19 @@ def route_model(model_id: str, body: RouteComputeRequest) -> RouteResult:
     except storage.ModelNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Model not found") from exc
 
+    variant = body.graph_variant or "ifc"
     try:
-        graph = body.graph or storage.read_graph(settings, model_id)
+        if body.graph is not None:
+            graph = body.graph
+        else:
+            graph = storage.read_graph(settings, model_id, variant)
     except storage.ModelNotFoundError as exc:
         raise HTTPException(
             status_code=404,
-            detail="Graph not found. Run POST /models/{id}/graph first.",
+            detail=(
+                f"Graph variant '{variant}' not found. "
+                f"Run POST /models/{{id}}/graph?variant={variant} first."
+            ),
         ) from exc
 
     try:
