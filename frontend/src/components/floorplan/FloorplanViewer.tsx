@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronDown, Maximize2 } from "lucide-react";
 import { useInfer } from "@/state/infer-store";
 import { continuousPolylineForStorey } from "@/lib/geometric-path";
@@ -27,7 +27,7 @@ type PlanView = {
 type Point2 = { x: number; y: number };
 
 type Camera = {
-  /** World-space pan (applied after Y-flip, in the same XY as footprints). */
+  /** Pan in display/viewBox space (after optional plan-align rotate). */
   panX: number;
   panY: number;
   /** 1 = fit to building bounds. */
@@ -68,13 +68,91 @@ function boundsFromPoints(points: Point2[], padRatio = 0.08): PlanView | null {
   };
 }
 
+function centroidOfPoints(points: Point2[]): Point2 {
+  let sx = 0;
+  let sy = 0;
+  for (const p of points) {
+    sx += p.x;
+    sy += p.y;
+  }
+  const n = Math.max(points.length, 1);
+  return { x: sx / n, y: sy / n };
+}
+
+function rotatePoint(p: Point2, cx: number, cy: number, angleRad: number): Point2 {
+  const cos = Math.cos(angleRad);
+  const sin = Math.sin(angleRad);
+  const x = p.x - cx;
+  const y = p.y - cy;
+  return { x: cx + x * cos - y * sin, y: cy + x * sin + y * cos };
+}
+
+/** Monotone-chain convex hull (XY). */
+function convexHull(points: Point2[]): Point2[] {
+  const uniq = new Map<string, Point2>();
+  for (const p of points) {
+    uniq.set(`${p.x.toFixed(4)},${p.y.toFixed(4)}`, p);
+  }
+  const pts = [...uniq.values()].sort((a, b) => a.x - b.x || a.y - b.y);
+  if (pts.length <= 2) return pts;
+
+  const cross = (o: Point2, a: Point2, b: Point2) =>
+    (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+
+  const lower: Point2[] = [];
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2]!, lower[lower.length - 1]!, p) <= 0) {
+      lower.pop();
+    }
+    lower.push(p);
+  }
+  const upper: Point2[] = [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i]!;
+    while (upper.length >= 2 && cross(upper[upper.length - 2]!, upper[upper.length - 1]!, p) <= 0) {
+      upper.pop();
+    }
+    upper.push(p);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}
+
+/**
+ * Angle (radians) of the longest convex-hull edge, normalized to (-π/2, π/2]
+ * so rotating by −angle makes that edge horizontal without flipping upside-down.
+ * Display-only — does not alter footprint / routing coordinates.
+ */
+function longestEdgeAlignAngle(points: Point2[]): number {
+  const hull = convexHull(points);
+  if (hull.length < 2) return 0;
+  let bestLen = 0;
+  let bestAngle = 0;
+  for (let i = 0; i < hull.length; i++) {
+    const a = hull[i]!;
+    const b = hull[(i + 1) % hull.length]!;
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    if (len > bestLen) {
+      bestLen = len;
+      bestAngle = Math.atan2(dy, dx);
+    }
+  }
+  // Keep nearly-horizontal: fold into (-π/2, π/2].
+  while (bestAngle > Math.PI / 2) bestAngle -= Math.PI;
+  while (bestAngle <= -Math.PI / 2) bestAngle += Math.PI;
+  return bestAngle;
+}
+
 const IDENTITY_CAMERA: Camera = { panX: 0, panY: 0, zoom: 1 };
 
 /**
  * Map a client pixel through the fixed building viewBox + camera transform
- * into footprint world XY (Y-up).
+ * into display XY (Y-up; plan-aligned when align is on).
  */
-function clientToWorld(
+function clientToView(
   clientX: number,
   clientY: number,
   el: SVGSVGElement,
@@ -94,7 +172,6 @@ function clientToWorld(
 
   const svgX = bounds.minX + ((clientX - ox) / contentW) * vw;
   const svgY = -bounds.maxY + ((clientY - oy) / contentH) * vh;
-  // Undo Y-flip: camera-space point before pan/zoom inverse.
   const p1x = svgX;
   const p1y = -svgY;
   const cx = (bounds.minX + bounds.maxX) / 2;
@@ -163,6 +240,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     activeStoreyId,
     setActiveStoreyId,
     connectivityRoute,
+    excludedNodeIds,
   } = useInfer();
 
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -178,6 +256,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const draggingRef = useRef(false);
 
   const footprintsId = footprintsDocument?.model_id ?? null;
+  /** Display-only: rotate longest hull edge to horizontal (routing stays in world XY). */
+  const [alignPlan, setAlignPlan] = useState(true);
 
   const storeys = useMemo(() => {
     const fromFp = footprintsDocument?.storeys ?? [];
@@ -217,10 +297,25 @@ export function FloorplanViewer({ className }: { className?: string }) {
     return pts;
   }, [footprintsDocument]);
 
-  const buildingBounds = useMemo(
-    () => boundsFromPoints(buildingPoints),
-    [buildingPoints],
-  );
+  const planAlign = useMemo(() => {
+    if (!buildingPoints.length) {
+      return { angleRad: 0, cx: 0, cy: 0, bounds: null as PlanView | null };
+    }
+    const c = centroidOfPoints(buildingPoints);
+    const angleRad = alignPlan ? longestEdgeAlignAngle(buildingPoints) : 0;
+    const displayPts =
+      angleRad === 0
+        ? buildingPoints
+        : buildingPoints.map((p) => rotatePoint(p, c.x, c.y, -angleRad));
+    return {
+      angleRad,
+      cx: c.x,
+      cy: c.y,
+      bounds: boundsFromPoints(displayPts),
+    };
+  }, [buildingPoints, alignPlan]);
+
+  const buildingBounds = planAlign.bounds;
   boundsRef.current = buildingBounds;
 
   const applyCameraDom = useCallback(() => {
@@ -240,16 +335,24 @@ export function FloorplanViewer({ className }: { className?: string }) {
     resetCamera();
   }, [footprintsId, resetCamera]);
 
+  // Re-fit when toggling align (bounds/orientation change).
+  useEffect(() => {
+    resetCamera();
+  }, [alignPlan, resetCamera]);
+
   const spaces = useMemo(() => {
     if (!footprintsDocument) return [];
+    const keep = (s: { global_id: string; incomplete: boolean; polygon: unknown[] }) =>
+      !s.incomplete &&
+      s.polygon.length >= 3 &&
+      !excludedNodeIds.has(`space:${s.global_id}`);
     if (activeStoreyId === "all") {
-      return footprintsDocument.spaces.filter((s) => !s.incomplete && s.polygon.length >= 3);
+      return footprintsDocument.spaces.filter(keep);
     }
     return footprintsDocument.spaces.filter(
-      (s) =>
-        s.storey_global_id === activeStoreyId && !s.incomplete && s.polygon.length >= 3,
+      (s) => s.storey_global_id === activeStoreyId && keep(s),
     );
-  }, [footprintsDocument, activeStoreyId]);
+  }, [footprintsDocument, activeStoreyId, excludedNodeIds]);
 
   const doors = useMemo(() => {
     if (!footprintsDocument) return [];
@@ -269,11 +372,12 @@ export function FloorplanViewer({ className }: { className?: string }) {
     const list = footprintsDocument?.stairs ?? [];
     return list.filter((s) => {
       if (s.incomplete || s.polygon.length < 3) return false;
+      if (excludedNodeIds.has(`stair:${s.global_id}`)) return false;
       if (activeStoreyId === "all") return true;
       if (s.storey_global_id == null) return true;
       return s.storey_global_id === activeStoreyId;
     });
-  }, [footprintsDocument, activeStoreyId]);
+  }, [footprintsDocument, activeStoreyId, excludedNodeIds]);
 
   const overlay = useMemo(() => {
     if (!footprintsDocument || !connectivityRoute?.found) return null;
@@ -308,13 +412,18 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const pathPoints = overlay?.points ?? [];
   const viewBox = buildingBounds ? toViewBox(buildingBounds) : "0 0 10 10";
 
+  // Stroke widths in world metres (fraction of building size). Avoid
+  // vector-effect:non-scaling-stroke — under scale(1,-1) + align rotate it
+  // desyncs strokes from fills (brown door ring offset, grey outline ≠ polygon).
   const markerBase = buildingBounds
     ? Math.max(viewWidth(buildingBounds), viewHeight(buildingBounds))
     : 10;
-  const routeStroke = 5;
-  const roomStroke = 1.25;
-  const endpointStroke = roomStroke + 1.5;
+  const roomStroke = markerBase * 0.0012;
+  const endpointStroke = markerBase * 0.0024;
+  const routeStroke = markerBase * 0.004;
+  const routeHalo = markerBase * 0.008;
   const doorR = markerBase * 0.008;
+  const doorStroke = markerBase * 0.0015;
 
   const incompleteCount =
     footprintsDocument?.spaces.filter((s) => s.incomplete).length ?? 0;
@@ -329,7 +438,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
   useLayoutEffect(() => {
     if (draggingRef.current) return;
     applyCameraDom();
-  }, [applyCameraDom, buildingBounds, activeStoreyId, footprintsId]);
+  }, [applyCameraDom, buildingBounds, activeStoreyId, footprintsId, alignPlan]);
 
   // Stable overlay owns pointer/wheel so SVG re-renders never break capture mid-pan.
   useEffect(() => {
@@ -344,15 +453,15 @@ export function FloorplanViewer({ className }: { className?: string }) {
       if (!bounds || !svg) return;
 
       const cam = cameraRef.current;
-      const worldBefore = clientToWorld(e.clientX, e.clientY, svg, bounds, cam);
+      const viewBefore = clientToView(e.clientX, e.clientY, svg, bounds, cam);
       const factor = e.deltaY > 0 ? 1 / 1.12 : 1.12;
       const nextZoom = Math.min(Math.max(cam.zoom * factor, 0.25), 40);
       const cx = (bounds.minX + bounds.maxX) / 2;
       const cy = (bounds.minY + bounds.maxY) / 2;
       const next = {
         zoom: nextZoom,
-        panX: cam.panX + (worldBefore.x - cx) * (cam.zoom - nextZoom),
-        panY: cam.panY + (worldBefore.y - cy) * (cam.zoom - nextZoom),
+        panX: cam.panX + (viewBefore.x - cx) * (cam.zoom - nextZoom),
+        panY: cam.panY + (viewBefore.y - cy) * (cam.zoom - nextZoom),
       };
       if (!Number.isFinite(next.panX) || !Number.isFinite(next.panY) || !Number.isFinite(next.zoom)) {
         return;
@@ -476,19 +585,37 @@ export function FloorplanViewer({ className }: { className?: string }) {
             </DropdownMenu>
           </div>
 
-          <button
-            type="button"
-            onClick={resetCamera}
-            disabled={!buildingBounds}
-            className={cn(
-              GLASS,
-              "pointer-events-auto inline-flex h-8 items-center gap-1 px-2.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40",
-            )}
-            title="Fit all floors (shared frame)"
-          >
-            <Maximize2 className="size-3" />
-            Fit
-          </button>
+          <div className="pointer-events-auto flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setAlignPlan((v) => !v)}
+              disabled={!buildingBounds}
+              className={cn(
+                GLASS,
+                "inline-flex h-8 items-center gap-1 px-2.5 text-[11px] transition-colors disabled:opacity-40",
+                alignPlan
+                  ? "text-foreground hover:bg-muted"
+                  : "text-muted-foreground hover:bg-muted hover:text-foreground",
+              )}
+              title="Display-only: rotate longest building edge to horizontal (routing stays in world XY)"
+            >
+              {alignPlan ? <Check className="size-3" /> : null}
+              Align
+            </button>
+            <button
+              type="button"
+              onClick={resetCamera}
+              disabled={!buildingBounds}
+              className={cn(
+                GLASS,
+                "inline-flex h-8 items-center gap-1 px-2.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40",
+              )}
+              title="Fit all floors (shared frame)"
+            >
+              <Maximize2 className="size-3" />
+              Fit
+            </button>
+          </div>
         </div>
 
         {!footprintsDocument ? (
@@ -505,6 +632,13 @@ export function FloorplanViewer({ className }: { className?: string }) {
             >
               <g transform="scale(1,-1)">
                 <g ref={cameraGroupRef}>
+                  <g
+                    transform={
+                      planAlign.angleRad !== 0
+                        ? `rotate(${(-planAlign.angleRad * 180) / Math.PI} ${planAlign.cx} ${planAlign.cy})`
+                        : undefined
+                    }
+                  >
                   {spaces.map((s) => {
                     return (
                       <path
@@ -514,7 +648,6 @@ export function FloorplanViewer({ className }: { className?: string }) {
                         fillRule="evenodd"
                         stroke="#64748b"
                         strokeWidth={roomStroke}
-                        vectorEffect="non-scaling-stroke"
                       >
                         <title>{s.name || s.global_id}</title>
                       </path>
@@ -527,9 +660,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
                         d={polygonPathD(s.polygon)}
                         fill="none"
                         stroke="#7c3aed"
-                        strokeWidth={roomStroke + 0.5}
-                        strokeDasharray="6 4"
-                        vectorEffect="non-scaling-stroke"
+                        strokeWidth={roomStroke * 1.4}
+                        strokeDasharray={`${markerBase * 0.006} ${markerBase * 0.004}`}
                       >
                         <title>{s.name ? `Stair: ${s.name}` : "Stair"}</title>
                       </path>
@@ -544,8 +676,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                         r={doorR}
                         fill="#f59e0b"
                         stroke="#92400e"
-                        strokeWidth={roomStroke}
-                        vectorEffect="non-scaling-stroke"
+                        strokeWidth={doorStroke}
                       >
                         <title>{d.name || d.global_id}</title>
                       </circle>
@@ -557,10 +688,9 @@ export function FloorplanViewer({ className }: { className?: string }) {
                       d={pathD}
                       fill="none"
                       stroke="#93c5fd"
-                      strokeWidth={routeStroke + 4}
+                      strokeWidth={routeHalo}
                       strokeLinecap="round"
                       strokeLinejoin="round"
-                      vectorEffect="non-scaling-stroke"
                       opacity={0.85}
                     />
                   ) : null}
@@ -572,7 +702,6 @@ export function FloorplanViewer({ className }: { className?: string }) {
                       strokeWidth={routeStroke}
                       strokeLinecap="round"
                       strokeLinejoin="round"
-                      vectorEffect="non-scaling-stroke"
                     />
                   ) : null}
 
@@ -586,7 +715,6 @@ export function FloorplanViewer({ className }: { className?: string }) {
                       fillRule="evenodd"
                       stroke="#16a34a"
                       strokeWidth={endpointStroke}
-                      vectorEffect="non-scaling-stroke"
                     >
                       <title>
                         Start:{" "}
@@ -605,7 +733,6 @@ export function FloorplanViewer({ className }: { className?: string }) {
                       fillRule="evenodd"
                       stroke="#dc2626"
                       strokeWidth={endpointStroke}
-                      vectorEffect="non-scaling-stroke"
                     >
                       <title>
                         End:{" "}
@@ -614,6 +741,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                       </title>
                     </path>
                   ) : null}
+                  </g>
                 </g>
               </g>
             </svg>

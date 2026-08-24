@@ -4,8 +4,9 @@
  *
  * Intermediate space centroids are skipped: only the route start/end spaces
  * use centroids; between portals we go door→door / door→stair / stair→door
- * inside the intervening space polygon via grid A* (0.1 m cells, mild
- * clearance costs, no string-pull). Graph topology routing is unchanged.
+ * inside the intervening space polygon via grid A* (0.1 m cells, step cost
+ * inversely proportional to wall clearance, no string-pull). Graph topology
+ * routing is unchanged.
  */
 
 import type {
@@ -178,25 +179,20 @@ function distToSpaceWall(
 /** Fixed cell size for in-polygon A* (metres). */
 export const LOCAL_PATH_CELL_M = 0.1;
 
+/** Floor so wall-adjacent cells don't send A* cost to Infinity. */
+const CLEARANCE_EPS_M = 0.02;
+
 /**
- * Mild clearance step cost (relative to the space's max clearance).
- *   clear≈0 → ~1.7×,  clear=0.5·max → ~1.18×,  clear=max → 1×
+ * Step cost inversely proportional to distance from the closest wall/hole:
+ *   cost = stepLen / clearance
  */
-function clearanceStepCost(
-  stepLen: number,
-  clearM: number,
-  maxClearM: number,
-): number {
-  const maxC = Math.max(maxClearM, 0.05);
-  const c = Math.max(clearM, 0.02);
-  const openness = Math.min(1, c / maxC);
-  const mult = 1 + 0.7 * (1 - openness) * (1 - openness);
-  return stepLen * mult;
+function clearanceStepCost(stepLen: number, clearM: number): number {
+  return stepLen / Math.max(clearM, CLEARANCE_EPS_M);
 }
 
 /**
  * Grid A* inside a space (door↔door, door↔centroid, etc. only).
- * Mild clearance-weighted steps on a 0.1 m grid (no string-pull).
+ * Step cost ∝ 1/clearance on a 0.1 m grid (no string-pull).
  * Optional holes are treated as blocked (exterior-minus-holes).
  */
 export function localPathInPolygon(
@@ -231,7 +227,7 @@ export function localPathInPolygon(
   });
 
   const clearance = new Float64Array(cols * rows);
-  let maxClear = 0;
+  let maxClear = CLEARANCE_EPS_M;
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const idx = r * cols + c;
@@ -267,7 +263,7 @@ export function localPathInPolygon(
       }
     }
     if (bestD === Infinity) {
-      clearance[r0 * cols + c0] = 0.05;
+      clearance[r0 * cols + c0] = CLEARANCE_EPS_M;
       return { c: c0, r: r0 };
     }
     return best;
@@ -290,9 +286,10 @@ export function localPathInPolygon(
     return open.splice(bestI, 1)[0];
   };
 
+  // Admissible under cost = stepLen/clear: cheapest metre is 1/maxClear.
   const hCost = (c: number, r: number) => {
     const p = cellCentre(c, r);
-    return Math.hypot(p.x - g.x, p.y - g.y);
+    return Math.hypot(p.x - g.x, p.y - g.y) / maxClear;
   };
 
   pushOpen({
@@ -343,7 +340,7 @@ export function localPathInPolygon(
       const stepLen = Math.hypot(dc!, dr!) * cell;
       const tentative =
         cur.g +
-        clearanceStepCost(stepLen, clear < 0 ? 0.05 : clear, maxClear);
+        clearanceStepCost(stepLen, clear < 0 ? CLEARANCE_EPS_M : clear);
       const nk = key(nc, nr);
       if (tentative >= (gScore.get(nk) ?? Infinity)) continue;
       came.set(nk, ck);

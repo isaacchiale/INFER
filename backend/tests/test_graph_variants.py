@@ -270,6 +270,179 @@ def test_door_heal_connects_when_inside_both_spaces():
     assert linked == {"space:A", "space:B"}
 
 
+def test_door_heal_skips_when_ifc_already_has_two_links():
+    """≥2 IFC space_door links → no geometry top-up for that door."""
+    ifc = ConnectivityGraph(
+        model_id="m_door_ifc2",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+            GraphNode(id="space:C", kind="space", global_id="C", storey_global_id="L1"),
+            GraphNode(id="door:D", kind="door", global_id="D", storey_global_id="L1"),
+        ],
+        edges=[
+            GraphEdge(
+                id="eA",
+                kind="space_door",
+                source="space:A",
+                target="door:D",
+                method="ifc_rel_space_boundary",
+                inferred=False,
+            ),
+            GraphEdge(
+                id="eB",
+                kind="space_door",
+                source="space:B",
+                target="door:D",
+                method="ifc_rel_space_boundary",
+                inferred=False,
+            ),
+        ],
+    )
+    footprints = FootprintsDocument(
+        model_id="m_door_ifc2",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", -4, -1, 0, 1),
+            _box_space("B", "L1", 0, -1, 2, 1),
+            _box_space("C", "L1", -1, 1.2, 1, 3),  # would pass geom with A if healed
+        ],
+        doors=[
+            DoorPortal(
+                global_id="D",
+                name="D",
+                storey_global_id="L1",
+                point=Point2D(x=0, y=0),
+                segment=[],
+                incomplete=False,
+                method="ifc_object_placement",
+            )
+        ],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    assert not any(e.method == "geom_door_space" for e in geo.edges)
+    space_links = {
+        e.source if e.source.startswith("space:") else e.target
+        for e in geo.edges
+        if e.kind == "space_door"
+    }
+    assert space_links == {"space:A", "space:B"}
+
+
+def test_door_heal_ifc_one_link_partners_only_against_ifc_space():
+    """
+    IFC linked to Red only: second side must pass between-math with Red
+    (not Green↔Blue), and be the closest such candidate.
+    """
+    ifc = ConnectivityGraph(
+        model_id="m_door_ifc1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:RED", kind="space", global_id="RED", storey_global_id="L1"),
+            GraphNode(id="space:GREEN", kind="space", global_id="GREEN", storey_global_id="L1"),
+            GraphNode(id="space:BLUE", kind="space", global_id="BLUE", storey_global_id="L1"),
+            GraphNode(id="door:D", kind="door", global_id="D", storey_global_id="L1"),
+        ],
+        edges=[
+            GraphEdge(
+                id="eR",
+                kind="space_door",
+                source="space:RED",
+                target="door:D",
+                method="ifc_rel_space_boundary",
+                inferred=False,
+            ),
+        ],
+    )
+    # Door on shared vertical wall between RED (left) and GREEN (right).
+    # BLUE is further right — opposite RED but farther than GREEN.
+    footprints = FootprintsDocument(
+        model_id="m_door_ifc1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("RED", "L1", -4, -1, 0, 1),
+            _box_space("GREEN", "L1", 0, -1, 2, 1),
+            _box_space("BLUE", "L1", 0.5, -1, 3, 1),
+        ],
+        doors=[
+            DoorPortal(
+                global_id="D",
+                name="D",
+                storey_global_id="L1",
+                point=Point2D(x=0, y=0),
+                segment=[],
+                incomplete=False,
+                method="ifc_object_placement",
+            )
+        ],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    geom = [
+        e.source if e.source.startswith("space:") else e.target
+        for e in geo.edges
+        if e.method == "geom_door_space"
+    ]
+    assert geom == ["space:GREEN"]
+    all_links = {
+        e.source if e.source.startswith("space:") else e.target
+        for e in geo.edges
+        if e.kind == "space_door"
+    }
+    assert all_links == {"space:RED", "space:GREEN"}
+    assert "space:BLUE" not in all_links
+
+
+def test_door_heal_rejects_same_side_of_ifc_host():
+    """
+    IFC→RED; door on RED's outer left wall; GREEN below (not through that wall)
+    must not be topped up — between-math with RED fails.
+    """
+    ifc = ConnectivityGraph(
+        model_id="m_door_outer",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:RED", kind="space", global_id="RED", storey_global_id="L1"),
+            GraphNode(id="space:GREEN", kind="space", global_id="GREEN", storey_global_id="L1"),
+            GraphNode(id="door:D", kind="door", global_id="D", storey_global_id="L1"),
+        ],
+        edges=[
+            GraphEdge(
+                id="eR",
+                kind="space_door",
+                source="space:RED",
+                target="door:D",
+                method="ifc_rel_space_boundary",
+                inferred=False,
+            ),
+        ],
+    )
+    footprints = FootprintsDocument(
+        model_id="m_door_outer",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("RED", "L1", 0, 0, 4, 4),
+            _box_space("GREEN", "L1", 0, -4, 4, -0.2),
+        ],
+        doors=[
+            DoorPortal(
+                global_id="D",
+                name="D",
+                storey_global_id="L1",
+                point=Point2D(x=0.05, y=2),  # on/near RED's left face
+                segment=[],
+                incomplete=False,
+                method="ifc_object_placement",
+            )
+        ],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    assert not any(e.method == "geom_door_space" for e in geo.edges)
+
+
 def test_stair_links_own_and_next_storey_only():
     """IfcStair on L1 → intersecting IfcSpaces on L1 + L2 only (not L3)."""
     ifc = ConnectivityGraph(

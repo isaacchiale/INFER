@@ -153,8 +153,54 @@ def _closest_point_on_polygon(
 
 
 # Cosine threshold when both contacts are outside the door: approach directions
-# must be roughly opposite (angle ≳ 75°). 0.25 allows thick walls / slight offset.
-DOOR_BETWEEN_DOT_MAX = 0.25
+# must be roughly opposite. -0.35 ⇒ angle ≳ ~110° (rejects ~90° corner false pairs).
+DOOR_BETWEEN_DOT_MAX = -0.35
+# When door is on/in one space: other contact must lie outward through that wall.
+DOOR_OUTWARD_DOT_MIN = 0.25
+# Outside both: |contact_A − contact_B| must be ≈ da+db (collinear through door).
+DOOR_CONTACT_COLLINEAR_SLACK_M = 0.2
+# Inside one: other space must meet near the door (same opening), metres.
+DOOR_INSIDE_OTHER_MAX_M = 0.45
+
+
+def _polygon_signed_area(polygon: list[Point2D]) -> float:
+    acc = 0.0
+    n = len(polygon)
+    for i in range(n):
+        j = (i + 1) % n
+        acc += polygon[i].x * polygon[j].y - polygon[j].x * polygon[i].y
+    return acc * 0.5
+
+
+def _outward_normal_at_closest_edge(
+    p: Point2D, polygon: list[Point2D]
+) -> tuple[float, float] | None:
+    """Unit outward normal of the polygon edge closest to p (CCW ring → outward)."""
+    if len(polygon) < 3:
+        return None
+    best_d = float("inf")
+    best_i = 0
+    n = len(polygon)
+    for i in range(n):
+        a = polygon[i]
+        b = polygon[(i + 1) % n]
+        d = _dist_point_to_segment(p.x, p.y, a.x, a.y, b.x, b.y)
+        if d < best_d:
+            best_d = d
+            best_i = i
+    a = polygon[best_i]
+    b = polygon[(best_i + 1) % n]
+    ex, ey = b.x - a.x, b.y - a.y
+    el = math.hypot(ex, ey)
+    if el < 1e-12:
+        return None
+    # Left normal of directed edge; for CCW boundary that points inward.
+    nx, ny = -ey / el, ex / el
+    if _polygon_signed_area(polygon) < 0:
+        # CW ring — flip so "left" of edge is still interior-ish, then outward flips.
+        nx, ny = -nx, -ny
+    # Outward = opposite of inward.
+    return (-nx, -ny)
 
 
 def _door_between_spaces(
@@ -165,8 +211,10 @@ def _door_between_spaces(
     (not centroids — more stable for long/large rooms).
 
     - D inside both → connect
-    - D inside exactly one → connect (door on that room's face toward the other)
-    - D outside both → unit vectors door→contact_A and door→contact_B roughly opposite
+    - D outside both → contacts near the same opening AND approach directions
+      roughly opposite (rejects perpendicular “around the corner” pairs)
+    - D inside exactly one (host) → other contact must lie roughly along the host's
+      outward wall normal at the door (through that face toward the other room)
     """
     if len(a.polygon) < 3 or len(b.polygon) < 3:
         return False
@@ -176,9 +224,27 @@ def _door_between_spaces(
     inside_b = db <= STAIR_INTERSECT_EPS
     if inside_a and inside_b:
         return True
-    if inside_a or inside_b:
-        return True
 
+    if inside_a ^ inside_b:
+        host = a if inside_a else b
+        other_pt = pb if inside_a else pa
+        other_d = db if inside_a else da
+        # Other room must meet the door at the same opening, not a far wall.
+        if other_d > DOOR_INSIDE_OTHER_MAX_M:
+            return False
+        outward = _outward_normal_at_closest_edge(door, host.polygon)
+        if outward is None:
+            return False
+        vx, vy = other_pt.x - door.x, other_pt.y - door.y
+        L = math.hypot(vx, vy)
+        if L < 1e-9:
+            return True
+        return (vx / L) * outward[0] + (vy / L) * outward[1] > DOOR_OUTWARD_DOT_MIN
+
+    # Outside both: contacts collinear through the door + opposite approach.
+    contact_sep = math.hypot(pa.x - pb.x, pa.y - pb.y)
+    if contact_sep > da + db + DOOR_CONTACT_COLLINEAR_SLACK_M:
+        return False
     ax, ay = pa.x - door.x, pa.y - door.y
     bx, by = pb.x - door.x, pb.y - door.y
     la = math.hypot(ax, ay)
@@ -213,6 +279,28 @@ def _pick_door_spaces(
     if best is not None:
         return [best[1], best[2]]
     return [ranked[0][1]]
+
+
+def _pick_second_space_for_ifc_door(
+    door: Point2D,
+    ifc_space: SpaceFootprint,
+    ranked: list[tuple[float, SpaceFootprint]],
+) -> SpaceFootprint | None:
+    """
+    IFC already linked one space: among other candidates within clearance, pick the
+    closest that passes the between-math **with that IFC space** (not vs each other).
+    """
+    best: tuple[float, SpaceFootprint] | None = None
+    for dist, space in ranked:
+        if space.global_id == ifc_space.global_id:
+            continue
+        if not _door_between_spaces(door, ifc_space, space):
+            continue
+        if best is None or dist < best[0] or (
+            dist == best[0] and space.global_id < best[1].global_id
+        ):
+            best = (dist, space)
+    return best[1] if best else None
 
 
 def _line_intersection(p1: Point2D, p2: Point2D, p3: Point2D, p4: Point2D) -> Point2D:
@@ -462,15 +550,29 @@ def build_geometry_graph(
     node_by_id = {n.id: n for n in nodes}
 
     # --- Door healing ---
-    # Same-storey spaces within DOOR_CLEARANCE_M; link at most 2 that the door
-    # sits between (closest-point rule). Tops up partial IFC links.
+    # Cap: a door has at most 2 space links total (IFC ∪ geom).
+    #   ≥2 IFC links → skip door entirely
+    #   1 IFC link  → add at most one partner that passes between-math WITH that
+    #                 IFC space (closest such candidate)
+    #   0 IFC links → pick ≤2 via between/nearest as before
+    space_fp_by_gid = {
+        s.global_id: s for s in _all_complete_spaces(footprints)
+    }
     for door in footprints.doors:
         door_id = f"door:{door.global_id}"
         if door_id not in node_by_id:
             continue
         if door.incomplete or door.point is None:
             continue
+
+        existing_space_ids = sorted(
+            sid for (did, sid) in linked_door_spaces if did == door_id
+        )
+        if len(existing_space_ids) >= 2:
+            continue
+
         px, py = door.point.x, door.point.y
+        door_pt = Point2D(x=px, y=py)
         ranked: list[tuple[float, SpaceFootprint]] = []
         for space in _spaces_for_storey(footprints, door.storey_global_id):
             space_id = f"space:{space.global_id}"
@@ -481,7 +583,22 @@ def build_geometry_graph(
                 continue
             ranked.append((d, space))
         ranked.sort(key=lambda t: (t[0], t[1].global_id))
-        for space in _pick_door_spaces(Point2D(x=px, y=py), ranked):
+
+        to_add: list[SpaceFootprint] = []
+        if len(existing_space_ids) == 1:
+            ifc_gid = existing_space_ids[0].removeprefix("space:")
+            ifc_fp = space_fp_by_gid.get(ifc_gid)
+            if ifc_fp is None:
+                # IFC linked a space we have no complete footprint for — cannot
+                # run between-math; leave the single IFC link as-is.
+                continue
+            partner = _pick_second_space_for_ifc_door(door_pt, ifc_fp, ranked)
+            if partner is not None:
+                to_add = [partner]
+        else:
+            to_add = _pick_door_spaces(door_pt, ranked)
+
+        for space in to_add:
             space_id = f"space:{space.global_id}"
             if (door_id, space_id) in linked_door_spaces:
                 continue

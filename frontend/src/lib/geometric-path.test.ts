@@ -129,7 +129,7 @@ describe("geometric-path", () => {
     }
   });
 
-  it("mildly biases corridor path away from the near wall", () => {
+  it("biases corridor path away from the near wall (1/clearance cost)", () => {
     const corridor = [
       { x: 0, y: 0 },
       { x: 20, y: 0 },
@@ -144,8 +144,8 @@ describe("geometric-path", () => {
     assert.ok(path.length >= 2);
     const mid = path[Math.floor(path.length / 2)]!;
     assert.ok(
-      mid.y > 0.6,
-      `expected mild centre bias, mid.y=${mid.y}`,
+      mid.y > 1.2,
+      `expected centre bias from 1/clearance, mid.y=${mid.y}`,
     );
   });
 

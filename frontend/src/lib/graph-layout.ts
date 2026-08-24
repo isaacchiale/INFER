@@ -155,6 +155,8 @@ export type LayoutNode = {
   h: number;
   /** Geometry rules: candidate nested parent (red circle in viewer). */
   nestedParent?: boolean;
+  /** Temporarily removed from the live network (parked in the right-hand grid). */
+  excluded?: boolean;
 };
 
 export type LayoutEdge = {
@@ -399,6 +401,8 @@ const CLUSTER_GAP = LAYOUT_NODE_GAP_X * 1.35;
 const ISOLATE_MARGIN = LAYOUT_NODE_W * 0.85 + LAYOUT_NODE_GAP_X * 0.5;
 /** Gap between room clusters and the stair/lift column on the right. */
 const PORTAL_COLUMN_GAP = LAYOUT_NODE_GAP_X * 1.25;
+const EXCLUDED_COLUMN_GAP = LAYOUT_NODE_GAP_X * 1.15;
+const EXCLUDED_GRID_COLS = 3;
 
 /**
  * Force-layout connected clusters (with gravity), pack them so they never
@@ -504,15 +508,25 @@ function forceLayoutStorey(
 /**
  * Level-banded layout: each storey is force-directed; bands stack top→bottom
  * in elevation order with a fixed {@link LAYOUT_BAND_GAP} between levels.
+ * Excluded nodes are parked in a grid to the right of stair/lift portals.
  */
-export function buildGraphLayout(graph: ConnectivityGraph, bands: StoreyBand[]): GraphLayout {
+export function buildGraphLayout(
+  graph: ConnectivityGraph,
+  bands: StoreyBand[],
+  excludedIds: ReadonlySet<string> = new Set(),
+): GraphLayout {
   const display = toDisplayGraph(graph);
   const bandIndex = new Map(bands.map((b, i) => [b.id, i]));
   const nodes: LayoutNode[] = [];
 
   const spacesByStorey = new Map<string, GraphNode[]>();
+  const excludedSpaces: GraphNode[] = [];
   for (const node of display.nodes) {
     if (node.kind !== "space") continue;
+    if (excludedIds.has(node.id)) {
+      excludedSpaces.push(node);
+      continue;
+    }
     const raw = node.storey_global_id ?? "__none__";
     const key = bandIndex.has(raw) ? raw : "__none__";
     const list = spacesByStorey.get(key) ?? [];
@@ -522,15 +536,18 @@ export function buildGraphLayout(graph: ConnectivityGraph, bands: StoreyBand[]):
   for (const list of spacesByStorey.values()) {
     list.sort((a, b) => (a.name || a.global_id).localeCompare(b.name || b.global_id));
   }
+  excludedSpaces.sort((a, b) => (a.name || a.global_id).localeCompare(b.name || b.global_id));
 
   const cellW = LAYOUT_NODE_W + LAYOUT_NODE_GAP_X;
   const cellH = LAYOUT_NODE_H + LAYOUT_NODE_GAP_Y;
 
   // Intra-storey edges only — vertical links don't pull rooms across floors.
+  // Skip anything touching an excluded node so the live network reorganises.
   const undirectedIntra: Array<{ source: string; target: string }> = [];
   const seenIntra = new Set<string>();
   for (const edge of display.edges) {
     if (edge.kind === "vertical") continue;
+    if (excludedIds.has(edge.source) || excludedIds.has(edge.target)) continue;
     const a = edge.source < edge.target ? edge.source : edge.target;
     const b = edge.source < edge.target ? edge.target : edge.source;
     const key = `${a}|${b}`;
@@ -639,7 +656,12 @@ export function buildGraphLayout(graph: ConnectivityGraph, bands: StoreyBand[]):
 
   // Stair / lift portals: right of every level's clusters (never over Level labels).
   const spaceById = new Map(display.nodes.filter((n) => n.kind === "space").map((n) => [n.id, n]));
-  const portals = display.nodes.filter((n) => n.kind === "stair" || n.kind === "lift");
+  const portals = display.nodes.filter(
+    (n) => (n.kind === "stair" || n.kind === "lift") && !excludedIds.has(n.id),
+  );
+  const excludedPortals = display.nodes.filter(
+    (n) => (n.kind === "stair" || n.kind === "lift") && excludedIds.has(n.id),
+  );
   const portalsByBand = new Map<number, GraphNode[]>();
 
   for (const portal of portals) {
@@ -696,10 +718,41 @@ export function buildGraphLayout(graph: ConnectivityGraph, bands: StoreyBand[]):
     }
   }
 
+  // Excluded nodes: grid to the right of the stair/lift column (restore via right-click).
+  const excludedAll = [...excludedSpaces, ...excludedPortals].sort((a, b) =>
+    (a.name || a.id).localeCompare(b.name || b.id),
+  );
+  if (excludedAll.length) {
+    const excludedColumnX = portalColumnX + LAYOUT_PORTAL_W + EXCLUDED_COLUMN_GAP;
+    const gapX = LAYOUT_NODE_GAP_X * 0.55;
+    const gapY = LAYOUT_NODE_GAP_Y * 0.55;
+    const startY = 24;
+    excludedAll.forEach((node, i) => {
+      const col = i % EXCLUDED_GRID_COLS;
+      const row = Math.floor(i / EXCLUDED_GRID_COLS);
+      const isPortal = node.kind === "stair" || node.kind === "lift";
+      const w = isPortal ? LAYOUT_PORTAL_W : LAYOUT_NODE_W;
+      const h = isPortal ? LAYOUT_PORTAL_H : LAYOUT_NODE_H;
+      const raw = node.name || node.global_id.slice(0, 8);
+      nodes.push({
+        id: node.id,
+        kind: node.kind as "space" | "stair" | "lift",
+        label: raw.length > 20 ? `${raw.slice(0, 18)}…` : raw,
+        x: excludedColumnX + col * (LAYOUT_NODE_W + gapX),
+        y: startY + row * (LAYOUT_NODE_H + gapY),
+        w,
+        h,
+        excluded: true,
+        nestedParent: Boolean(node.nested_parent),
+      });
+    });
+  }
+
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const edges: LayoutEdge[] = [];
   const seen = new Set<string>();
   for (const edge of display.edges) {
+    if (excludedIds.has(edge.source) || excludedIds.has(edge.target)) continue;
     if (!byId.has(edge.source) || !byId.has(edge.target)) continue;
     const key = `${edge.source}|${edge.target}`;
     const rev = `${edge.target}|${edge.source}`;

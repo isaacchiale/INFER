@@ -23,6 +23,8 @@ export type CytoscapeRuntime = {
   fit: () => void;
   destroy: () => void;
   onSpaceTap: (handler: (nodeId: string) => void) => void;
+  /** Right-click toggle for spaces / stairs / lifts (including excluded grid). */
+  onNodeCxtTap: (handler: (nodeId: string) => void) => void;
 };
 
 function stylesheet(p: GraphThemePalette): StylesheetJson {
@@ -111,6 +113,17 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       },
     },
     {
+      selector: "node[excluded = 1]",
+      style: {
+        "background-opacity": 0.45,
+        "border-style": "dashed",
+        "border-width": 2,
+        "border-color": "#94a3b8",
+        opacity: 0.75,
+        "z-index": 20,
+      },
+    },
+    {
       selector: "edge",
       style: {
         width: 3,
@@ -179,9 +192,10 @@ export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
         kind: node.kind,
         onPath: 0,
         nestedParent: node.nestedParent ? 1 : 0,
+        excluded: node.excluded ? 1 : 0,
       },
       position: { x: node.x + node.w / 2, y: node.y + node.h / 2 },
-      selectable: node.kind === "space",
+      selectable: node.kind === "space" || Boolean(node.excluded),
       grabbable: false,
     });
   }
@@ -372,10 +386,29 @@ export async function createCytoscapeRuntime(
   window.addEventListener("resize", resize);
 
   let spaceHandler: ((nodeId: string) => void) | null = null;
+  let cxtHandler: ((nodeId: string) => void) | null = null;
   cy.on("tap", "node", (evt) => {
     const id = String(evt.target.id());
     if (!id.startsWith("space:")) return;
+    // Left-click only picks live (non-excluded) spaces for origin/destination.
+    if (Number(evt.target.data("excluded")) === 1) return;
     spaceHandler?.(id);
+  });
+  cy.on("cxttap", "node", (evt) => {
+    evt.preventDefault();
+    const id = String(evt.target.id());
+    if (
+      !id.startsWith("space:") &&
+      !id.startsWith("stair:") &&
+      !id.startsWith("lift:")
+    ) {
+      return;
+    }
+    cxtHandler?.(id);
+  });
+  // Stop the browser context menu over the canvas (right-click restore/remove).
+  container.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
   });
 
   return {
@@ -489,6 +522,9 @@ export async function createCytoscapeRuntime(
     },
     onSpaceTap(handler) {
       spaceHandler = handler;
+    },
+    onNodeCxtTap(handler) {
+      cxtHandler = handler;
     },
   };
 }

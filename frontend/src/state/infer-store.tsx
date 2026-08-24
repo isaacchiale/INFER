@@ -107,6 +107,10 @@ interface InferState {
   setConnectivityRoute: (route: RouteResult | null) => void;
   /** Swap graph variant (IFC / geometry / topologic) without clearing entities/footprints. */
   setConnectivityGraphOnly: (graph: ConnectivityGraph) => void;
+  /** Graph node ids temporarily removed from the live network (right-click toggle). */
+  excludedNodeIds: ReadonlySet<string>;
+  toggleExcludedNode: (nodeId: string) => void;
+  clearExcludedNodes: () => void;
   graphSource: "demo" | "model" | "none";
   setModelGraph: (payload: {
     modelId: string;
@@ -155,7 +159,23 @@ export function InferProvider({ children }: { children: ReactNode }) {
   const [entitiesExtract, setEntitiesExtract] = useState<EntitiesExtract | null>(null);
   const [footprintsDocument, setFootprintsDocument] = useState<FootprintsDocument | null>(null);
   const [connectivityRoute, setConnectivityRoute] = useState<RouteResult | null>(null);
+  const [excludedNodeIds, setExcludedNodeIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const removedRef = useRef<ScenarioCondition | null>(null);
+
+  const toggleExcludedNode = useCallback((nodeId: string) => {
+    setExcludedNodeIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(nodeId)) next.delete(nodeId);
+      else next.add(nodeId);
+      return next;
+    });
+  }, []);
+
+  const clearExcludedNodes = useCallback(() => {
+    setExcludedNodeIds(new Set());
+  }, []);
 
   const queueIfcFile = useCallback(async (file: File) => {
     const buffer = new Uint8Array(await file.arrayBuffer());
@@ -177,6 +197,7 @@ export function InferProvider({ children }: { children: ReactNode }) {
       setEntitiesExtract(payload.entities);
       setFootprintsDocument(payload.footprints ?? null);
       setConnectivityRoute(null);
+      setExcludedNodeIds(new Set());
       const firstStorey =
         payload.footprints?.storeys[0]?.global_id ?? payload.entities.storeys[0]?.global_id;
       if (firstStorey) setActiveStoreyId(firstStorey);
@@ -190,12 +211,14 @@ export function InferProvider({ children }: { children: ReactNode }) {
     setEntitiesExtract(null);
     setFootprintsDocument(null);
     setConnectivityRoute(null);
+    setExcludedNodeIds(new Set());
     setPendingIfc(null);
   }, []);
 
   const setConnectivityGraphOnly = useCallback((graph: ConnectivityGraph) => {
     setConnectivityGraph(graph);
     setConnectivityRoute(null);
+    setExcludedNodeIds(new Set());
   }, []);
 
   const setViewerStatus = useCallback(
@@ -326,6 +349,9 @@ export function InferProvider({ children }: { children: ReactNode }) {
       connectivityRoute,
       setConnectivityRoute,
       setConnectivityGraphOnly,
+      excludedNodeIds,
+      toggleExcludedNode,
+      clearExcludedNodes,
       graphSource: connectivityGraph ? "model" : "none",
       setModelGraph,
       clearModelGraph,
@@ -373,6 +399,9 @@ export function InferProvider({ children }: { children: ReactNode }) {
       footprintsDocument,
       connectivityRoute,
       setConnectivityGraphOnly,
+      excludedNodeIds,
+      toggleExcludedNode,
+      clearExcludedNodes,
       setModelGraph,
       clearModelGraph,
     ],
