@@ -1,0 +1,57 @@
+---
+description: Deferred daily progress Word log — document previous active day on return
+alwaysApply: true
+---
+
+# Daily progress Word log (Isaac)
+
+Maintain `docs/INFER-daily-progress-summary.docx` as Isaac’s internship day log.
+
+## Strategy (deferred logging)
+
+Do **not** update the doc at end-of-day by default.
+
+Instead, at the **start of the next active session**, before doing new work:
+
+1. Read `docs/INFER-daily-progress-summary.docx` and note the **latest day heading** already logged.
+2. Infer whether there was an **earlier active day** after that heading (from this chat’s timestamps / transcript / prior session work) that is not yet in the doc.
+3. If yes → **first** append Progress / Problems / Solutions for that previous active day, tell Isaac in one line, **then** continue with today’s request.
+4. If the gap includes quiet days → **skip** them (no empty sections). Only log days with real work.
+5. If the previous active day is already logged, or there is nothing new to log → do nothing to the doc; proceed normally.
+
+### Example
+
+- Day 1 (active until ~5pm) → no doc update.
+- Day 2 (quiet) → no doc update.
+- Day 3 (returns) → **before any new task**, document Day 1, then start Day 3 work.
+
+## What counts as an “active day”
+
+Real engineering / design work: code, OpenSpec, debugging, architecture decisions, meaningful commits.
+
+Not active: status checks, branch questions, brief Q&A only.
+
+## Section format
+
+Heading 1: `Weekday, D Month YYYY` (e.g. `Thursday, 20 August 2026`).
+
+Under each day:
+
+- **Progress** — what shipped or decided  
+- **Problems** — what broke or blocked  
+- **Solutions** — what fixed it or the chosen approach  
+
+Concise internship-log bullets. Prefer outcomes over play-by-play.
+
+Optionally refresh the Snapshot section if branch tip / architecture changed materially.
+
+Do not commit the docx unless Isaac asks.
+
+## Helper
+
+`backend/.venv/Scripts/python.exe docs/_append_daily_progress.py --date "..." --progress "..." --problems "..." --solutions "..."`
+
+## Explicit overrides
+
+- “log today” / “update the daily doc” → update immediately (including current day if requested).  
+- Quiet return with no prior unlogged work → do not touch the doc.
