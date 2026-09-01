@@ -134,11 +134,30 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
         "z-index": 1,
       },
     },
+    // Heal colours: door=yellow, space↔space=green, stair=purple.
     {
-      selector: "edge[inferred = 1]",
+      selector: "edge[heal = 'door']",
+      style: {
+        width: 3.25,
+        "line-color": "#eab308",
+        opacity: 0.95,
+        "z-index": 2,
+      },
+    },
+    {
+      selector: "edge[heal = 'space']",
       style: {
         width: 3.25,
         "line-color": "#22c55e",
+        opacity: 0.95,
+        "z-index": 2,
+      },
+    },
+    {
+      selector: "edge[heal = 'stair']",
+      style: {
+        width: 3.25,
+        "line-color": "#7c3aed",
         opacity: 0.95,
         "z-index": 2,
       },
@@ -154,10 +173,10 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       },
     },
     {
-      selector: "edge[vertical = 1][inferred = 1]",
+      selector: "edge[vertical = 1][heal = 'stair']",
       style: {
         "line-style": "dashed",
-        "line-color": "#22c55e",
+        "line-color": "#7c3aed",
         width: 2.75,
         opacity: 0.95,
         "z-index": 2,
@@ -211,6 +230,7 @@ export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
         target: edge.target,
         vertical: edge.vertical ? 1 : 0,
         inferred: edge.inferred ? 1 : 0,
+        heal: edge.heal ?? "",
         onPath: 0,
       },
     });

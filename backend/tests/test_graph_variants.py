@@ -1,9 +1,11 @@
 from app.schemas.footprints import (
     DoorPortal,
     FootprintsDocument,
+    OpeningPortal,
     Point2D,
     SpaceFootprint,
     StairFootprint,
+    WallFootprint,
 )
 from app.schemas.graph import ConnectivityGraph, GraphEdge, GraphNode
 from app.services.graph_geometry import build_geometry_graph
@@ -17,6 +19,22 @@ from app.services.graph_topologic import (
 
 def _box_space(gid: str, storey: str, x0: float, y0: float, x1: float, y1: float) -> SpaceFootprint:
     return SpaceFootprint(
+        global_id=gid,
+        name=gid,
+        storey_global_id=storey,
+        polygon=[
+            Point2D(x=x0, y=y0),
+            Point2D(x=x1, y=y0),
+            Point2D(x=x1, y=y1),
+            Point2D(x=x0, y=y1),
+        ],
+        incomplete=False,
+        method="ifc_placement_bbox",
+    )
+
+
+def _box_wall(gid: str, storey: str, x0: float, y0: float, x1: float, y1: float) -> WallFootprint:
+    return WallFootprint(
         global_id=gid,
         name=gid,
         storey_global_id=storey,
@@ -747,3 +765,344 @@ def test_adjacent_rooms_are_not_nested_parents():
     )
     geo = build_geometry_graph(ifc, footprints)
     assert all(not n.nested_parent for n in geo.nodes)
+
+
+def test_space_in_parent_hole_is_not_nested_child():
+    """Donut corridor: lift in the courtyard hole must not flag the corridor."""
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:002", kind="space", global_id="002", storey_global_id="L1"),
+            GraphNode(id="space:LIFT", kind="space", global_id="LIFT", storey_global_id="L1"),
+            GraphNode(id="space:INNER", kind="space", global_id="INNER", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    corridor = _box_space("002", "L1", 0, 0, 20, 10)
+    corridor.holes = [
+        [
+            Point2D(x=6, y=2),
+            Point2D(x=14, y=2),
+            Point2D(x=14, y=8),
+            Point2D(x=6, y=8),
+        ]
+    ]
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            corridor,
+            # Lift entirely in the hole — not in walkable corridor.
+            _box_space("LIFT", "L1", 7, 3, 10, 7),
+            # Truly nested room in the walkable ring (left wing).
+            _box_space("INNER", "L1", 1, 1, 4, 4),
+        ],
+        doors=[],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    by_id = {n.id: n for n in geo.nodes}
+    # INNER is properly inside the ring → still a nested parent.
+    assert by_id["space:002"].nested_parent is True
+    assert by_id["space:LIFT"].nested_parent is False
+    assert by_id["space:INNER"].nested_parent is False
+
+    # Hole-only child alone must not flag the donut.
+    footprints_hole_only = FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[corridor, _box_space("LIFT", "L1", 7, 3, 10, 7)],
+        doors=[],
+        stairs=[],
+    )
+    ifc_hole_only = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:002", kind="space", global_id="002", storey_global_id="L1"),
+            GraphNode(id="space:LIFT", kind="space", global_id="LIFT", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    geo2 = build_geometry_graph(ifc_hole_only, footprints_hole_only)
+    assert all(not n.nested_parent for n in geo2.nodes)
+
+
+def test_opening_heals_open_plan_space_space():
+    """No wall in the strip between facing rooms → inferred space_space."""
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+            GraphNode(id="space:C", kind="space", global_id="C", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", 0, 0, 4, 4),
+            _box_space("B", "L1", 4.2, 0, 8.2, 4),
+            _box_space("C", "L1", 20, 0, 24, 4),
+        ],
+        doors=[],
+        openings=[],
+        stairs=[],
+        walls=[],  # strip empty → open plan
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    opening_edges = [e for e in geo.edges if e.method == "geom_opening_space"]
+    assert len(opening_edges) == 1
+    assert {opening_edges[0].source, opening_edges[0].target} == {"space:A", "space:B"}
+    assert opening_edges[0].portal is not None
+    # Clear-span centre sits in the strip between A and B (x≈4.1, mid y).
+    assert abs(opening_edges[0].portal.x - 4.1) < 0.25
+    assert 0.5 < opening_edges[0].portal.y < 3.5
+
+
+def test_full_wall_blocks_space_space():
+    """Solid wall sealing the strip → no space_space."""
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", 0, 0, 4, 4),
+            _box_space("B", "L1", 4.2, 0, 8.2, 4),
+        ],
+        doors=[],
+        openings=[],
+        stairs=[],
+        walls=[_box_wall("W1", "L1", 4.0, 0.0, 4.2, 4.0)],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    assert not any(e.method == "geom_opening_space" for e in geo.edges)
+
+
+def test_other_storey_door_does_not_carve_sealed_wall():
+    """Stacked door XY from another floor must not punch a sealed same-storey wall."""
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L2"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L2"),
+            GraphNode(id="space:Z", kind="space", global_id="Z", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[
+            {"global_id": "L1", "name": "L1", "elevation": 0.0},
+            {"global_id": "L2", "name": "L2", "elevation": 3.0},
+        ],
+        spaces=[
+            _box_space("A", "L2", 0, 0, 4, 4),
+            _box_space("B", "L2", 4.2, 0, 8.2, 4),
+            _box_space("Z", "L1", 0, 0, 4, 4),
+        ],
+        doors=[
+            DoorPortal(
+                global_id="D_L1",
+                name="lower door",
+                storey_global_id="L1",
+                point=Point2D(x=4.1, y=2.0),
+                incomplete=False,
+                method="ifc_object_placement",
+            )
+        ],
+        openings=[
+            OpeningPortal(
+                global_id="O_L1",
+                name="lower opening",
+                storey_global_id="L1",
+                point=Point2D(x=4.1, y=2.0),
+                incomplete=False,
+                method="ifc_object_placement",
+                filled_by_door_global_id="D_L1",
+            )
+        ],
+        stairs=[],
+        walls=[_box_wall("W1", "L2", 4.0, 0.0, 4.2, 4.0)],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    assert not any(e.method == "geom_opening_space" for e in geo.edges)
+
+
+def test_partial_wall_with_opening_allows_space_space():
+    """Wall leaves a gap; opening carves clear → space_space."""
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", 0, 0, 4, 4),
+            _box_space("B", "L1", 4.2, 0, 8.2, 4),
+        ],
+        doors=[],
+        openings=[
+            OpeningPortal(
+                global_id="O1",
+                name="pass",
+                storey_global_id="L1",
+                point=Point2D(x=4.1, y=2.0),
+                incomplete=False,
+                method="ifc_object_placement",
+            )
+        ],
+        stairs=[],
+        # Wall only covers bottom half of the frontage; top stays open — and
+        # opening at y=2 carves even if hull overlaps.
+        walls=[_box_wall("W1", "L1", 4.0, 0.0, 4.2, 1.2)],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    opening_edges = [e for e in geo.edges if e.method == "geom_opening_space"]
+    assert len(opening_edges) == 1
+    assert {opening_edges[0].source, opening_edges[0].target} == {"space:A", "space:B"}
+    assert opening_edges[0].global_id == "O1"
+    assert opening_edges[0].portal is not None
+    # Portal is clear-span centre (wide/partial open), not the opening XY alone.
+    assert abs(opening_edges[0].portal.x - 4.1) < 0.25
+    assert 1.5 < opening_edges[0].portal.y < 3.5
+
+
+def test_opening_heal_skips_door_filled_pair_already_door_linked():
+    """Door already bridges both spaces → no duplicate space_space."""
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+            GraphNode(id="door:D", kind="door", global_id="D", storey_global_id="L1"),
+        ],
+        edges=[
+            GraphEdge(
+                id="e1",
+                kind="space_door",
+                source="space:A",
+                target="door:D",
+                method="ifc_rel_space_boundary",
+                inferred=False,
+            ),
+            GraphEdge(
+                id="e2",
+                kind="space_door",
+                source="space:B",
+                target="door:D",
+                method="ifc_rel_space_boundary",
+                inferred=False,
+            ),
+        ],
+    )
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", 0, 0, 4, 4),
+            _box_space("B", "L1", 4.2, 0, 8.2, 4),
+        ],
+        doors=[
+            DoorPortal(
+                global_id="D",
+                storey_global_id="L1",
+                point=Point2D(x=4.1, y=2),
+                incomplete=False,
+                method="ifc_object_placement",
+            )
+        ],
+        openings=[],
+        stairs=[],
+        walls=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    assert not any(e.method == "geom_opening_space" for e in geo.edges)
+
+
+def test_wall_touch_without_clear_span_does_not_heal():
+    """Sealed wall, no void carve → no space_space."""
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", 0, 0, 4, 4),
+            _box_space("B", "L1", 4.2, 0, 8.2, 4),
+        ],
+        doors=[],
+        openings=[],
+        stairs=[],
+        walls=[_box_wall("W1", "L1", 3.95, -0.1, 4.25, 4.1)],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    assert not any(e.kind == "space_space" for e in geo.edges)
+
+
+def test_opening_heal_does_not_cross_storeys():
+    """Open-plan strip on L1 only — never L1↔L2."""
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:L1A", kind="space", global_id="L1A", storey_global_id="L1"),
+            GraphNode(id="space:L1B", kind="space", global_id="L1B", storey_global_id="L1"),
+            GraphNode(id="space:L2A", kind="space", global_id="L2A", storey_global_id="L2"),
+            GraphNode(id="space:L2B", kind="space", global_id="L2B", storey_global_id="L2"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[
+            {"global_id": "L1", "name": "L1", "elevation": 0.0},
+            {"global_id": "L2", "name": "L2", "elevation": 3.0},
+        ],
+        spaces=[
+            _box_space("L1A", "L1", 0, 0, 4, 4),
+            _box_space("L1B", "L1", 4.2, 0, 8.2, 4),
+            _box_space("L2A", "L2", 0, 0, 4, 4),
+            _box_space("L2B", "L2", 4.2, 0, 8.2, 4),
+        ],
+        doors=[],
+        openings=[],
+        stairs=[],
+        walls=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    opening_edges = [e for e in geo.edges if e.method == "geom_opening_space"]
+    assert len(opening_edges) == 2  # one per storey open pair
+    for e in opening_edges:
+        ends = {e.source, e.target}
+        assert ends in (
+            {"space:L1A", "space:L1B"},
+            {"space:L2A", "space:L2B"},
+        )

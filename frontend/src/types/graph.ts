@@ -31,10 +31,16 @@ export interface GraphEdge {
     | "vertical_storey_link"
     | "geom_door_space"
     | "geom_stair_space"
+    | "geom_opening_space"
     | "topologicpy_adjacency";
   bidirectional?: boolean;
-  /** True when not authored via IfcRelSpaceBoundary — draw green in the viewer. */
+  /** True when not authored via IfcRelSpaceBoundary — heal colours in the viewer. */
   inferred?: boolean;
+  /**
+   * Plan XY for space↔space geometric path: centre of the walkable clear span
+   * (or IFC opening on the interface). Treated like a door portal.
+   */
+  portal?: { x: number; y: number } | null;
 }
 
 export interface ConnectivityGraph {

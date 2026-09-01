@@ -19,6 +19,7 @@ import type {
 import type { ConnectivityGraph, RouteResult } from "@/types/graph";
 import type { EntitiesExtract } from "@/api/models";
 import type { FootprintsDocument } from "@/types/footprints";
+import type { ViewerCameraPose, ThreeAabb, Mat4Elements } from "@/lib/viewer-camera-pose";
 
 export type WorkMode = "model" | "navigate" | "layers" | "validate" | "scenario";
 
@@ -97,6 +98,18 @@ interface InferState {
   viewerStatus: string;
   setViewerStatus: (message: string, kind?: "info" | "error" | "loading") => void;
   viewerStatusKind: "info" | "error" | "loading";
+  /** Live 3D camera in plan metres + elevation; null when unknown / cleared. */
+  viewerCameraPose: ViewerCameraPose | null;
+  setViewerCameraPose: (pose: ViewerCameraPose | null) => void;
+  /** Loaded 3D model AABB (Three Y-up); used to lock plan-dot axis frame. */
+  viewerModelBounds: ThreeAabb | null;
+  setViewerModelBounds: (bounds: ThreeAabb | null) => void;
+  /**
+   * Inverse of Fragments/web-ifc coordination matrix (column-major 16).
+   * Undoes COORDINATE_TO_ORIGIN so the plan-dot matches footprint IFC XY.
+   */
+  viewerCoordInverse: Mat4Elements | null;
+  setViewerCoordInverse: (m: Mat4Elements | null) => void;
 
   // Backend model + connectivity graph (null graph ⇒ demo fallback in viewer)
   backendModelId: string | null;
@@ -154,6 +167,9 @@ export function InferProvider({ children }: { children: ReactNode }) {
   const [viewerStatusKind, setViewerStatusKind] = useState<"info" | "error" | "loading">(
     "info",
   );
+  const [viewerCameraPose, setViewerCameraPose] = useState<ViewerCameraPose | null>(null);
+  const [viewerModelBounds, setViewerModelBounds] = useState<ThreeAabb | null>(null);
+  const [viewerCoordInverse, setViewerCoordInverse] = useState<Mat4Elements | null>(null);
   const [backendModelId, setBackendModelId] = useState<string | null>(null);
   const [connectivityGraph, setConnectivityGraph] = useState<ConnectivityGraph | null>(null);
   const [entitiesExtract, setEntitiesExtract] = useState<EntitiesExtract | null>(null);
@@ -213,6 +229,9 @@ export function InferProvider({ children }: { children: ReactNode }) {
     setConnectivityRoute(null);
     setExcludedNodeIds(new Set());
     setPendingIfc(null);
+    setViewerCameraPose(null);
+    setViewerModelBounds(null);
+    setViewerCoordInverse(null);
   }, []);
 
   const setConnectivityGraphOnly = useCallback((graph: ConnectivityGraph) => {
@@ -342,6 +361,12 @@ export function InferProvider({ children }: { children: ReactNode }) {
       viewerStatus,
       setViewerStatus,
       viewerStatusKind,
+      viewerCameraPose,
+      setViewerCameraPose,
+      viewerModelBounds,
+      setViewerModelBounds,
+      viewerCoordInverse,
+      setViewerCoordInverse,
       backendModelId,
       connectivityGraph,
       entitiesExtract,
@@ -393,6 +418,9 @@ export function InferProvider({ children }: { children: ReactNode }) {
       viewerStatus,
       setViewerStatus,
       viewerStatusKind,
+      viewerCameraPose,
+      viewerModelBounds,
+      viewerCoordInverse,
       backendModelId,
       connectivityGraph,
       entitiesExtract,

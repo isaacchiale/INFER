@@ -50,8 +50,43 @@ class DoorPortal(BaseModel):
     ] = "unavailable"
 
 
+class OpeningPortal(BaseModel):
+    """2D portal for an IfcOpeningElement (void in a wall / open-plan gap)."""
+
+    global_id: str
+    name: str = ""
+    storey_global_id: str | None = None
+    point: Point2D | None = None
+    segment: list[Point2D] = Field(default_factory=list)
+    incomplete: bool = False
+    method: Literal[
+        "ifc_mesh_xy_centroid",
+        "ifc_object_placement",
+        "unavailable",
+    ] = "unavailable"
+    """Door that fills this opening via IfcRelFillsElement, if any."""
+    filled_by_door_global_id: str | None = None
+    """Window that fills this opening, if any (not treated as walkable in v1)."""
+    filled_by_window_global_id: str | None = None
+
+
 class StairFootprint(BaseModel):
     """2D plan outline for an IfcStair (top-down hull), for floorplan overlay."""
+
+    global_id: str
+    name: str = ""
+    storey_global_id: str | None = None
+    polygon: list[Point2D] = Field(default_factory=list)
+    incomplete: bool = False
+    method: Literal[
+        "ifc_mesh_xy_hull",
+        "ifc_placement_bbox",
+        "unavailable",
+    ] = "unavailable"
+
+
+class WallFootprint(BaseModel):
+    """2D plan outline for an IfcWall (top-down hull), for space↔space strip tests."""
 
     global_id: str
     name: str = ""
@@ -73,4 +108,6 @@ class FootprintsDocument(BaseModel):
     storeys: list[StoreyFootprintMeta] = Field(default_factory=list)
     spaces: list[SpaceFootprint] = Field(default_factory=list)
     doors: list[DoorPortal] = Field(default_factory=list)
+    openings: list[OpeningPortal] = Field(default_factory=list)
     stairs: list[StairFootprint] = Field(default_factory=list)
+    walls: list[WallFootprint] = Field(default_factory=list)

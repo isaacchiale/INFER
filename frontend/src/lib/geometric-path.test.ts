@@ -240,4 +240,136 @@ describe("geometric-path", () => {
     assert.ok(line.points.length >= 2);
     assert.equal(line.incomplete, false);
   });
+
+  it("routes space↔space heals through openings like doors", () => {
+    const fp: FootprintsDocument = {
+      ...footprints,
+      openings: [
+        {
+          global_id: "O_AB",
+          name: "Opening AB",
+          storey_global_id: "S1",
+          point: { x: 10, y: 5 },
+          segment: [],
+          incomplete: false,
+          method: "ifc_object_placement",
+        },
+        {
+          global_id: "O_BC",
+          name: "Opening BC",
+          storey_global_id: "S1",
+          point: { x: 30, y: 5 },
+          segment: [],
+          incomplete: false,
+          method: "ifc_object_placement",
+        },
+      ],
+    };
+    const graph = {
+      schema_version: "1.0" as const,
+      model_id: "t",
+      nodes: [],
+      edges: [
+        {
+          id: "e1",
+          kind: "space_space" as const,
+          source: "space:A",
+          target: "space:B",
+          global_id: "O_AB",
+          method: "geom_opening_space" as const,
+          inferred: true,
+          portal: { x: 10, y: 5 },
+        },
+        {
+          id: "e2",
+          kind: "space_space" as const,
+          source: "space:B",
+          target: "space:C",
+          global_id: "O_BC",
+          method: "geom_opening_space" as const,
+          inferred: true,
+          portal: { x: 30, y: 5 },
+        },
+      ],
+    };
+
+    const route = ["space:A", "space:B", "space:C"];
+    const line = continuousPolylineForStorey(route, fp, "S1", graph);
+    assert.equal(line.incomplete, false);
+    // start + opening AB + opening BC + end
+    assert.match(line.note, /4 waypoints/);
+
+    const near = (p: { x: number; y: number }, q: { x: number; y: number }) =>
+      Math.hypot(p.x - q.x, p.y - q.y) < 0.05;
+    const aCent = polygonCentroid(fp.spaces[0]!.polygon)!;
+    const cCent = polygonCentroid(fp.spaces[2]!.polygon)!;
+    const oAb = { x: 10, y: 5 };
+    const oBc = { x: 30, y: 5 };
+
+    assert.ok(near(line.points[0]!, aCent), "starts at room A centroid");
+    assert.ok(near(line.points[line.points.length - 1]!, cCent), "ends at C");
+    assert.ok(line.points.some((p) => near(p, oAb)), "passes opening AB");
+    assert.ok(line.points.some((p) => near(p, oBc)), "passes opening BC");
+
+    // Must not be a single straight centroid–centroid chord (would skip openings).
+    const isStraightChord =
+      line.points.length === 2 &&
+      near(line.points[0]!, aCent) &&
+      near(line.points[1]!, cCent);
+    assert.equal(isStraightChord, false);
+
+    const path = buildGeometricPath(route, fp, graph);
+    assert.equal(path.complete, true);
+    assert.ok(path.segments.length >= 3);
+    assert.ok(path.segments.every((s) => !s.incomplete && s.points.length >= 1));
+  });
+
+  it("prefers edge clear-span portal over facade openings", () => {
+    const fp: FootprintsDocument = {
+      ...footprints,
+      openings: [
+        {
+          global_id: "FACADE",
+          name: "Facade window",
+          storey_global_id: "S1",
+          point: { x: 5, y: 0 },
+          segment: [],
+          incomplete: false,
+          method: "ifc_object_placement",
+        },
+      ],
+    };
+    const graph = {
+      schema_version: "1.0" as const,
+      model_id: "t",
+      nodes: [],
+      edges: [
+        {
+          id: "e1",
+          kind: "space_space" as const,
+          source: "space:A",
+          target: "space:B",
+          method: "geom_opening_space" as const,
+          inferred: true,
+          portal: { x: 10, y: 5 },
+        },
+      ],
+    };
+    const line = continuousPolylineForStorey(
+      ["space:A", "space:B"],
+      fp,
+      "S1",
+      graph,
+    );
+    const near = (p: { x: number; y: number }, q: { x: number; y: number }) =>
+      Math.hypot(p.x - q.x, p.y - q.y) < 0.05;
+    assert.ok(
+      line.points.some((p) => near(p, { x: 10, y: 5 })),
+      "uses strip portal on shared wall",
+    );
+    assert.ok(
+      !line.points.some((p) => near(p, { x: 5, y: 0 })),
+      "ignores facade opening",
+    );
+  });
 });

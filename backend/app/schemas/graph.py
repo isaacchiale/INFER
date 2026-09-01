@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.footprints import Point2D
+
 GraphVariant = Literal["ifc", "geometry", "topologic"]
 
 EdgeMethod = Literal[
@@ -11,6 +13,7 @@ EdgeMethod = Literal[
     "vertical_storey_link",
     "geom_door_space",
     "geom_stair_space",
+    "geom_opening_space",
     "topologicpy_adjacency",
 ]
 
@@ -45,6 +48,11 @@ class GraphEdge(BaseModel):
     bidirectional: bool = True
     """True when the edge was not authored via IfcRelSpaceBoundary."""
     inferred: bool = False
+    """
+    Plan XY for geometric path on space↔space heals: centre of the walkable
+    clear span along the shared frontage (used like a door portal).
+    """
+    portal: Point2D | None = None
 
 
 class ConnectivityGraph(BaseModel):

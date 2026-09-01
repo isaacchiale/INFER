@@ -1,10 +1,10 @@
-import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   Panel,
   PanelGroup,
   PanelResizeHandle,
 } from "react-resizable-panels";
-import { Box, GitFork, LayoutGrid, Maximize2, Minimize2, X } from "lucide-react";
+import { Box, GitFork, LayoutGrid, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { GraphViewer } from "@/components/graph/GraphViewer";
 import { FloorplanViewer } from "@/components/floorplan/FloorplanViewer";
@@ -13,7 +13,6 @@ export type PaneId = "model3d" | "floorplan" | "graph";
 
 type PaneState = {
   open: boolean;
-  maximized: boolean;
 };
 
 const PANE_META: Record<PaneId, { title: string; icon: ReactNode }> = {
@@ -41,10 +40,9 @@ function clearPersistedPaneLayout() {
   }
 }
 
-// Drop any prior session panel layout before the first paint (reload = equal thirds).
 clearPersistedPaneLayout();
 
-/** Stable off-screen size so WebGL keeps a real framebuffer while the pane is closed. */
+/** Stable off-screen size so WebGL / Cytoscape keep a real framebuffer while parked. */
 const KEEP_ALIVE = { width: 640, height: 480 };
 
 function equalDefaultSize(openCount: number): number {
@@ -55,15 +53,11 @@ function PaneChrome({
   title,
   icon,
   onClose,
-  onMaximize,
-  maximized,
   children,
 }: {
   title: string;
   icon: ReactNode;
   onClose: () => void;
-  onMaximize: () => void;
-  maximized: boolean;
   children: ReactNode;
 }) {
   return (
@@ -73,26 +67,15 @@ function PaneChrome({
           {icon}
           <span>{title}</span>
         </div>
-        <div className="flex items-center gap-0.5">
-          <button
-            type="button"
-            onClick={onMaximize}
-            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-            aria-label={maximized ? `Restore ${title}` : `Maximize ${title}`}
-            title={maximized ? `Restore ${title}` : `Maximize ${title}`}
-          >
-            {maximized ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
-          </button>
-          <button
-            type="button"
-            onClick={onClose}
-            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-            aria-label={`Close ${title}`}
-            title={`Close ${title}`}
-          >
-            <X className="size-3.5" />
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          aria-label={`Close ${title}`}
+          title={`Close ${title}`}
+        >
+          <X className="size-3.5" />
+        </button>
       </div>
       <div className="min-h-0 flex-1">{children}</div>
     </div>
@@ -110,25 +93,69 @@ function ResizeHandle() {
   );
 }
 
+function parkHost(host: HTMLElement, workspace: HTMLElement) {
+  if (host.parentElement !== workspace) {
+    workspace.appendChild(host);
+  }
+  host.style.position = "fixed";
+  host.style.left = "-10000px";
+  host.style.top = "0px";
+  host.style.right = "auto";
+  host.style.bottom = "auto";
+  host.style.width = `${KEEP_ALIVE.width}px`;
+  host.style.height = `${KEEP_ALIVE.height}px`;
+  host.style.opacity = "0";
+  host.style.pointerEvents = "none";
+  host.style.zIndex = "-1";
+  host.setAttribute("aria-hidden", "true");
+}
+
+function dockHost(host: HTMLElement, target: HTMLElement) {
+  if (getComputedStyle(target).position === "static") {
+    target.style.position = "relative";
+  }
+  if (host.parentElement !== target) {
+    target.appendChild(host);
+  }
+  host.style.position = "absolute";
+  host.style.left = "0";
+  host.style.top = "0";
+  host.style.right = "0";
+  host.style.bottom = "0";
+  host.style.width = "100%";
+  host.style.height = "100%";
+  host.style.opacity = "1";
+  host.style.pointerEvents = "auto";
+  host.style.zIndex = "1";
+  host.setAttribute("aria-hidden", "false");
+}
+
+const PARKED_STYLE: CSSProperties = {
+  position: "fixed",
+  left: -10000,
+  top: 0,
+  width: KEEP_ALIVE.width,
+  height: KEEP_ALIVE.height,
+  opacity: 0,
+  pointerEvents: "none",
+};
+
 export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
   const [panes, setPanes] = useState<Record<PaneId, PaneState>>({
-    model3d: { open: true, maximized: false },
-    floorplan: { open: true, maximized: false },
-    graph: { open: true, maximized: false },
+    model3d: { open: true },
+    floorplan: { open: true },
+    graph: { open: true },
   });
 
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const threeSlotRef = useRef<HTMLDivElement | null>(null);
+  const floorSlotRef = useRef<HTMLDivElement | null>(null);
+  const graphSlotRef = useRef<HTMLDivElement | null>(null);
   const threeHostRef = useRef<HTMLDivElement | null>(null);
+  const floorHostRef = useRef<HTMLDivElement | null>(null);
+  const graphHostRef = useRef<HTMLDivElement | null>(null);
 
   const openCount = (Object.keys(panes) as PaneId[]).filter((id) => panes[id].open).length;
-  const maximizedId = (Object.keys(panes) as PaneId[]).find(
-    (id) => panes[id].maximized && panes[id].open,
-  );
-
-  /** 3D should be visible in the layout (not parked). */
-  const threeDocked =
-    panes.model3d.open && (maximizedId == null || maximizedId === "model3d");
 
   const closePane = useCallback((id: PaneId) => {
     setPanes((prev) => {
@@ -136,164 +163,49 @@ export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
       if (othersOpen.length === 0) return prev;
       return {
         ...prev,
-        [id]: { open: false, maximized: false },
-        ...Object.fromEntries(othersOpen.map((k) => [k, { ...prev[k], maximized: false }])),
-      } as Record<PaneId, PaneState>;
+        [id]: { open: false },
+      };
     });
   }, []);
 
   const openPane = useCallback((id: PaneId) => {
     setPanes((prev) => ({
       ...prev,
-      [id]: { open: true, maximized: false },
+      [id]: { open: true },
     }));
   }, []);
 
-  const toggleMaximize = useCallback((id: PaneId) => {
-    setPanes((prev) => {
-      const willMax = !prev[id].maximized;
-      const next = { ...prev };
-      (Object.keys(next) as PaneId[]).forEach((k) => {
-        next[k] = {
-          open: prev[k].open,
-          maximized: willMax ? k === id : false,
-        };
-      });
-      return next;
-    });
-  }, []);
-
-  const chrome = (id: Exclude<PaneId, "model3d">) => (
-    <PaneChrome
-      title={PANE_META[id].title}
-      icon={PANE_META[id].icon}
-      maximized={!!panes[id].maximized}
-      onClose={() => closePane(id)}
-      onMaximize={() => toggleMaximize(id)}
-    >
-      {id === "floorplan" ? (
-        <FloorplanViewer className="h-full" />
-      ) : (
-        <GraphViewer className="h-full" />
-      )}
-    </PaneChrome>
-  );
-
   const defaultSize = equalDefaultSize(openCount);
 
-  const mainLayout = () => {
-    const show3d = panes.model3d.open;
-    const showFloor = panes.floorplan.open;
-    const showGraph = panes.graph.open;
-
-    const modelOrder = 1;
-    const floorOrder = show3d ? 2 : 1;
-    const graphOrder = 1 + Number(show3d) + Number(showFloor);
-
-    return (
-      <PanelGroup direction="horizontal" className="h-full min-h-0">
-        {show3d && (
-          <>
-            <Panel
-              id="model3d"
-              order={modelOrder}
-              defaultSize={defaultSize}
-              minSize={16}
-              className="min-w-0"
-            >
-              <div ref={threeSlotRef} className="relative h-full w-full overflow-hidden bg-viewport" />
-            </Panel>
-            {(showFloor || showGraph) && <ResizeHandle />}
-          </>
-        )}
-
-        {showFloor && (
-          <>
-            <Panel
-              id="floorplan"
-              order={floorOrder}
-              defaultSize={defaultSize}
-              minSize={16}
-              className="min-w-0"
-            >
-              {chrome("floorplan")}
-            </Panel>
-            {showGraph && <ResizeHandle />}
-          </>
-        )}
-
-        {showGraph && (
-          <Panel
-            id="graph"
-            order={graphOrder}
-            defaultSize={defaultSize}
-            minSize={16}
-            className="min-w-0"
-          >
-            {chrome("graph")}
-          </Panel>
-        )}
-
-        {openCount === 0 && <div ref={threeSlotRef} className="h-full w-full" />}
-      </PanelGroup>
-    );
-  };
-
-  // Keep a single 3D mount: reparent into the slot (or workspace when maximized).
-  // Never absolute-overlay the whole workspace at z-30 — a stale rect steals
-  // wheel/pan from the graph/floorplan panes until maximize "fixes" it.
+  /**
+   * Keep a single mount per viewer (3D / floorplan / graph). Closed panes park
+   * off-screen so WebGL / Cytoscape stay alive; open panes dock into slots.
+   */
   useLayoutEffect(() => {
-    const host = threeHostRef.current;
     const workspace = workspaceRef.current;
-    if (!host || !workspace) return;
-
-    const park = () => {
-      if (host.parentElement !== workspace) {
-        workspace.appendChild(host);
-      }
-      host.style.position = "fixed";
-      host.style.left = "-10000px";
-      host.style.top = "0px";
-      host.style.right = "auto";
-      host.style.bottom = "auto";
-      host.style.width = `${KEEP_ALIVE.width}px`;
-      host.style.height = `${KEEP_ALIVE.height}px`;
-      host.style.opacity = "0";
-      host.style.pointerEvents = "none";
-      host.style.zIndex = "-1";
-      host.setAttribute("aria-hidden", "true");
-    };
-
-    const dockInto = (target: HTMLElement) => {
-      if (getComputedStyle(target).position === "static") {
-        target.style.position = "relative";
-      }
-      if (host.parentElement !== target) {
-        target.appendChild(host);
-      }
-      host.style.position = "absolute";
-      host.style.left = "0";
-      host.style.top = "0";
-      host.style.right = "0";
-      host.style.bottom = "0";
-      host.style.width = "100%";
-      host.style.height = "100%";
-      host.style.opacity = "1";
-      host.style.pointerEvents = "auto";
-      host.style.zIndex = "1";
-      host.setAttribute("aria-hidden", "false");
-    };
+    const threeHost = threeHostRef.current;
+    const floorHost = floorHostRef.current;
+    const graphHost = graphHostRef.current;
+    if (!workspace || !threeHost || !floorHost || !graphHost) return;
 
     const sync = () => {
-      if (maximizedId === "model3d") {
-        dockInto(workspace);
-        return;
+      if (panes.model3d.open && threeSlotRef.current) {
+        dockHost(threeHost, threeSlotRef.current);
+      } else {
+        parkHost(threeHost, workspace);
       }
-      if (threeDocked && threeSlotRef.current) {
-        dockInto(threeSlotRef.current);
-        return;
+
+      if (panes.floorplan.open && floorSlotRef.current) {
+        dockHost(floorHost, floorSlotRef.current);
+      } else {
+        parkHost(floorHost, workspace);
       }
-      park();
+
+      if (panes.graph.open && graphSlotRef.current) {
+        dockHost(graphHost, graphSlotRef.current);
+      } else {
+        parkHost(graphHost, workspace);
+      }
     };
 
     sync();
@@ -301,12 +213,22 @@ export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
     const ro = new ResizeObserver(() => sync());
     ro.observe(workspace);
     if (threeSlotRef.current) ro.observe(threeSlotRef.current);
+    if (floorSlotRef.current) ro.observe(floorSlotRef.current);
+    if (graphSlotRef.current) ro.observe(graphSlotRef.current);
     window.addEventListener("resize", sync);
     return () => {
       ro.disconnect();
       window.removeEventListener("resize", sync);
     };
-  }, [threeDocked, maximizedId, panes.model3d.open, panes.floorplan.open, panes.graph.open]);
+  }, [panes.model3d.open, panes.floorplan.open, panes.graph.open]);
+
+  const show3d = panes.model3d.open;
+  const showFloor = panes.floorplan.open;
+  const showGraph = panes.graph.open;
+
+  const modelOrder = 1;
+  const floorOrder = show3d ? 2 : 1;
+  const graphOrder = 1 + Number(show3d) + Number(showFloor);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -337,35 +259,95 @@ export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
       </div>
 
       <div ref={workspaceRef} className="relative min-h-0 flex-1 overflow-hidden">
-        {maximizedId && maximizedId !== "model3d"
-          ? chrome(maximizedId)
-          : maximizedId === "model3d"
-            ? null
-            : mainLayout()}
+        <PanelGroup direction="horizontal" className="h-full min-h-0">
+          {show3d && (
+            <>
+              <Panel
+                id="model3d"
+                order={modelOrder}
+                defaultSize={defaultSize}
+                minSize={16}
+                className="min-w-0"
+              >
+                <div
+                  ref={threeSlotRef}
+                  className="relative h-full w-full overflow-hidden bg-viewport"
+                />
+              </Panel>
+              {(showFloor || showGraph) && <ResizeHandle />}
+            </>
+          )}
 
-        {/* Single keep-alive 3D host — never unmounted while the workspace lives */}
+          {showFloor && (
+            <>
+              <Panel
+                id="floorplan"
+                order={floorOrder}
+                defaultSize={defaultSize}
+                minSize={16}
+                className="min-w-0"
+              >
+                <div ref={floorSlotRef} className="relative h-full w-full overflow-hidden" />
+              </Panel>
+              {showGraph && <ResizeHandle />}
+            </>
+          )}
+
+          {showGraph && (
+            <Panel
+              id="graph"
+              order={graphOrder}
+              defaultSize={defaultSize}
+              minSize={16}
+              className="min-w-0"
+            >
+              <div ref={graphSlotRef} className="relative h-full w-full overflow-hidden" />
+            </Panel>
+          )}
+
+          {openCount === 0 && <div ref={threeSlotRef} className="h-full w-full" />}
+        </PanelGroup>
+
+        {/* Keep-alive hosts — never unmounted while the workspace lives */}
         <div
           ref={threeHostRef}
           className="overflow-hidden bg-background shadow-sm"
-          // Initial park until layout effect runs
-          style={{
-            position: "fixed",
-            left: -10000,
-            top: 0,
-            width: KEEP_ALIVE.width,
-            height: KEEP_ALIVE.height,
-            opacity: 0,
-            pointerEvents: "none",
-          }}
+          style={PARKED_STYLE}
         >
           <PaneChrome
             title={PANE_META.model3d.title}
             icon={PANE_META.model3d.icon}
-            maximized={maximizedId === "model3d"}
             onClose={() => closePane("model3d")}
-            onMaximize={() => toggleMaximize("model3d")}
           >
             <div className="relative h-full min-h-0">{modelPane}</div>
+          </PaneChrome>
+        </div>
+
+        <div
+          ref={floorHostRef}
+          className="overflow-hidden bg-background shadow-sm"
+          style={PARKED_STYLE}
+        >
+          <PaneChrome
+            title={PANE_META.floorplan.title}
+            icon={PANE_META.floorplan.icon}
+            onClose={() => closePane("floorplan")}
+          >
+            <FloorplanViewer className="h-full" />
+          </PaneChrome>
+        </div>
+
+        <div
+          ref={graphHostRef}
+          className="overflow-hidden bg-background shadow-sm"
+          style={PARKED_STYLE}
+        >
+          <PaneChrome
+            title={PANE_META.graph.title}
+            icon={PANE_META.graph.icon}
+            onClose={() => closePane("graph")}
+          >
+            <GraphViewer className="h-full" />
           </PaneChrome>
         </div>
       </div>

@@ -5,7 +5,13 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 
-from app.schemas.footprints import FootprintsDocument, Point2D, SpaceFootprint
+from app.schemas.footprints import (
+    FootprintsDocument,
+    OpeningPortal,
+    Point2D,
+    SpaceFootprint,
+    WallFootprint,
+)
 from app.schemas.graph import ConnectivityGraph, GraphEdge, GraphNode
 
 
@@ -255,6 +261,280 @@ def _door_between_spaces(
     return dot < DOOR_BETWEEN_DOT_MAX
 
 
+# Space↔space heal: facing frontage + strip clearance (walls − opening/door voids).
+INTERFACE_SAMPLE_M = 0.12
+# Max gap between footprints to count as a shared interface (wall thickness).
+INTERFACE_GAP_MAX_M = 0.45
+MIN_INTERFACE_LEN_M = 0.5
+# Walkable clear span along the frontage after carving voids.
+MIN_CLEAR_SPAN_M = 0.7
+# Mid-strip point is "in wall" if inside wall poly or within this distance.
+WALL_HIT_TOL_M = 0.08
+# Carve this radius around opening/door portals as clear (voids often missing from wall mesh).
+VOID_CARVE_RADIUS_M = 0.55
+
+
+def _polygon_centroid(polygon: list[Point2D]) -> Point2D:
+    if not polygon:
+        return Point2D(x=0.0, y=0.0)
+    return Point2D(
+        x=sum(p.x for p in polygon) / len(polygon),
+        y=sum(p.y for p in polygon) / len(polygon),
+    )
+
+
+def _sample_polygon_boundary(
+    polygon: list[Point2D], step: float = INTERFACE_SAMPLE_M
+) -> list[Point2D]:
+    if len(polygon) < 3 or step <= 0:
+        return []
+    pts: list[Point2D] = []
+    n = len(polygon)
+    for i in range(n):
+        a = polygon[i]
+        b = polygon[(i + 1) % n]
+        seg_len = math.hypot(b.x - a.x, b.y - a.y)
+        if seg_len < 1e-9:
+            continue
+        count = max(1, int(math.ceil(seg_len / step)))
+        for k in range(count + 1):
+            t = k / count
+            pts.append(Point2D(x=a.x + t * (b.x - a.x), y=a.y + t * (b.y - a.y)))
+    return pts
+
+
+def _interface_length_and_gap(
+    a: SpaceFootprint, b: SpaceFootprint, gap_max: float = INTERFACE_GAP_MAX_M
+) -> tuple[float, float]:
+    """Shared-frontage length + mean gap. Length 0 if no interface."""
+    if len(a.polygon) < 3 or len(b.polygon) < 3:
+        return 0.0, float("inf")
+    hits: list[float] = []
+    for p in _sample_polygon_boundary(a.polygon):
+        d = _dist_point_to_polygon(p.x, p.y, b.polygon)
+        if d <= gap_max:
+            hits.append(d)
+    for p in _sample_polygon_boundary(b.polygon):
+        d = _dist_point_to_polygon(p.x, p.y, a.polygon)
+        if d <= gap_max:
+            hits.append(d)
+    if not hits:
+        return 0.0, float("inf")
+    length = (len(hits) * INTERFACE_SAMPLE_M) / 2.0
+    mean_gap = sum(hits) / len(hits)
+    return length, mean_gap
+
+
+def _frontage_strip_samples(
+    a: SpaceFootprint, b: SpaceFootprint, gap_max: float = INTERFACE_GAP_MAX_M
+) -> list[tuple[float, Point2D]]:
+    """
+    Samples along the shared frontage: (1D parameter t, midpoint in the strip).
+    t runs along the direction perpendicular to A→B centroids.
+    """
+    if len(a.polygon) < 3 or len(b.polygon) < 3:
+        return []
+    ca = _polygon_centroid(a.polygon)
+    cb = _polygon_centroid(b.polygon)
+    dx, dy = cb.x - ca.x, cb.y - ca.y
+    span = math.hypot(dx, dy)
+    if span < 1e-9:
+        fx, fy = 1.0, 0.0
+    else:
+        # Unit along frontage (perpendicular to A→B).
+        fx, fy = -dy / span, dx / span
+
+    samples: list[tuple[float, Point2D]] = []
+    for p in _sample_polygon_boundary(a.polygon):
+        d = _dist_point_to_polygon(p.x, p.y, b.polygon)
+        if d > gap_max:
+            continue
+        q, _ = _closest_point_on_polygon(p, b.polygon)
+        mid = Point2D(x=0.5 * (p.x + q.x), y=0.5 * (p.y + q.y))
+        t = (p.x - ca.x) * fx + (p.y - ca.y) * fy
+        samples.append((t, mid))
+    samples.sort(key=lambda item: item[0])
+    return samples
+
+
+def _point_hits_wall(
+    p: Point2D, walls: list[WallFootprint], tol: float = WALL_HIT_TOL_M
+) -> bool:
+    for wall in walls:
+        if len(wall.polygon) < 3:
+            continue
+        if _point_in_polygon(p.x, p.y, wall.polygon):
+            return True
+        if _dist_point_to_polygon(p.x, p.y, wall.polygon) <= tol:
+            return True
+    return False
+
+
+def _max_clear_span_m(
+    samples: list[tuple[float, Point2D]],
+    blocked: list[bool],
+) -> float:
+    """Longest contiguous clear run along frontage parameter t."""
+    if not samples or len(samples) != len(blocked):
+        return 0.0
+    best = 0.0
+    run_start: float | None = None
+    prev_t: float | None = None
+    for (t, _mid), is_blocked in zip(samples, blocked):
+        if not is_blocked:
+            if run_start is None:
+                run_start = t
+            prev_t = t
+        else:
+            if run_start is not None and prev_t is not None:
+                best = max(best, prev_t - run_start)
+            run_start = None
+            prev_t = None
+    if run_start is not None and prev_t is not None:
+        best = max(best, prev_t - run_start)
+    # Single-sample clear runs: credit one sample step.
+    if best < 1e-9 and any(not b for b in blocked):
+        best = INTERFACE_SAMPLE_M
+    return best
+
+
+# Prefer centre of the whole clear frontage when most of the strip is open.
+CLEAR_FRONTAGE_WIDE_FRAC = 0.7
+
+
+def _clear_span_portal(
+    samples: list[tuple[float, Point2D]],
+    blocked: list[bool],
+) -> Point2D | None:
+    """
+    Door-like portal on the shared frontage:
+    - If ≥ CLEAR_FRONTAGE_WIDE_FRAC of samples are clear → centre of all clear
+      midpoints (wide opening / open plan).
+    - Else → centre of the longest contiguous clear run (narrow doorway).
+    """
+    if not samples or len(samples) != len(blocked):
+        return None
+
+    clear_mids = [mid for (_t, mid), is_blocked in zip(samples, blocked) if not is_blocked]
+    if not clear_mids:
+        return None
+
+    clear_frac = len(clear_mids) / len(samples)
+    if clear_frac >= CLEAR_FRONTAGE_WIDE_FRAC:
+        return Point2D(
+            x=sum(p.x for p in clear_mids) / len(clear_mids),
+            y=sum(p.y for p in clear_mids) / len(clear_mids),
+        )
+
+    best_len = -1.0
+    best_mids: list[Point2D] = []
+    run_start: float | None = None
+    prev_t: float | None = None
+    run_mids: list[Point2D] = []
+
+    def close_run() -> None:
+        nonlocal best_len, best_mids, run_start, prev_t, run_mids
+        if run_start is None or prev_t is None or not run_mids:
+            run_start = None
+            prev_t = None
+            run_mids = []
+            return
+        span = prev_t - run_start
+        if span < 1e-9:
+            span = INTERFACE_SAMPLE_M
+        if span > best_len:
+            best_len = span
+            best_mids = list(run_mids)
+        run_start = None
+        prev_t = None
+        run_mids = []
+
+    for (t, mid), is_blocked in zip(samples, blocked):
+        if not is_blocked:
+            if run_start is None:
+                run_start = t
+            prev_t = t
+            run_mids.append(mid)
+        else:
+            close_run()
+    close_run()
+
+    if not best_mids:
+        return None
+    return Point2D(
+        x=sum(p.x for p in best_mids) / len(best_mids),
+        y=sum(p.y for p in best_mids) / len(best_mids),
+    )
+
+
+def _carve_voids(
+    samples: list[tuple[float, Point2D]],
+    blocked: list[bool],
+    portals: list[Point2D],
+    radius: float = VOID_CARVE_RADIUS_M,
+) -> None:
+    for i, (_t, mid) in enumerate(samples):
+        for portal in portals:
+            if math.hypot(mid.x - portal.x, mid.y - portal.y) <= radius:
+                blocked[i] = False
+                break
+
+
+def _strip_clear_portal(
+    a: SpaceFootprint,
+    b: SpaceFootprint,
+    walls: list[WallFootprint],
+    void_portals: list[Point2D],
+) -> Point2D | None:
+    """
+    If the facing strip has a clear span ≥ MIN_CLEAR_SPAN_M after wall hits and
+    void carving, return the centre of that clear opening (door-like portal).
+    Otherwise None.
+    """
+    samples = _frontage_strip_samples(a, b)
+    if len(samples) < 2:
+        return None
+
+    blocked = [_point_hits_wall(mid, walls) for _t, mid in samples]
+    _carve_voids(samples, blocked, void_portals)
+    portal = _clear_span_portal(samples, blocked)
+    if portal is None:
+        return None
+    if _max_clear_span_m(samples, blocked) < MIN_CLEAR_SPAN_M:
+        return None
+    return portal
+
+
+def _strip_is_walkable(
+    a: SpaceFootprint,
+    b: SpaceFootprint,
+    walls: list[WallFootprint],
+    void_portals: list[Point2D],
+) -> bool:
+    """True when the facing strip has a clear span ≥ MIN_CLEAR_SPAN_M."""
+    return _strip_clear_portal(a, b, walls, void_portals) is not None
+
+
+def _spaces_already_door_linked(
+    a_id: str, b_id: str, linked_door_spaces: set[tuple[str, str]]
+) -> bool:
+    """True if some door already links both spaces (space–door–space covered)."""
+    doors_a = {did for (did, sid) in linked_door_spaces if sid == a_id}
+    doors_b = {did for (did, sid) in linked_door_spaces if sid == b_id}
+    return bool(doors_a & doors_b)
+
+
+def _opening_on_interface(
+    portal: Point2D, a: SpaceFootprint, b: SpaceFootprint
+) -> bool:
+    """Fallback when wall footprints are missing: portal between facing spaces."""
+    da = _dist_point_to_polygon(portal.x, portal.y, a.polygon)
+    db = _dist_point_to_polygon(portal.x, portal.y, b.polygon)
+    if da > VOID_CARVE_RADIUS_M + 0.3 or db > VOID_CARVE_RADIUS_M + 0.3:
+        return False
+    return _door_between_spaces(portal, a, b)
+
+
 def _pick_door_spaces(
     door: Point2D, ranked: list[tuple[float, SpaceFootprint]]
 ) -> list[SpaceFootprint]:
@@ -431,22 +711,34 @@ def _storey_ids_ordered_by_elevation(footprints: FootprintsDocument) -> list[str
     return [s.global_id for s in with_elev]
 
 
+def _point_in_space_footprint(x: float, y: float, space: SpaceFootprint) -> bool:
+    """True when (x,y) is in the space exterior and not inside any hole."""
+    if len(space.polygon) < 3:
+        return False
+    if not _point_in_polygon(x, y, space.polygon):
+        return False
+    for hole in space.holes or []:
+        if len(hole) >= 3 and _point_in_polygon(x, y, hole):
+            return False
+    return True
+
+
 def _footprint_contained(child: SpaceFootprint, parent: SpaceFootprint) -> bool:
     """
-    True when child sits inside parent: centroid in parent and most ring
-    vertices in parent. Used to find nested IfcSpace parents without IFC
-    CompositionType / RelAggregates.
+    True when child sits in the parent's walkable footprint: centroid and most
+    ring vertices in parent exterior-minus-holes. Spaces that only sit in a
+    parent hole (courtyard / lift shaft) are not nested children.
     """
     if len(child.polygon) < 3 or len(parent.polygon) < 3:
         return False
     inside = sum(
-        1 for p in child.polygon if _point_in_polygon(p.x, p.y, parent.polygon)
+        1 for p in child.polygon if _point_in_space_footprint(p.x, p.y, parent)
     )
     if inside / len(child.polygon) < NESTED_CHILD_VERTEX_IN_PARENT:
         return False
     cx = sum(p.x for p in child.polygon) / len(child.polygon)
     cy = sum(p.y for p in child.polygon) / len(child.polygon)
-    return _point_in_polygon(cx, cy, parent.polygon)
+    return _point_in_space_footprint(cx, cy, parent)
 
 
 def find_nested_parent_gids(footprints: FootprintsDocument) -> set[str]:
@@ -521,8 +813,8 @@ def build_geometry_graph(
     ifc_graph: ConnectivityGraph, footprints: FootprintsDocument
 ) -> ConnectivityGraph:
     """
-    Superset of the IFC graph: add door↔space and stair↔space links from footprints
-    when missing from IfcRelSpaceBoundary.
+    Superset of the IFC graph: add door↔space, opening space↔space, and
+    stair↔space links from footprints when missing from IfcRelSpaceBoundary.
     """
     nodes = list(ifc_graph.nodes)
     edges = [e.model_copy(deep=True) for e in ifc_graph.edges]
@@ -531,6 +823,7 @@ def build_geometry_graph(
     # Existing portal links (ignore direction).
     linked_door_spaces: set[tuple[str, str]] = set()  # (door_id, space_id)
     linked_stair_spaces: set[tuple[str, str]] = set()
+    linked_space_pairs: set[tuple[str, str]] = set()  # frozenset-as-sorted tuple
     for e in edges:
         if e.kind == "space_door":
             a, b = e.source, e.target
@@ -546,6 +839,11 @@ def build_geometry_graph(
                 stair.startswith("stair:") or stair.startswith("lift:")
             ):
                 linked_stair_spaces.add((stair, space))
+        if e.kind == "space_space":
+            a, b = e.source, e.target
+            if a.startswith("space:") and b.startswith("space:"):
+                lo, hi = (a, b) if a < b else (b, a)
+                linked_space_pairs.add((lo, hi))
 
     node_by_id = {n.id: n for n in nodes}
 
@@ -618,6 +916,18 @@ def build_geometry_graph(
             )
             edge_ids.add(eid)
             linked_door_spaces.add((door_id, space_id))
+
+    # --- Space↔space heal (interface-first) ---
+    # Only link rooms that share a plan interface; openings must lie on that
+    # interface. Do not pick "nearest two rooms to an opening" (that crossed walls).
+    _heal_space_space_interfaces(
+        footprints=footprints,
+        node_by_id=node_by_id,
+        edges=edges,
+        edge_ids=edge_ids,
+        linked_space_pairs=linked_space_pairs,
+        linked_door_spaces=linked_door_spaces,
+    )
 
     # --- Stair / lift healing ---
     # Own storey + next storey up. Per storey: at most one IfcSpace (max ∩ area).
@@ -695,3 +1005,154 @@ def build_geometry_graph(
         nodes=deepcopy(annotated),
         edges=edges,
     )
+
+
+def _void_portals_on_storey(
+    footprints: FootprintsDocument, storey_gid: str
+) -> list[Point2D]:
+    """
+    Opening/door points that may carve wall strips on this storey only.
+
+    Multi-storey IFCs often stack identical door XY on every floor; carving with
+    another storey's door would punch false holes through sealed attic walls.
+    """
+    voids: list[Point2D] = []
+    for opening in footprints.openings or []:
+        if opening.incomplete or opening.point is None:
+            continue
+        if opening.storey_global_id and opening.storey_global_id != storey_gid:
+            continue
+        voids.append(opening.point)
+    for door in footprints.doors or []:
+        if door.incomplete or door.point is None:
+            continue
+        if door.storey_global_id and door.storey_global_id != storey_gid:
+            continue
+        voids.append(door.point)
+    return voids
+
+
+def _heal_space_space_interfaces(
+    *,
+    footprints: FootprintsDocument,
+    node_by_id: dict[str, GraphNode],
+    edges: list[GraphEdge],
+    edge_ids: set[str],
+    linked_space_pairs: set[tuple[str, str]],
+    linked_door_spaces: set[tuple[str, str]],
+) -> None:
+    """
+    Infer walkable space↔space links from facing strips:
+
+    1. Same-storey pairs with a shared plan frontage.
+    2. Mark strip samples blocked by wall footprints; carve same-storey
+       opening/door voids clear (never other floors' stacked doors).
+    3. Connect when a clear span ≥ MIN_CLEAR_SPAN_M remains
+       (no wall / open plan, or partial wall + opening). Full wall seal ⇒ no edge.
+    4. Store ``portal`` = centre of the walkable clear frontage for geometric path.
+
+    Skip pairs already linked by the same door. Never opening→nearest-rooms.
+    """
+    spaces = [
+        s
+        for s in _all_complete_spaces(footprints)
+        if s.storey_global_id and f"space:{s.global_id}" in node_by_id
+    ]
+    walls = [
+        w
+        for w in (footprints.walls or [])
+        if not w.incomplete and len(w.polygon) >= 3
+    ]
+
+    eligible_openings = [
+        o
+        for o in (footprints.openings or [])
+        if _opening_eligible_for_heal(o) and o.point is not None
+    ]
+
+    by_storey: dict[str, list[SpaceFootprint]] = {}
+    for s in spaces:
+        by_storey.setdefault(s.storey_global_id or "", []).append(s)
+
+    walls_by_storey: dict[str | None, list[WallFootprint]] = {}
+    for w in walls:
+        walls_by_storey.setdefault(w.storey_global_id, []).append(w)
+
+    for storey_gid, group in by_storey.items():
+        storey_walls = list(walls_by_storey.get(storey_gid, []))
+        storey_walls.extend(walls_by_storey.get(None, []))
+        void_portals = _void_portals_on_storey(footprints, storey_gid)
+
+        for i, a in enumerate(group):
+            for b in group[i + 1 :]:
+                a_id = f"space:{a.global_id}"
+                b_id = f"space:{b.global_id}"
+                lo, hi = (a_id, b_id) if a_id < b_id else (b_id, a_id)
+                if (lo, hi) in linked_space_pairs:
+                    continue
+                if _spaces_already_door_linked(a_id, b_id, linked_door_spaces):
+                    continue
+
+                length, _mean_gap = _interface_length_and_gap(a, b)
+                if length < MIN_INTERFACE_LEN_M:
+                    continue
+
+                local_voids: list[Point2D] = []
+                for portal in void_portals:
+                    da = _dist_point_to_polygon(portal.x, portal.y, a.polygon)
+                    db = _dist_point_to_polygon(portal.x, portal.y, b.polygon)
+                    if da <= INTERFACE_GAP_MAX_M + VOID_CARVE_RADIUS_M and db <= (
+                        INTERFACE_GAP_MAX_M + VOID_CARVE_RADIUS_M
+                    ):
+                        local_voids.append(portal)
+
+                strip_portal = _strip_clear_portal(a, b, storey_walls, local_voids)
+                if strip_portal is None:
+                    continue
+
+                # Tag an IFC opening on the interface for metadata only.
+                # Portal stays the clear-span centre (never furniture/cabinet XY).
+                edge_gid: str | None = None
+                for opening in eligible_openings:
+                    if (
+                        opening.storey_global_id
+                        and opening.storey_global_id != storey_gid
+                    ):
+                        continue
+                    assert opening.point is not None
+                    if _opening_on_interface(opening.point, a, b):
+                        edge_gid = opening.global_id
+                        break
+
+                eid = (
+                    f"space_space:{lo}:{hi}:opening:{edge_gid}:geom"
+                    if edge_gid
+                    else f"space_space:{lo}:{hi}:strip:geom"
+                )
+                if eid in edge_ids:
+                    continue
+                edges.append(
+                    GraphEdge(
+                        id=eid,
+                        kind="space_space",
+                        source=lo,
+                        target=hi,
+                        global_id=edge_gid,
+                        method="geom_opening_space",
+                        bidirectional=True,
+                        inferred=True,
+                        portal=strip_portal,
+                    )
+                )
+                edge_ids.add(eid)
+                linked_space_pairs.add((lo, hi))
+
+
+def _opening_eligible_for_heal(opening: OpeningPortal) -> bool:
+    if opening.incomplete or opening.point is None:
+        return False
+    if opening.filled_by_door_global_id:
+        return False
+    if opening.filled_by_window_global_id:
+        return False
+    return True

@@ -80,7 +80,9 @@ export function GraphViewer({ className }: { className?: string }) {
     const nodes = layout.nodes
       .map((n) => `${n.id}:${n.x.toFixed(1)}:${n.y.toFixed(1)}:${n.excluded ? 1 : 0}`)
       .join("|");
-    const edges = layout.edges.map((e) => `${e.id}:${e.inferred ? 1 : 0}`).join("|");
+    const edges = layout.edges
+      .map((e) => `${e.id}:${e.inferred ? 1 : 0}:${e.heal ?? ""}`)
+      .join("|");
     const excludedKey = [...excludedNodeIds].sort().join(",");
     return `${nodes}#${edges}#${variant}#${excludedKey}`;
   }, [layout, variant, excludedNodeIds]);
@@ -380,7 +382,13 @@ export function GraphViewer({ className }: { className?: string }) {
                 <span className="inline-block h-0.5 w-3 bg-slate-500" /> IFC
               </span>
               <span className="inline-flex items-center gap-1">
-                <span className="inline-block h-0.5 w-3 bg-[#22c55e]" /> Inferred
+                <span className="inline-block h-0.5 w-3 bg-[#eab308]" /> Door heal
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block h-0.5 w-3 bg-[#22c55e]" /> Space↔space
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block h-0.5 w-3 bg-[#7c3aed]" /> Stair heal
               </span>
             </div>
           )}

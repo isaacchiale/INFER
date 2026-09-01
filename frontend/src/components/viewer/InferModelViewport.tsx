@@ -56,7 +56,13 @@ function InferModelViewportImpl({
   const [engineError, setEngineError] = useState<string | null>(null);
   const [navMode, setNavMode] = useState<NavMode>("orbit");
 
-  const { pendingIfc, setViewerStatus } = useInfer();
+  const {
+    pendingIfc,
+    setViewerStatus,
+    setViewerCameraPose,
+    setViewerModelBounds,
+    setViewerCoordInverse,
+  } = useInfer();
 
   const switchNavMode = (mode: NavMode) => {
     setNavMode(mode);
@@ -73,9 +79,21 @@ function InferModelViewportImpl({
 
     void (async () => {
       try {
-        const runtime = await createThatOpenRuntime(host, (message, kind) => {
-          if (!disposed) setViewerStatus(message, kind ?? "info");
-        });
+        const runtime = await createThatOpenRuntime(
+          host,
+          (message, kind) => {
+            if (!disposed) setViewerStatus(message, kind ?? "info");
+          },
+          (pose) => {
+            if (!disposed) setViewerCameraPose(pose);
+          },
+          (bounds) => {
+            if (!disposed) setViewerModelBounds(bounds);
+          },
+          (inv) => {
+            if (!disposed) setViewerCoordInverse(inv);
+          },
+        );
         if (disposed) {
           runtime.dispose();
           return;
@@ -84,6 +102,9 @@ function InferModelViewportImpl({
         setEngineReady(true);
         setEngineError(null);
         setNavMode(runtime.getNavMode());
+        setViewerCameraPose(runtime.getCameraPose());
+        setViewerModelBounds(runtime.getModelBounds());
+        setViewerCoordInverse(runtime.getCoordinationInverse());
       } catch (error) {
         console.error(error);
         if (!disposed) {
@@ -100,8 +121,18 @@ function InferModelViewportImpl({
       runtimeRef.current?.dispose();
       runtimeRef.current = null;
       setEngineReady(false);
+      setViewerCameraPose(null);
+      setViewerModelBounds(null);
+      setViewerCoordInverse(null);
     };
-  }, [modelId, onViewerReady, setViewerStatus]);
+  }, [
+    modelId,
+    onViewerReady,
+    setViewerStatus,
+    setViewerCameraPose,
+    setViewerModelBounds,
+    setViewerCoordInverse,
+  ]);
 
   // Load / reload IFC retained in the store. Closing the 3D pane disposes the
   // WebGL runtime; reopening must rehydrate from this buffer (do not clear it).

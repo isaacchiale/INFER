@@ -15,6 +15,26 @@ export const LAYOUT_GUTTER_X = 168;
 export const LAYOUT_TOP_PAD = 48;
 export const LAYOUT_BOTTOM_PAD = 36;
 
+/** Map edge method/kind → viewer heal colour channel. */
+export function healKindForEdge(
+  method: GraphEdge["method"],
+  kind: GraphEdge["kind"],
+  inferred: boolean,
+): "door" | "space" | "stair" | undefined {
+  if (!inferred) return undefined;
+  if (method === "geom_door_space" || kind === "space_door") return "door";
+  if (method === "geom_stair_space" || kind === "vertical") return "stair";
+  if (
+    method === "geom_opening_space" ||
+    method === "topologicpy_adjacency" ||
+    kind === "space_space"
+  ) {
+    return "space";
+  }
+  // Fallback: other inferred methods (legacy) → space channel.
+  return "space";
+}
+
 export function deriveStoreyBands(
   graph: ConnectivityGraph,
   entities?: EntitiesExtract | null,
@@ -126,7 +146,7 @@ export function toDisplayGraph(graph: ConnectivityGraph): DisplayGraph {
         const a = spaces[i];
         const b = spaces[j];
         if (!a || !b) continue;
-        // Green if either door↔space side was geometry-healed (partial IFC top-up too).
+        // Yellow if either door↔space side was geometry-healed (partial IFC top-up too).
         const inferred = Boolean(flags?.get(a) || flags?.get(b));
         pushEdge({
           id: `viz-door:${doorId}:${a}:${b}`,
@@ -165,6 +185,8 @@ export type LayoutEdge = {
   target: string;
   vertical: boolean;
   inferred?: boolean;
+  /** Heal colour channel: door=yellow, space=green, stair=purple. */
+  heal?: "door" | "space" | "stair";
 };
 
 export type GraphLayout = {
@@ -758,12 +780,15 @@ export function buildGraphLayout(
     const rev = `${edge.target}|${edge.source}`;
     if (seen.has(key) || seen.has(rev)) continue;
     seen.add(key);
+    const inferred =
+      Boolean(edge.inferred) || edge.method !== "ifc_rel_space_boundary";
     edges.push({
       id: edge.id,
       source: edge.source,
       target: edge.target,
       vertical: edge.kind === "vertical",
-      inferred: Boolean(edge.inferred) || edge.method !== "ifc_rel_space_boundary",
+      inferred,
+      heal: healKindForEdge(edge.method, edge.kind, inferred),
     });
   }
 
@@ -811,9 +836,9 @@ export function graphPalette(theme: "light" | "dark"): GraphThemePalette {
       edgeOpacity: 0.9,
       vertical: "#F59E0B",
       verticalOpacity: 0.55,
-      path: "#FFB703",
-      pathNode: "#00E5FF",
-      pathUnderlay: "#00E5FF",
+      path: "#3B82F6",
+      pathNode: "#60A5FA",
+      pathUnderlay: "#60A5FA",
     };
   }
   return {

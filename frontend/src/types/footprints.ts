@@ -28,7 +28,28 @@ export type DoorPortal = {
   method: "ifc_mesh_xy_centroid" | "ifc_object_placement" | "unavailable";
 };
 
+export type OpeningPortal = {
+  global_id: string;
+  name: string;
+  storey_global_id: string | null;
+  point: Point2D | null;
+  segment: Point2D[];
+  incomplete: boolean;
+  method: "ifc_mesh_xy_centroid" | "ifc_object_placement" | "unavailable";
+  filled_by_door_global_id?: string | null;
+  filled_by_window_global_id?: string | null;
+};
+
 export type StairFootprint = {
+  global_id: string;
+  name: string;
+  storey_global_id: string | null;
+  polygon: Point2D[];
+  incomplete: boolean;
+  method: "ifc_mesh_xy_hull" | "ifc_placement_bbox" | "unavailable";
+};
+
+export type WallFootprint = {
   global_id: string;
   name: string;
   storey_global_id: string | null;
@@ -45,6 +66,10 @@ export type FootprintsDocument = {
   storeys: Array<{ global_id: string; name: string; elevation: number | null }>;
   spaces: SpaceFootprint[];
   doors: DoorPortal[];
+  /** Optional for older footprints.json built before opening heal. */
+  openings?: OpeningPortal[];
   /** Optional for older footprints.json built before stair overlay. */
   stairs?: StairFootprint[];
+  /** Optional for older footprints.json built before wall-strip heal. */
+  walls?: WallFootprint[];
 };

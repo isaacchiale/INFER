@@ -1,7 +1,16 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronDown, Maximize2 } from "lucide-react";
 import { useInfer } from "@/state/infer-store";
 import { continuousPolylineForStorey } from "@/lib/geometric-path";
+import { normalizeElevationsToMetres } from "@/lib/storey-elevations";
+import {
+  ifcElevationFromThree,
+  planTranslationFromCentres,
+  pointInBuildingBounds,
+  storeyIdForElevation,
+  threeAabbCentre,
+  threeToIfcPlanResolved,
+} from "@/lib/viewer-camera-pose";
 import { cn } from "@/lib/utils";
 import type { FootprintsDocument, SpaceFootprint } from "@/types/footprints";
 import {
@@ -16,6 +25,18 @@ const PLAN_CANVAS = "bg-[#F8FAFC] dark:bg-[#0F1117]";
 
 const GLASS =
   "rounded-[6px] border border-border bg-background/90 shadow-sm backdrop-blur-[2px]";
+
+type PlanLayer = "spaces" | "walls" | "doors" | "stairs" | "route" | "start" | "end";
+
+const DEFAULT_PLAN_LAYERS: Record<PlanLayer, boolean> = {
+  spaces: true,
+  walls: true,
+  doors: true,
+  stairs: true,
+  route: true,
+  start: true,
+  end: true,
+};
 
 type PlanView = {
   minX: number;
@@ -59,7 +80,10 @@ function boundsFromPoints(points: Point2[], padRatio = 0.08): PlanView | null {
     maxY = Math.max(maxY, p.y);
   }
   if (!Number.isFinite(minX)) return null;
-  const pad = Math.max((maxX - minX) * padRatio, (maxY - minY) * padRatio, 0.5);
+  const pad =
+    padRatio <= 0
+      ? 0
+      : Math.max((maxX - minX) * padRatio, (maxY - minY) * padRatio, 0.5);
   return {
     minX: minX - pad,
     minY: minY - pad,
@@ -161,8 +185,12 @@ export function FloorplanViewer({ className }: { className?: string }) {
     entitiesExtract,
     activeStoreyId,
     setActiveStoreyId,
+    connectivityGraph,
     connectivityRoute,
     excludedNodeIds,
+    viewerCameraPose,
+    viewerModelBounds,
+    viewerCoordInverse,
   } = useInfer();
 
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -170,12 +198,19 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const cameraGroupRef = useRef<SVGGElement | null>(null);
   const cameraRef = useRef<Camera>({ ...IDENTITY_CAMERA });
   const boundsRef = useRef<PlanView | null>(null);
+  /** Residual Three↔footprint translation (locked per model; not an axis flip). */
+  const planDeltaRef = useRef<{ x: number; y: number } | null>(null);
   const dragRef = useRef<{
     pointerId: number;
     lastX: number;
     lastY: number;
   } | null>(null);
   const draggingRef = useRef(false);
+  const [layers, setLayers] = useState<Record<PlanLayer, boolean>>(DEFAULT_PLAN_LAYERS);
+
+  const toggleLayer = useCallback((key: PlanLayer) => {
+    setLayers((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
 
   const footprintsId = footprintsDocument?.model_id ?? null;
 
@@ -214,6 +249,10 @@ export function FloorplanViewer({ className }: { className?: string }) {
       if (st.incomplete) continue;
       for (const p of st.polygon) pts.push(p);
     }
+    for (const w of footprintsDocument.walls ?? []) {
+      if (w.incomplete) continue;
+      for (const p of w.polygon) pts.push(p);
+    }
     return pts;
   }, [footprintsDocument]);
 
@@ -221,8 +260,112 @@ export function FloorplanViewer({ className }: { className?: string }) {
     () => boundsFromPoints(buildingPoints),
     [buildingPoints],
   );
+  /** Unpadded footprint AABB — used to lock Three→plan axis frame per model. */
+  const footprintBoundsTight = useMemo(
+    () => boundsFromPoints(buildingPoints, 0),
+    [buildingPoints],
+  );
   boundsRef.current = buildingBounds;
 
+  /** Storey elevations in metres (footprints may be mm). */
+  const storeysMetres = useMemo(() => {
+    const raw = footprintsDocument?.storeys ?? [];
+    const withElev = raw.filter(
+      (s): s is { global_id: string; name: string; elevation: number } =>
+        s.elevation != null && Number.isFinite(s.elevation),
+    );
+    if (!withElev.length) return [] as Array<{ global_id: string; elevation: number }>;
+    const { metres } = normalizeElevationsToMetres(withElev.map((s) => s.elevation));
+    return withElev.map((s, i) => ({
+      global_id: s.global_id,
+      elevation: metres[i]!,
+    }));
+  }, [footprintsDocument]);
+
+  /**
+   * 3D camera as plan blue dot: only when inside the building footprint AABB
+   * and on the storey currently shown (or any storey when viewing "all").
+   *
+   * Prefer Fragments coordination-matrix inverse (exact origin undo). Fall back
+   * to centre translation when that matrix is missing/identity.
+   */
+  const cameraDotInfo = useMemo(() => {
+    if (!viewerCameraPose) {
+      return { dot: null as { x: number; y: number } | null, reason: "no 3D pose yet" };
+    }
+    if (!buildingBounds) {
+      return { dot: null, reason: "no footprints" };
+    }
+    const three = viewerCameraPose.three ?? {
+      x: viewerCameraPose.x,
+      y: viewerCameraPose.elevation,
+      z: -viewerCameraPose.y,
+    };
+
+    const hasCoord = Boolean(viewerCoordInverse && viewerCoordInverse.length >= 16);
+
+    if (
+      !hasCoord &&
+      planDeltaRef.current == null &&
+      viewerModelBounds &&
+      footprintBoundsTight
+    ) {
+      const delta = planTranslationFromCentres(
+        threeAabbCentre(viewerModelBounds),
+        footprintBoundsTight,
+      );
+      planDeltaRef.current =
+        Math.abs(delta.x) < 0.05 && Math.abs(delta.y) < 0.05 ? { x: 0, y: 0 } : delta;
+    }
+
+    if (!hasCoord && planDeltaRef.current == null && footprintBoundsTight) {
+      return { dot: null, reason: "calibrating plan ↔ 3D origin…" };
+    }
+
+    const mapped = threeToIfcPlanResolved(
+      three,
+      hasCoord ? viewerCoordInverse : null,
+      hasCoord ? null : planDeltaRef.current,
+    );
+    // When coordination matrix restores absolute IFC Z, prefer that elevation;
+    // otherwise lift Three Y onto storey elevations.
+    const elev = hasCoord
+      ? mapped.elevation
+      : ifcElevationFromThree(
+          mapped.elevation,
+          viewerModelBounds,
+          storeysMetres.map((s) => s.elevation),
+        );
+    const plan = { x: mapped.x, y: mapped.y, elevation: elev };
+    if (!pointInBuildingBounds(plan.x, plan.y, buildingBounds, 2)) {
+      return {
+        dot: null,
+        reason: "outside building — fly inside to see the camera dot",
+      };
+    }
+    if (activeStoreyId !== "all" && storeysMetres.length) {
+      const poseStorey = storeyIdForElevation(storeysMetres, plan.elevation);
+      if (!poseStorey || poseStorey !== activeStoreyId) {
+        const name =
+          storeys.find((s) => s.global_id === poseStorey)?.name ?? poseStorey ?? "?";
+        return {
+          dot: null,
+          reason: `camera on ${name} — switch floorplan level to match`,
+        };
+      }
+    }
+    return { dot: { x: plan.x, y: plan.y }, reason: "tracking" };
+  }, [
+    viewerCameraPose,
+    viewerModelBounds,
+    viewerCoordInverse,
+    buildingBounds,
+    footprintBoundsTight,
+    storeysMetres,
+    activeStoreyId,
+    storeys,
+  ]);
+  const cameraDot = cameraDotInfo.dot;
   const applyCameraDom = useCallback(() => {
     const g = cameraGroupRef.current;
     const bounds = boundsRef.current;
@@ -237,6 +380,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
 
   // New model → reset camera; keep camera across storey switches.
   useEffect(() => {
+    planDeltaRef.current = null;
     resetCamera();
   }, [footprintsId, resetCamera]);
 
@@ -279,14 +423,31 @@ export function FloorplanViewer({ className }: { className?: string }) {
     });
   }, [footprintsDocument, activeStoreyId, excludedNodeIds]);
 
+  /** Walls: match storey when known; unassigned walls show on every storey. */
+  const walls = useMemo(() => {
+    const list = footprintsDocument?.walls ?? [];
+    return list.filter((w) => {
+      if (w.incomplete || w.polygon.length < 3) return false;
+      if (activeStoreyId === "all") return true;
+      if (w.storey_global_id == null) return true;
+      return w.storey_global_id === activeStoreyId;
+    });
+  }, [footprintsDocument, activeStoreyId]);
+
   const overlay = useMemo(() => {
     if (!footprintsDocument || !connectivityRoute?.found) return null;
     return continuousPolylineForStorey(
       connectivityRoute.node_ids,
       footprintsDocument,
       activeStoreyId,
+      connectivityGraph,
     );
-  }, [footprintsDocument, connectivityRoute, activeStoreyId]);
+  }, [
+    footprintsDocument,
+    connectivityRoute,
+    activeStoreyId,
+    connectivityGraph,
+  ]);
 
   /** Origin / destination IfcSpace polygons (not path centroids). */
   const routeEndpointSpaces = useMemo(() => {
@@ -324,6 +485,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const routeHalo = markerBase * 0.008;
   const doorR = markerBase * 0.008;
   const doorStroke = markerBase * 0.0015;
+  const cameraR = markerBase * 0.018;
 
   const incompleteCount =
     footprintsDocument?.spaces.filter((s) => s.incomplete).length ?? 0;
@@ -514,51 +676,70 @@ export function FloorplanViewer({ className }: { className?: string }) {
             >
               <g transform="scale(1,-1)">
                 <g ref={cameraGroupRef}>
-                  {spaces.map((s) => {
-                    return (
-                      <path
-                        key={s.global_id}
-                        d={spacePathD(s.polygon, s.holes)}
-                        fill="rgba(148,163,184,0.35)"
-                        fillRule="evenodd"
-                        stroke="#64748b"
-                        strokeWidth={roomStroke}
-                      >
-                        <title>{s.name || s.global_id}</title>
-                      </path>
-                    );
-                  })}
-                  {stairs.map((s) => {
-                    return (
-                      <path
-                        key={`stair:${s.global_id}`}
-                        d={polygonPathD(s.polygon)}
-                        fill="none"
-                        stroke="#7c3aed"
-                        strokeWidth={roomStroke * 1.4}
-                        strokeDasharray={`${markerBase * 0.006} ${markerBase * 0.004}`}
-                      >
-                        <title>{s.name ? `Stair: ${s.name}` : "Stair"}</title>
-                      </path>
-                    );
-                  })}
-                  {doors.map((d) =>
-                    d.point ? (
-                      <circle
-                        key={d.global_id}
-                        cx={d.point.x}
-                        cy={d.point.y}
-                        r={doorR}
-                        fill="#f59e0b"
-                        stroke="#92400e"
-                        strokeWidth={doorStroke}
-                      >
-                        <title>{d.name || d.global_id}</title>
-                      </circle>
-                    ) : null,
-                  )}
+                  {layers.walls
+                    ? walls.map((w) => (
+                        <path
+                          key={`wall:${w.global_id}`}
+                          d={polygonPathD(w.polygon)}
+                          fill="rgba(236,72,153,0.45)"
+                          stroke="#db2777"
+                          strokeWidth={roomStroke}
+                        >
+                          <title>{w.name ? `Wall: ${w.name}` : "Wall"}</title>
+                        </path>
+                      ))
+                    : null}
+                  {layers.spaces
+                    ? spaces.map((s) => {
+                        return (
+                          <path
+                            key={s.global_id}
+                            d={spacePathD(s.polygon, s.holes)}
+                            fill="rgba(148,163,184,0.35)"
+                            fillRule="evenodd"
+                            stroke="#64748b"
+                            strokeWidth={roomStroke}
+                          >
+                            <title>{s.name || s.global_id}</title>
+                          </path>
+                        );
+                      })
+                    : null}
+                  {layers.stairs
+                    ? stairs.map((s) => {
+                        return (
+                          <path
+                            key={`stair:${s.global_id}`}
+                            d={polygonPathD(s.polygon)}
+                            fill="none"
+                            stroke="#7c3aed"
+                            strokeWidth={roomStroke * 1.4}
+                            strokeDasharray={`${markerBase * 0.006} ${markerBase * 0.004}`}
+                          >
+                            <title>{s.name ? `Stair: ${s.name}` : "Stair"}</title>
+                          </path>
+                        );
+                      })
+                    : null}
+                  {layers.doors
+                    ? doors.map((d) =>
+                        d.point ? (
+                          <circle
+                            key={d.global_id}
+                            cx={d.point.x}
+                            cy={d.point.y}
+                            r={doorR}
+                            fill="#f59e0b"
+                            stroke="#92400e"
+                            strokeWidth={doorStroke}
+                          >
+                            <title>{d.name || d.global_id}</title>
+                          </circle>
+                        ) : null,
+                      )
+                    : null}
 
-                  {pathD ? (
+                  {layers.route && pathD ? (
                     <path
                       d={pathD}
                       fill="none"
@@ -569,7 +750,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                       opacity={0.85}
                     />
                   ) : null}
-                  {pathD ? (
+                  {layers.route && pathD ? (
                     <path
                       d={pathD}
                       fill="none"
@@ -580,7 +761,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     />
                   ) : null}
 
-                  {routeEndpointSpaces.start ? (
+                  {layers.start && routeEndpointSpaces.start ? (
                     <path
                       d={spacePathD(
                         routeEndpointSpaces.start.polygon,
@@ -598,7 +779,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                       </title>
                     </path>
                   ) : null}
-                  {routeEndpointSpaces.end ? (
+                  {layers.end && routeEndpointSpaces.end ? (
                     <path
                       d={spacePathD(
                         routeEndpointSpaces.end.polygon,
@@ -615,6 +796,28 @@ export function FloorplanViewer({ className }: { className?: string }) {
                           routeEndpointSpaces.end.global_id}
                       </title>
                     </path>
+                  ) : null}
+
+                  {cameraDot ? (
+                    <g>
+                      <circle
+                        cx={cameraDot.x}
+                        cy={cameraDot.y}
+                        r={cameraR * 1.65}
+                        fill="rgba(37,99,235,0.25)"
+                        stroke="none"
+                      />
+                      <circle
+                        cx={cameraDot.x}
+                        cy={cameraDot.y}
+                        r={cameraR}
+                        fill="#2563eb"
+                        stroke="#eff6ff"
+                        strokeWidth={doorStroke * 1.5}
+                      >
+                        <title>3D camera</title>
+                      </circle>
+                    </g>
                   ) : null}
                 </g>
               </g>
@@ -635,35 +838,107 @@ export function FloorplanViewer({ className }: { className?: string }) {
               </div>
             )}
 
-            <div className="pointer-events-none absolute bottom-2 left-2 right-2 flex flex-wrap items-center gap-3 rounded-md border border-border/80 bg-background/90 px-2 py-1.5 text-[11px] text-muted-foreground backdrop-blur-sm">
-              <span className="inline-flex items-center gap-1">
-                <span
-                  className="inline-block size-2.5 border-2 border-[#16a34a]"
-                  style={{ background: "rgba(22,163,74,0.25)" }}
-                />{" "}
-                Start
+            <div className="pointer-events-none absolute bottom-2 left-2 right-2 z-20 flex flex-wrap items-center gap-1.5 rounded-md border border-border/80 bg-background/90 px-2 py-1.5 text-[11px] text-muted-foreground backdrop-blur-sm">
+              {(
+                [
+                  {
+                    key: "start" as const,
+                    label: "Start",
+                    swatch: (
+                      <span
+                        className="inline-block size-2.5 border-2 border-[#16a34a]"
+                        style={{ background: "rgba(22,163,74,0.25)" }}
+                      />
+                    ),
+                  },
+                  {
+                    key: "route" as const,
+                    label: "Route",
+                    swatch: <span className="inline-block h-0.5 w-4 bg-[#1d4ed8]" />,
+                  },
+                  {
+                    key: "end" as const,
+                    label: "End",
+                    swatch: (
+                      <span
+                        className="inline-block size-2.5 border-2 border-[#dc2626]"
+                        style={{ background: "rgba(220,38,38,0.25)" }}
+                      />
+                    ),
+                  },
+                  {
+                    key: "spaces" as const,
+                    label: "Space",
+                    swatch: (
+                      <span
+                        className="inline-block size-2.5 border border-[#64748b]"
+                        style={{ background: "rgba(148,163,184,0.35)" }}
+                      />
+                    ),
+                  },
+                  {
+                    key: "walls" as const,
+                    label: "Wall",
+                    swatch: (
+                      <span
+                        className="inline-block size-2.5 border border-[#db2777]"
+                        style={{ background: "rgba(236,72,153,0.45)" }}
+                      />
+                    ),
+                  },
+                  {
+                    key: "doors" as const,
+                    label: "Door",
+                    swatch: <span className="inline-block size-2 rounded-full bg-[#f59e0b]" />,
+                  },
+                  {
+                    key: "stairs" as const,
+                    label: "Stair",
+                    swatch: (
+                      <span
+                        className="inline-block h-0.5 w-4 border-t-2 border-dashed"
+                        style={{ borderColor: "#7c3aed" }}
+                      />
+                    ),
+                  },
+                ] as const
+              ).map((item) => {
+                const on = layers[item.key];
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    className={cn(
+                      "pointer-events-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors",
+                      on
+                        ? "text-foreground hover:bg-muted"
+                        : "text-muted-foreground/50 line-through hover:bg-muted/60",
+                    )}
+                    aria-pressed={on}
+                    title={on ? `Hide ${item.label}` : `Show ${item.label}`}
+                    onClick={() => toggleLayer(item.key)}
+                  >
+                    {item.swatch}
+                    {item.label}
+                  </button>
+                );
+              })}
+              <span
+                className={cn(
+                  "inline-flex items-center gap-1 rounded px-1.5 py-0.5",
+                  cameraDot ? "text-foreground" : "text-muted-foreground/50",
+                )}
+                title={cameraDotInfo.reason}
+              >
+                <span className="inline-block size-2 rounded-full bg-[#2563eb]" />
+                Camera
+                {!cameraDot ? (
+                  <span className="max-w-[14rem] truncate text-[10px] font-normal opacity-80">
+                    ({cameraDotInfo.reason})
+                  </span>
+                ) : null}
               </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="inline-block h-0.5 w-4 bg-[#1d4ed8]" /> Route
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span
-                  className="inline-block size-2.5 border-2 border-[#dc2626]"
-                  style={{ background: "rgba(220,38,38,0.25)" }}
-                />{" "}
-                End
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="inline-block size-2 rounded-full bg-[#f59e0b]" /> Door
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span
-                  className="inline-block h-0.5 w-4 border-t-2 border-dashed"
-                  style={{ borderColor: "#7c3aed" }}
-                />{" "}
-                Stair
-              </span>
-              <span className="min-w-0 flex-1 truncate">
+              <span className="min-w-0 flex-1 truncate px-1">
                 {connectivityRoute?.found
                   ? pathPoints.length >= 2
                     ? overlay?.note

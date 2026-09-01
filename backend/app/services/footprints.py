@@ -26,10 +26,12 @@ import ifcopenshell.util.placement
 from app.schemas.footprints import (
     DoorPortal,
     FootprintsDocument,
+    OpeningPortal,
     Point2D,
     SpaceFootprint,
     StairFootprint,
     StoreyFootprintMeta,
+    WallFootprint,
 )
 from app.services.graph import _gid, _name, _storey_gid
 from app.services.ifc_units import length_to_metres
@@ -485,6 +487,89 @@ def _door_portal(ifc, door) -> DoorPortal:
     )
 
 
+def _opening_host_storey_gid(ifc, opening) -> str | None:
+    """Storey of the wall/element this opening voids, if any."""
+    for rel in ifc.by_type("IfcRelVoidsElement"):
+        related = getattr(rel, "RelatedOpeningElement", None)
+        if related != opening:
+            continue
+        host = getattr(rel, "RelatingBuildingElement", None)
+        if host is None:
+            continue
+        storey = _storey_gid(ifc, host)
+        if storey:
+            return storey
+    return None
+
+
+def _opening_fill_gids(ifc, opening) -> tuple[str | None, str | None]:
+    """Return (door_gid, window_gid) filling this opening, if any."""
+    door_gid: str | None = None
+    window_gid: str | None = None
+    for rel in ifc.by_type("IfcRelFillsElement"):
+        relating = getattr(rel, "RelatingOpeningElement", None)
+        if relating != opening:
+            continue
+        filling = getattr(rel, "RelatedBuildingElement", None)
+        if filling is None:
+            continue
+        gid = _gid(filling)
+        if not gid:
+            continue
+        if filling.is_a("IfcDoor"):
+            door_gid = gid
+        elif filling.is_a("IfcWindow"):
+            window_gid = gid
+    return door_gid, window_gid
+
+
+def _opening_portal(ifc, opening) -> OpeningPortal:
+    gid = _gid(opening)
+    # Openings are rarely contained in a storey; prefer the voided wall's storey.
+    storey = _storey_gid(ifc, opening) or _opening_host_storey_gid(ifc, opening)
+    name = _name(opening)
+    door_gid, window_gid = _opening_fill_gids(ifc, opening)
+
+    xy = _mesh_xy_points(opening)
+    if xy:
+        cx = sum(p[0] for p in xy) / len(xy)
+        cy = sum(p[1] for p in xy) / len(xy)
+        return OpeningPortal(
+            global_id=gid,
+            name=name,
+            storey_global_id=storey,
+            point=Point2D(x=cx, y=cy),
+            incomplete=False,
+            method="ifc_mesh_xy_centroid",
+            filled_by_door_global_id=door_gid,
+            filled_by_window_global_id=window_gid,
+        )
+
+    origin = _placement_xy(opening)
+    if origin is not None:
+        return OpeningPortal(
+            global_id=gid,
+            name=name,
+            storey_global_id=storey,
+            point=Point2D(x=origin[0], y=origin[1]),
+            incomplete=False,
+            method="ifc_object_placement",
+            filled_by_door_global_id=door_gid,
+            filled_by_window_global_id=window_gid,
+        )
+
+    return OpeningPortal(
+        global_id=gid,
+        name=name,
+        storey_global_id=storey,
+        point=None,
+        incomplete=True,
+        method="unavailable",
+        filled_by_door_global_id=door_gid,
+        filled_by_window_global_id=window_gid,
+    )
+
+
 def _aggregated_parts(ifc, parent) -> list:
     """Child products aggregated under parent (e.g. IfcStairFlight under IfcStair)."""
     parts: list = []
@@ -544,10 +629,50 @@ def _stair_footprint(ifc, stair) -> StairFootprint:
     )
 
 
+def _wall_footprint(ifc, wall) -> WallFootprint:
+    """Walls use convex hull / placement bbox for strip blockage tests."""
+    gid = _gid(wall)
+    storey = _storey_gid(ifc, wall)
+    name = _name(wall)
+
+    xy = _unique_xy(_mesh_xy_points(wall))
+    if len(xy) >= 3:
+        hull = _convex_hull(xy)
+        if len(hull) >= 3:
+            return WallFootprint(
+                global_id=gid,
+                name=name,
+                storey_global_id=storey,
+                polygon=_to_points(hull),
+                incomplete=False,
+                method="ifc_mesh_xy_hull",
+            )
+
+    bbox = _bbox_polygon_from_placement(wall)
+    if bbox is not None:
+        return WallFootprint(
+            global_id=gid,
+            name=name,
+            storey_global_id=storey,
+            polygon=_to_points(bbox),
+            incomplete=False,
+            method="ifc_placement_bbox",
+        )
+
+    return WallFootprint(
+        global_id=gid,
+        name=name,
+        storey_global_id=storey,
+        polygon=[],
+        incomplete=True,
+        method="unavailable",
+    )
+
+
 def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
     """
-    Derive footprints for every IfcSpace / IfcDoor / IfcStair that enters the
-    connectivity graph (spaces + doors for path; stairs for plan overlay).
+    Derive footprints for spaces, doors, openings, stairs, and walls used by
+    connectivity / plan overlay / strip heal.
     """
     ifc = ifcopenshell.open(ifc_file_path)
 
@@ -575,16 +700,33 @@ def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
             continue
         doors.append(_door_portal(ifc, door))
 
+    openings: list[OpeningPortal] = []
+    for opening in ifc.by_type("IfcOpeningElement"):
+        if not _gid(opening):
+            continue
+        openings.append(_opening_portal(ifc, opening))
+
     stairs: list[StairFootprint] = []
     for stair in ifc.by_type("IfcStair"):
         if not _gid(stair):
             continue
         stairs.append(_stair_footprint(ifc, stair))
 
+    walls: list[WallFootprint] = []
+    seen_wall: set[str] = set()
+    for wall in list(ifc.by_type("IfcWall")) + list(ifc.by_type("IfcWallStandardCase")):
+        gid = _gid(wall)
+        if not gid or gid in seen_wall:
+            continue
+        seen_wall.add(gid)
+        walls.append(_wall_footprint(ifc, wall))
+
     return FootprintsDocument(
         model_id=model_id,
         storeys=storeys,
         spaces=spaces,
         doors=doors,
+        openings=openings,
         stairs=stairs,
+        walls=walls,
     )

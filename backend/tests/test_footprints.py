@@ -52,6 +52,8 @@ def test_footprints_incomplete_on_sparse_fixture(client):
     assert all(len(s["polygon"]) == 0 for s in doc["spaces"])
     assert len(doc["doors"]) >= 1
     assert all(d["incomplete"] for d in doc["doors"])
+    assert "openings" in doc
+    assert isinstance(doc["openings"], list)
 
     fetched = client.get(f"/models/{model_id}/footprints")
     assert fetched.status_code == 200
@@ -59,6 +61,64 @@ def test_footprints_incomplete_on_sparse_fixture(client):
 
     stored = (get_settings().data_path / "models" / model_id / "model.ifc").read_bytes()
     assert hashlib.sha256(stored).hexdigest() == hashlib.sha256(payload).hexdigest()
+
+
+def test_footprints_opening_unfilled_and_door_filled(tmp_path):
+    """Opening extract: bare opening + door-filled opening via IfcRelFillsElement."""
+    ifc_path = tmp_path / "openings.ifc"
+    f = ifcopenshell.file(schema="IFC4")
+    project = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="T")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    site = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcSite", name="S")
+    building = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcBuilding", name="B")
+    storey = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingStorey", name="L1"
+    )
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=project, products=[site])
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=site, products=[building])
+    ifcopenshell.api.run(
+        "aggregate.assign_object", f, relating_object=building, products=[storey]
+    )
+
+    bare = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcOpeningElement", name="Void"
+    )
+    filled_op = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcOpeningElement", name="DoorVoid"
+    )
+    door = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcDoor", name="D1")
+    ifcopenshell.api.run(
+        "spatial.assign_container", f, relating_structure=storey, products=[bare, filled_op, door]
+    )
+    ifcopenshell.api.run(
+        "geometry.edit_object_placement",
+        f,
+        product=bare,
+        matrix=[[1, 0, 0, 1], [0, 1, 0, 2], [0, 0, 1, 0], [0, 0, 0, 1]],
+        is_si=True,
+    )
+    ifcopenshell.api.run(
+        "geometry.edit_object_placement",
+        f,
+        product=filled_op,
+        matrix=[[1, 0, 0, 3], [0, 1, 0, 2], [0, 0, 1, 0], [0, 0, 0, 1]],
+        is_si=True,
+    )
+    f.create_entity(
+        "IfcRelFillsElement",
+        GlobalId=ifcopenshell.guid.new(),
+        RelatingOpeningElement=filled_op,
+        RelatedBuildingElement=door,
+    )
+
+    f.write(str(ifc_path))
+    doc = footprints_service.build_footprints("test-openings", str(ifc_path))
+    assert len(doc.openings) == 2
+    by_name = {o.name: o for o in doc.openings}
+    assert by_name["Void"].incomplete is False
+    assert by_name["Void"].point is not None
+    assert by_name["Void"].filled_by_door_global_id is None
+    assert by_name["DoorVoid"].filled_by_door_global_id == door.GlobalId
 
 
 def test_footprints_placement_bbox_happy_path(tmp_path):
