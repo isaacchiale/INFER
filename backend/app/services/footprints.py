@@ -487,18 +487,15 @@ def _door_portal(ifc, door) -> DoorPortal:
     )
 
 
-def _opening_host_storey_gid(ifc, opening) -> str | None:
-    """Storey of the wall/element this opening voids, if any."""
+def _opening_host(ifc, opening):
+    """Building element this opening voids via IfcRelVoidsElement, if any."""
     for rel in ifc.by_type("IfcRelVoidsElement"):
         related = getattr(rel, "RelatedOpeningElement", None)
         if related != opening:
             continue
         host = getattr(rel, "RelatingBuildingElement", None)
-        if host is None:
-            continue
-        storey = _storey_gid(ifc, host)
-        if storey:
-            return storey
+        if host is not None:
+            return host
     return None
 
 
@@ -524,49 +521,45 @@ def _opening_fill_gids(ifc, opening) -> tuple[str | None, str | None]:
 
 
 def _opening_portal(ifc, opening) -> OpeningPortal:
-    gid = _gid(opening)
-    # Openings are rarely contained in a storey; prefer the voided wall's storey.
-    storey = _storey_gid(ifc, opening) or _opening_host_storey_gid(ifc, opening)
-    name = _name(opening)
+    host = _opening_host(ifc, opening)
     door_gid, window_gid = _opening_fill_gids(ifc, opening)
+    common = {
+        "global_id": _gid(opening),
+        "name": _name(opening),
+        # Openings are rarely contained in a storey; prefer the voided wall's.
+        "storey_global_id": _storey_gid(ifc, opening)
+        or (_storey_gid(ifc, host) if host is not None else None),
+        "filled_by_door_global_id": door_gid,
+        "filled_by_window_global_id": window_gid,
+        "host_global_id": _gid(host) if host is not None else None,
+        "host_is_wall": host is not None and host.is_a("IfcWall"),
+    }
 
     xy = _mesh_xy_points(opening)
     if xy:
         cx = sum(p[0] for p in xy) / len(xy)
         cy = sum(p[1] for p in xy) / len(xy)
         return OpeningPortal(
-            global_id=gid,
-            name=name,
-            storey_global_id=storey,
+            **common,
             point=Point2D(x=cx, y=cy),
             incomplete=False,
             method="ifc_mesh_xy_centroid",
-            filled_by_door_global_id=door_gid,
-            filled_by_window_global_id=window_gid,
         )
 
     origin = _placement_xy(opening)
     if origin is not None:
         return OpeningPortal(
-            global_id=gid,
-            name=name,
-            storey_global_id=storey,
+            **common,
             point=Point2D(x=origin[0], y=origin[1]),
             incomplete=False,
             method="ifc_object_placement",
-            filled_by_door_global_id=door_gid,
-            filled_by_window_global_id=window_gid,
         )
 
     return OpeningPortal(
-        global_id=gid,
-        name=name,
-        storey_global_id=storey,
+        **common,
         point=None,
         incomplete=True,
         method="unavailable",
-        filled_by_door_global_id=door_gid,
-        filled_by_window_global_id=window_gid,
     )
 
 

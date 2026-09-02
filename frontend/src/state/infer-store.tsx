@@ -237,7 +237,6 @@ export function InferProvider({ children }: { children: ReactNode }) {
   const setConnectivityGraphOnly = useCallback((graph: ConnectivityGraph) => {
     setConnectivityGraph(graph);
     setConnectivityRoute(null);
-    setExcludedNodeIds(new Set());
   }, []);
 
   const setViewerStatus = useCallback(

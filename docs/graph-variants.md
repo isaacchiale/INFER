@@ -50,8 +50,14 @@ pair of spaces that share a facing frontage:
 2. Mark samples blocked where they hit a wall polygon.
 3. Carve samples clear near **same-storey** opening/door portals (voids often
    absent from wall mesh). Doors stacked at the same XY on other floors are ignored.
-4. If a contiguous **clear span** ≥ ~0.7 m remains → emit inferred ``space_space``
-   (``geom_opening_space``). Partial wall + opening ⇒ connect; full wall seal ⇒ no.
+   Only openings that void an ``IfcWall`` (``host_is_wall``) may carve: Revit
+   exports cabinet and countertop recesses as ``IfcOpeningElement`` hosted by
+   ``IfcFurnishingElement``, and those stand against walls, so trusting them
+   punches doorways through solid partitions.
+4. If a contiguous **clear span** ≥ ~0.7 m remains along the shared outline
+   (room-A boundary order, not the line between space centroids) → emit
+   inferred ``space_space`` (``geom_opening_space``). Partial wall + opening
+   ⇒ connect; full wall seal ⇒ no.
 5. Set edge ``portal`` to the **centre of the walkable clear frontage** (wide open
    strip → average of all clear midpoints; narrow doorway → longest clear run).
    Optionally tag ``global_id`` when an unfilled IfcOpening sits near that portal —
@@ -66,7 +72,8 @@ Spaces whose **walkable** footprints contain smaller same-storey spaces are
 flagged ``nested_parent: true`` on the geometry graph. Containment uses
 exterior-minus-holes: a lift/courtyard space sitting only in a parent hole
 does **not** count. The Graph Viewer draws a red circle around flagged nodes.
-Detection only — parents are not removed or reduced yet.
+Right-click remove recalculates geometry healing for that node's storey
+without it (other storeys keep their inferred edges).
 
 Source IFC is never modified.
 """

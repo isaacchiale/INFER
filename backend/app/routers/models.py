@@ -3,7 +3,7 @@ from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from app.config import get_settings
 from app.schemas.entities import EntitiesExtract, ModelMetadata
 from app.schemas.footprints import FootprintsDocument
-from app.schemas.graph import ConnectivityGraph, GraphVariant
+from app.schemas.graph import ConnectivityGraph, GraphLiveRequest, GraphVariant
 from app.services import extract as extract_service
 from app.services import footprints as footprints_service
 from app.services import graph as graph_service
@@ -155,6 +155,48 @@ def get_graph(
         raise HTTPException(
             status_code=404,
             detail=_VARIANT_DETAIL.get(variant, "Graph not found."),
+        ) from exc
+
+
+@router.post("/{model_id}/graph/live", response_model=ConnectivityGraph)
+def live_geometry_graph(
+    model_id: str,
+    body: GraphLiveRequest,
+    variant: GraphVariant = Query("geometry"),
+) -> ConnectivityGraph:
+    """
+    Recalculate geometry healing for storeys touched by excluded nodes.
+    Does not overwrite persisted graph.geometry.json.
+    """
+    if variant != "geometry":
+        raise HTTPException(
+            status_code=400,
+            detail="Live reheal is only available for the geometry variant.",
+        )
+    settings = get_settings()
+    try:
+        storage.read_meta(settings, model_id)
+    except storage.ModelNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Model not found") from exc
+
+    ifc_graph = _ensure_ifc_graph(settings, model_id)
+    footprints = _ensure_footprints(settings, model_id)
+    previous: ConnectivityGraph | None
+    try:
+        previous = storage.read_graph(settings, model_id, "geometry")
+    except storage.ModelNotFoundError:
+        previous = None
+
+    try:
+        return graph_geometry.reheal_geometry_graph(
+            ifc_graph,
+            footprints,
+            excluded_node_ids=body.excluded_node_ids,
+            previous=previous,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500, detail=f"Geometry reheal failed: {exc}"
         ) from exc
 
 

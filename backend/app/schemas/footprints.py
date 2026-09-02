@@ -68,6 +68,11 @@ class OpeningPortal(BaseModel):
     filled_by_door_global_id: str | None = None
     """Window that fills this opening, if any (not treated as walkable in v1)."""
     filled_by_window_global_id: str | None = None
+    """Element this opening voids via IfcRelVoidsElement, if any."""
+    host_global_id: str | None = None
+    """True when the voided element is an IfcWall. Revit exports furniture
+    recesses (cabinets, counters) as openings too; those void the furniture."""
+    host_is_wall: bool = False
 
 
 class StairFootprint(BaseModel):

@@ -32,8 +32,8 @@ class GraphNode(BaseModel):
     storey_global_id: str | None = None
     """
     True when this space geometrically contains other same-storey spaces
-    (candidate to remove or reduce to residual corridor). Geometry variant only;
-    nodes are flagged, not removed yet.
+    (candidate to remove or reduce to residual corridor). Geometry variant only.
+    Right-click remove reheals that storey without the node.
     """
     nested_parent: bool = False
 
@@ -53,6 +53,12 @@ class GraphEdge(BaseModel):
     clear span along the shared frontage (used like a door portal).
     """
     portal: Point2D | None = None
+
+
+class GraphLiveRequest(BaseModel):
+    """Ephemeral geometry reheal; does not overwrite persisted graphs."""
+
+    excluded_node_ids: list[str] = Field(default_factory=list)
 
 
 class ConnectivityGraph(BaseModel):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from copy import deepcopy
 
 from app.schemas.footprints import (
@@ -21,6 +22,12 @@ STAIR_INTERSECT_EPS = 1e-4
 # Nested-parent detection (geometry variant highlight only — no removal yet).
 NESTED_CHILD_VERTEX_IN_PARENT = 0.85
 NESTED_CHILD_AREA_RATIO_MAX = 0.98
+
+
+def _normalize_excluded_node_ids(raw: Iterable[str] | None) -> set[str]:
+    if not raw:
+        return set()
+    return {str(x) for x in raw if x}
 
 
 def _point_in_polygon(x: float, y: float, polygon: list[Point2D]) -> bool:
@@ -272,15 +279,8 @@ MIN_CLEAR_SPAN_M = 0.7
 WALL_HIT_TOL_M = 0.08
 # Carve this radius around opening/door portals as clear (voids often missing from wall mesh).
 VOID_CARVE_RADIUS_M = 0.55
-
-
-def _polygon_centroid(polygon: list[Point2D]) -> Point2D:
-    if not polygon:
-        return Point2D(x=0.0, y=0.0)
-    return Point2D(
-        x=sum(p.x for p in polygon) / len(polygon),
-        y=sum(p.y for p in polygon) / len(polygon),
-    )
+# Split disjoint contact patches when outline-arc gap exceeds this (≈3 sample steps).
+FRONTAGE_CHAIN_GAP_M = 0.4
 
 
 def _sample_polygon_boundary(
@@ -325,36 +325,170 @@ def _interface_length_and_gap(
     return length, mean_gap
 
 
+def _boundary_samples_arclen(
+    polygon: list[Point2D], step: float = INTERFACE_SAMPLE_M
+) -> tuple[list[tuple[float, Point2D]], float]:
+    """
+    Sample the ring in vertex order. Each point carries arc length from
+    vertex 0. Closing vertex is omitted (not duplicated as s=0).
+    Returns (samples, perimeter).
+    """
+    n = len(polygon)
+    if n < 3 or step <= 0:
+        return [], 0.0
+    samples: list[tuple[float, Point2D]] = []
+    perimeter = 0.0
+    for i in range(n):
+        a = polygon[i]
+        b = polygon[(i + 1) % n]
+        seg_len = math.hypot(b.x - a.x, b.y - a.y)
+        if seg_len < 1e-9:
+            continue
+        count = max(1, int(math.ceil(seg_len / step)))
+        for k in range(count):
+            t = k / count
+            samples.append(
+                (
+                    perimeter + t * seg_len,
+                    Point2D(x=a.x + t * (b.x - a.x), y=a.y + t * (b.y - a.y)),
+                )
+            )
+        perimeter += seg_len
+    return samples, perimeter
+
+
 def _frontage_strip_samples(
     a: SpaceFootprint, b: SpaceFootprint, gap_max: float = INTERFACE_GAP_MAX_M
-) -> list[tuple[float, Point2D]]:
+) -> tuple[list[tuple[float, Point2D]], float]:
     """
-    Samples along the shared frontage: (1D parameter t, midpoint in the strip).
-    t runs along the direction perpendicular to A→B centroids.
+    Samples along the shared frontage in A's outline order.
+
+    Each item is (arc length along A, midpoint in the strip toward B).
+    Disjoint contact patches stay separated by large arc gaps.
     """
     if len(a.polygon) < 3 or len(b.polygon) < 3:
-        return []
-    ca = _polygon_centroid(a.polygon)
-    cb = _polygon_centroid(b.polygon)
-    dx, dy = cb.x - ca.x, cb.y - ca.y
-    span = math.hypot(dx, dy)
-    if span < 1e-9:
-        fx, fy = 1.0, 0.0
-    else:
-        # Unit along frontage (perpendicular to A→B).
-        fx, fy = -dy / span, dx / span
-
+        return [], 0.0
+    boundary, perimeter = _boundary_samples_arclen(a.polygon)
     samples: list[tuple[float, Point2D]] = []
-    for p in _sample_polygon_boundary(a.polygon):
+    for s, p in boundary:
         d = _dist_point_to_polygon(p.x, p.y, b.polygon)
         if d > gap_max:
             continue
         q, _ = _closest_point_on_polygon(p, b.polygon)
         mid = Point2D(x=0.5 * (p.x + q.x), y=0.5 * (p.y + q.y))
-        t = (p.x - ca.x) * fx + (p.y - ca.y) * fy
-        samples.append((t, mid))
-    samples.sort(key=lambda item: item[0])
-    return samples
+        samples.append((s, mid))
+    return samples, perimeter
+
+
+def _frontage_chains(
+    samples: list[tuple[float, Point2D]], perimeter: float
+) -> tuple[list[list[int]], bool]:
+    """
+    Index groups of consecutive outline samples.
+    Returns (chains, full_ring) where full_ring means the facing set wraps
+    the whole perimeter as one loop.
+    """
+    if not samples:
+        return [], False
+    chains: list[list[int]] = [[0]]
+    for i in range(1, len(samples)):
+        if samples[i][0] - samples[i - 1][0] > FRONTAGE_CHAIN_GAP_M:
+            chains.append([i])
+        else:
+            chains[-1].append(i)
+    wrap = (
+        perimeter > FRONTAGE_CHAIN_GAP_M
+        and (samples[0][0] + perimeter - samples[-1][0]) <= FRONTAGE_CHAIN_GAP_M
+    )
+    if not wrap:
+        return chains, False
+    if len(chains) == 1:
+        return chains, True
+    merged = [chains[-1] + chains[0]] + chains[1:-1]
+    return merged, False
+
+
+def _unwrap_chain_s(
+    samples: list[tuple[float, Point2D]],
+    indices: list[int],
+    perimeter: float,
+) -> list[float]:
+    out: list[float] = []
+    for i, idx in enumerate(indices):
+        s = samples[idx][0]
+        if i > 0 and s + 1e-9 < out[-1]:
+            s += perimeter
+        out.append(s)
+    return out
+
+
+def _longest_clear_on_chain(
+    s_vals: list[float],
+    blocked: list[bool],
+    mids: list[Point2D],
+    *,
+    circular: bool,
+    perimeter: float,
+) -> tuple[float, list[Point2D]]:
+    """Longest clear run on one chain. Span is outline arc length."""
+    n = len(s_vals)
+    if n == 0:
+        return 0.0, []
+    if n != len(blocked) or n != len(mids):
+        return 0.0, []
+
+    def scan(ss: list[float], bb: list[bool], mm: list[Point2D], limit: int) -> tuple[float, list[Point2D]]:
+        best_span = 0.0
+        best_mids: list[Point2D] = []
+        i = 0
+        while i < limit:
+            if bb[i]:
+                i += 1
+                continue
+            j = i
+            while j < len(bb) and not bb[j] and j < i + n:
+                j += 1
+            span = ss[j - 1] - ss[i]
+            if span < 1e-9:
+                span = INTERFACE_SAMPLE_M
+            if span > best_span:
+                best_span = span
+                best_mids = mm[i:j]
+            i = j
+        return best_span, best_mids
+
+    if circular and n > 1:
+        ss = s_vals + [x + perimeter for x in s_vals]
+        bb = blocked + blocked
+        mm = mids + mids
+        return scan(ss, bb, mm, n)
+    return scan(s_vals, blocked, mids, n)
+
+
+def _best_clear_run(
+    samples: list[tuple[float, Point2D]],
+    blocked: list[bool],
+    perimeter: float,
+) -> tuple[float, list[Point2D]]:
+    if not samples or len(samples) != len(blocked):
+        return 0.0, []
+    chains, full_ring = _frontage_chains(samples, perimeter)
+    best_span = 0.0
+    best_mids: list[Point2D] = []
+    for chain in chains:
+        s_vals = _unwrap_chain_s(samples, chain, perimeter)
+        bb = [blocked[i] for i in chain]
+        mm = [samples[i][1] for i in chain]
+        span, run_mids = _longest_clear_on_chain(
+            s_vals, bb, mm, circular=full_ring, perimeter=perimeter
+        )
+        if span > best_span:
+            best_span = span
+            best_mids = run_mids
+    if best_span < 1e-9 and any(not b for b in blocked):
+        best_span = INTERFACE_SAMPLE_M
+        best_mids = [mid for (_s, mid), b in zip(samples, blocked) if not b][:1]
+    return best_span, best_mids
 
 
 def _point_hits_wall(
@@ -373,29 +507,11 @@ def _point_hits_wall(
 def _max_clear_span_m(
     samples: list[tuple[float, Point2D]],
     blocked: list[bool],
+    perimeter: float = 0.0,
 ) -> float:
-    """Longest contiguous clear run along frontage parameter t."""
-    if not samples or len(samples) != len(blocked):
-        return 0.0
-    best = 0.0
-    run_start: float | None = None
-    prev_t: float | None = None
-    for (t, _mid), is_blocked in zip(samples, blocked):
-        if not is_blocked:
-            if run_start is None:
-                run_start = t
-            prev_t = t
-        else:
-            if run_start is not None and prev_t is not None:
-                best = max(best, prev_t - run_start)
-            run_start = None
-            prev_t = None
-    if run_start is not None and prev_t is not None:
-        best = max(best, prev_t - run_start)
-    # Single-sample clear runs: credit one sample step.
-    if best < 1e-9 and any(not b for b in blocked):
-        best = INTERFACE_SAMPLE_M
-    return best
+    """Longest contiguous clear run along A's outline frontage."""
+    span, _mids = _best_clear_run(samples, blocked, perimeter)
+    return span
 
 
 # Prefer centre of the whole clear frontage when most of the strip is open.
@@ -405,6 +521,7 @@ CLEAR_FRONTAGE_WIDE_FRAC = 0.7
 def _clear_span_portal(
     samples: list[tuple[float, Point2D]],
     blocked: list[bool],
+    perimeter: float = 0.0,
 ) -> Point2D | None:
     """
     Door-like portal on the shared frontage:
@@ -426,44 +543,12 @@ def _clear_span_portal(
             y=sum(p.y for p in clear_mids) / len(clear_mids),
         )
 
-    best_len = -1.0
-    best_mids: list[Point2D] = []
-    run_start: float | None = None
-    prev_t: float | None = None
-    run_mids: list[Point2D] = []
-
-    def close_run() -> None:
-        nonlocal best_len, best_mids, run_start, prev_t, run_mids
-        if run_start is None or prev_t is None or not run_mids:
-            run_start = None
-            prev_t = None
-            run_mids = []
-            return
-        span = prev_t - run_start
-        if span < 1e-9:
-            span = INTERFACE_SAMPLE_M
-        if span > best_len:
-            best_len = span
-            best_mids = list(run_mids)
-        run_start = None
-        prev_t = None
-        run_mids = []
-
-    for (t, mid), is_blocked in zip(samples, blocked):
-        if not is_blocked:
-            if run_start is None:
-                run_start = t
-            prev_t = t
-            run_mids.append(mid)
-        else:
-            close_run()
-    close_run()
-
-    if not best_mids:
+    _span, run_mids = _best_clear_run(samples, blocked, perimeter)
+    if not run_mids:
         return None
     return Point2D(
-        x=sum(p.x for p in best_mids) / len(best_mids),
-        y=sum(p.y for p in best_mids) / len(best_mids),
+        x=sum(p.x for p in run_mids) / len(run_mids),
+        y=sum(p.y for p in run_mids) / len(run_mids),
     )
 
 
@@ -491,16 +576,16 @@ def _strip_clear_portal(
     void carving, return the centre of that clear opening (door-like portal).
     Otherwise None.
     """
-    samples = _frontage_strip_samples(a, b)
+    samples, perimeter = _frontage_strip_samples(a, b)
     if len(samples) < 2:
         return None
 
     blocked = [_point_hits_wall(mid, walls) for _t, mid in samples]
     _carve_voids(samples, blocked, void_portals)
-    portal = _clear_span_portal(samples, blocked)
+    portal = _clear_span_portal(samples, blocked, perimeter)
     if portal is None:
         return None
-    if _max_clear_span_m(samples, blocked) < MIN_CLEAR_SPAN_M:
+    if _max_clear_span_m(samples, blocked, perimeter) < MIN_CLEAR_SPAN_M:
         return None
     return portal
 
@@ -683,22 +768,33 @@ def _pick_best_space_for_stair(
 
 
 def _spaces_for_storey(
-    footprints: FootprintsDocument, storey: str | None
+    footprints: FootprintsDocument,
+    storey: str | None,
+    excluded_node_ids: set[str] | None = None,
 ) -> list[SpaceFootprint]:
+    excluded = excluded_node_ids or set()
     out: list[SpaceFootprint] = []
     for s in footprints.spaces:
         if s.incomplete or len(s.polygon) < 3:
+            continue
+        if f"space:{s.global_id}" in excluded:
             continue
         if storey is None or s.storey_global_id is None or s.storey_global_id == storey:
             out.append(s)
     return out
 
 
-def _all_complete_spaces(footprints: FootprintsDocument) -> list[SpaceFootprint]:
+def _all_complete_spaces(
+    footprints: FootprintsDocument,
+    excluded_node_ids: set[str] | None = None,
+) -> list[SpaceFootprint]:
+    excluded = excluded_node_ids or set()
     return [
         s
         for s in footprints.spaces
-        if not s.incomplete and len(s.polygon) >= 3
+        if not s.incomplete
+        and len(s.polygon) >= 3
+        and f"space:{s.global_id}" not in excluded
     ]
 
 
@@ -809,22 +905,80 @@ def _stair_candidate_storeys(
     return allowed
 
 
+def _storeys_for_nodes(
+    nodes: list[GraphNode], node_ids: set[str]
+) -> set[str]:
+    """Storey GlobalIds touched by the given graph node ids."""
+    out: set[str] = set()
+    by_id = {n.id: n for n in nodes}
+    for nid in node_ids:
+        node = by_id.get(nid)
+        if node is not None and node.storey_global_id:
+            out.add(node.storey_global_id)
+    return out
+
+
 def build_geometry_graph(
-    ifc_graph: ConnectivityGraph, footprints: FootprintsDocument
+    ifc_graph: ConnectivityGraph,
+    footprints: FootprintsDocument,
+    *,
+    excluded_node_ids: Iterable[str] | None = None,
+    only_storeys: Iterable[str] | None = None,
+    previous: ConnectivityGraph | None = None,
 ) -> ConnectivityGraph:
     """
     Superset of the IFC graph: add door↔space, opening space↔space, and
     stair↔space links from footprints when missing from IfcRelSpaceBoundary.
+
+    ``excluded_node_ids`` (e.g. right-click remove) are skipped as heal
+    candidates. IFC links to those nodes do not block a replacement heal.
+
+    When ``only_storeys`` is set, inferred edges on other storeys are kept
+    from ``previous`` (or rebuilt in full if previous is missing).
     """
+    excluded = _normalize_excluded_node_ids(excluded_node_ids)
+    storey_filter = {s for s in (only_storeys or []) if s} or None
+    if storey_filter is not None and previous is None:
+        storey_filter = None
+
     nodes = list(ifc_graph.nodes)
     edges = [e.model_copy(deep=True) for e in ifc_graph.edges]
     edge_ids = {e.id for e in edges}
+    node_by_id = {n.id: n for n in nodes}
 
-    # Existing portal links (ignore direction).
+    def _inferred_on_filtered_storey(edge: GraphEdge) -> bool:
+        """True when a space (or door) endpoint sits on a storey being rehealed."""
+        if storey_filter is None:
+            return False
+        for endpoint in (edge.source, edge.target):
+            node = node_by_id.get(endpoint)
+            if node is None:
+                continue
+            if node.kind in {"space", "door"} and node.storey_global_id in storey_filter:
+                return True
+        return False
+
+    # Keep inferred edges from a previous geometry graph on storeys we are
+    # not recalculating (right-click remove → heal that level only).
+    if storey_filter is not None and previous is not None:
+        for e in previous.edges:
+            if not e.inferred:
+                continue
+            if e.id in edge_ids:
+                continue
+            if _inferred_on_filtered_storey(e):
+                continue
+            edges.append(e.model_copy(deep=True))
+            edge_ids.add(e.id)
+
+    # Existing portal links (ignore direction). Skip excluded endpoints so
+    # an IFC/geom link to a removed node does not block a replacement.
     linked_door_spaces: set[tuple[str, str]] = set()  # (door_id, space_id)
     linked_stair_spaces: set[tuple[str, str]] = set()
     linked_space_pairs: set[tuple[str, str]] = set()  # frozenset-as-sorted tuple
     for e in edges:
+        if e.source in excluded or e.target in excluded:
+            continue
         if e.kind == "space_door":
             a, b = e.source, e.target
             door = a if a.startswith("door:") else b if b.startswith("door:") else ""
@@ -845,7 +999,10 @@ def build_geometry_graph(
                 lo, hi = (a, b) if a < b else (b, a)
                 linked_space_pairs.add((lo, hi))
 
-    node_by_id = {n.id: n for n in nodes}
+    def _on_heal_storey(storey_gid: str | None) -> bool:
+        if storey_filter is None:
+            return True
+        return bool(storey_gid) and storey_gid in storey_filter
 
     # --- Door healing ---
     # Cap: a door has at most 2 space links total (IFC ∪ geom).
@@ -854,13 +1011,17 @@ def build_geometry_graph(
     #                 IFC space (closest such candidate)
     #   0 IFC links → pick ≤2 via between/nearest as before
     space_fp_by_gid = {
-        s.global_id: s for s in _all_complete_spaces(footprints)
+        s.global_id: s for s in _all_complete_spaces(footprints, excluded)
     }
     for door in footprints.doors:
         door_id = f"door:{door.global_id}"
         if door_id not in node_by_id:
             continue
+        if door_id in excluded:
+            continue
         if door.incomplete or door.point is None:
+            continue
+        if not _on_heal_storey(door.storey_global_id):
             continue
 
         existing_space_ids = sorted(
@@ -872,7 +1033,9 @@ def build_geometry_graph(
         px, py = door.point.x, door.point.y
         door_pt = Point2D(x=px, y=py)
         ranked: list[tuple[float, SpaceFootprint]] = []
-        for space in _spaces_for_storey(footprints, door.storey_global_id):
+        for space in _spaces_for_storey(
+            footprints, door.storey_global_id, excluded
+        ):
             space_id = f"space:{space.global_id}"
             if space_id not in node_by_id:
                 continue
@@ -927,17 +1090,21 @@ def build_geometry_graph(
         edge_ids=edge_ids,
         linked_space_pairs=linked_space_pairs,
         linked_door_spaces=linked_door_spaces,
+        excluded_node_ids=excluded,
+        only_storeys=storey_filter,
     )
 
     # --- Stair / lift healing ---
     # Own storey + next storey up. Per storey: at most one IfcSpace (max ∩ area).
     stairs = list(footprints.stairs or [])
-    all_spaces = _all_complete_spaces(footprints)
+    all_spaces = _all_complete_spaces(footprints, excluded)
     space_by_id = {f"space:{s.global_id}": s for s in all_spaces}
 
     for stair in stairs:
         stair_id = f"stair:{stair.global_id}"
         if stair_id not in node_by_id:
+            continue
+        if stair_id in excluded:
             continue
         if stair.incomplete or len(stair.polygon) < 3:
             continue
@@ -946,8 +1113,13 @@ def build_geometry_graph(
         )
         if candidate_storeys is None:
             continue
+        heal_storeys = candidate_storeys
+        if storey_filter is not None:
+            heal_storeys = candidate_storeys & storey_filter
+        if not heal_storeys:
+            continue
 
-        for storey_gid in candidate_storeys:
+        for storey_gid in heal_storeys:
             # If IFC already linked this stair to any space on this storey, skip.
             already = False
             for sid, spid in linked_stair_spaces:
@@ -1007,6 +1179,36 @@ def build_geometry_graph(
     )
 
 
+def reheal_geometry_graph(
+    ifc_graph: ConnectivityGraph,
+    footprints: FootprintsDocument,
+    *,
+    excluded_node_ids: Iterable[str] | None = None,
+    previous: ConnectivityGraph | None = None,
+) -> ConnectivityGraph:
+    """
+    Recalculate geometry healing for storeys touched by excluded nodes.
+
+    Other storeys keep their previous inferred edges. Does not persist.
+    """
+    excluded = _normalize_excluded_node_ids(excluded_node_ids)
+    if not excluded:
+        if previous is not None:
+            return previous
+        return build_geometry_graph(ifc_graph, footprints)
+
+    storeys = _storeys_for_nodes(ifc_graph.nodes, excluded)
+    if previous is not None:
+        storeys |= _storeys_for_nodes(previous.nodes, excluded)
+    return build_geometry_graph(
+        ifc_graph,
+        footprints,
+        excluded_node_ids=excluded,
+        only_storeys=storeys or None,
+        previous=previous,
+    )
+
+
 def _void_portals_on_storey(
     footprints: FootprintsDocument, storey_gid: str
 ) -> list[Point2D]:
@@ -1015,10 +1217,16 @@ def _void_portals_on_storey(
 
     Multi-storey IFCs often stack identical door XY on every floor; carving with
     another storey's door would punch false holes through sealed attic walls.
+
+    Only openings that void an ``IfcWall`` may carve: Revit exports cabinet and
+    countertop recesses as ``IfcOpeningElement`` too, and those stand against
+    walls, so trusting them punches doorways through solid partitions.
     """
     voids: list[Point2D] = []
     for opening in footprints.openings or []:
         if opening.incomplete or opening.point is None:
+            continue
+        if not opening.host_is_wall:
             continue
         if opening.storey_global_id and opening.storey_global_id != storey_gid:
             continue
@@ -1040,13 +1248,16 @@ def _heal_space_space_interfaces(
     edge_ids: set[str],
     linked_space_pairs: set[tuple[str, str]],
     linked_door_spaces: set[tuple[str, str]],
+    excluded_node_ids: set[str] | None = None,
+    only_storeys: set[str] | None = None,
 ) -> None:
     """
     Infer walkable space↔space links from facing strips:
 
     1. Same-storey pairs with a shared plan frontage.
     2. Mark strip samples blocked by wall footprints; carve same-storey
-       opening/door voids clear (never other floors' stacked doors).
+       wall-voiding opening/door portals clear (never other floors' stacked
+       doors, never furniture recesses).
     3. Connect when a clear span ≥ MIN_CLEAR_SPAN_M remains
        (no wall / open plan, or partial wall + opening). Full wall seal ⇒ no edge.
     4. Store ``portal`` = centre of the walkable clear frontage for geometric path.
@@ -1055,7 +1266,7 @@ def _heal_space_space_interfaces(
     """
     spaces = [
         s
-        for s in _all_complete_spaces(footprints)
+        for s in _all_complete_spaces(footprints, excluded_node_ids)
         if s.storey_global_id and f"space:{s.global_id}" in node_by_id
     ]
     walls = [
@@ -1079,6 +1290,8 @@ def _heal_space_space_interfaces(
         walls_by_storey.setdefault(w.storey_global_id, []).append(w)
 
     for storey_gid, group in by_storey.items():
+        if only_storeys is not None and storey_gid not in only_storeys:
+            continue
         storey_walls = list(walls_by_storey.get(storey_gid, []))
         storey_walls.extend(walls_by_storey.get(None, []))
         void_portals = _void_portals_on_storey(footprints, storey_gid)

@@ -5,6 +5,7 @@ import {
   buildModelGraph,
   computeModelRoute,
   getModelGraph,
+  rehealModelGraph,
 } from "@/api/models";
 import { useInfer } from "@/state/infer-store";
 import { useAppTheme } from "@/hooks/use-app-theme";
@@ -175,6 +176,40 @@ export function GraphViewer({ className }: { className?: string }) {
     setDestination((prev) => (prev && ids.has(prev) ? prev : second.id));
   }, [graph, excludedNodeIds, setConnectivityRoute]);
 
+  const liveRehealRef = useRef(false);
+  useEffect(() => {
+    if (variant !== "geometry" || !backendModelId || graphSource !== "model") {
+      return;
+    }
+    const ids = [...excludedNodeIds];
+    if (!ids.length && !liveRehealRef.current) {
+      return;
+    }
+    let cancelled = false;
+    setVariantBusy(true);
+    setVariantError(null);
+    const run = ids.length
+      ? rehealModelGraph(backendModelId, ids)
+      : getModelGraph(backendModelId, "geometry");
+    void run
+      .then((g) => {
+        if (cancelled) return;
+        liveRehealRef.current = ids.length > 0;
+        setConnectivityGraphOnly(g);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setVariantError(err instanceof Error ? err.message : "Failed to recalculate geometry");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setVariantBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [backendModelId, excludedNodeIds, graphSource, setConnectivityGraphOnly, variant]);
+
   const blockedNodeIds = useMemo(() => [...excludedNodeIds], [excludedNodeIds]);
 
   useEffect(() => {
@@ -201,6 +236,7 @@ export function GraphViewer({ className }: { className?: string }) {
             destination_node_id: destination,
             graph_variant: variant,
             blocked_node_ids: blockedNodeIds,
+            graph: variant === "geometry" ? graph : undefined,
           })
         : computeRoute({
             origin_node_id: origin,
@@ -398,7 +434,11 @@ export function GraphViewer({ className }: { className?: string }) {
             </span>
           )}
           {variantBusy && (
-            <span className="text-[10px] text-muted-foreground">Loading variant…</span>
+            <span className="text-[10px] text-muted-foreground">
+              {variant === "geometry" && excludedNodeIds.size > 0
+                ? "Recalculating geometry…"
+                : "Loading variant…"}
+            </span>
           )}
           {variantError && (
             <span className="max-w-[240px] text-[10px] text-destructive">{variantError}</span>

@@ -66,6 +66,21 @@ export async function buildModelGraph(
   return (await response.json()) as ConnectivityGraph;
 }
 
+export async function rehealModelGraph(
+  modelId: string,
+  excludedNodeIds: string[],
+  variant: "geometry" = "geometry",
+): Promise<ConnectivityGraph> {
+  const q = new URLSearchParams({ variant });
+  const response = await fetch(`${apiBase}/models/${modelId}/graph/live?${q}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ excluded_node_ids: excludedNodeIds }),
+  });
+  if (!response.ok) throw new Error(await readError(response));
+  return (await response.json()) as ConnectivityGraph;
+}
+
 export async function getModelGraph(
   modelId: string,
   variant: "ifc" | "geometry" | "topologic" = "ifc",
@@ -84,6 +99,7 @@ export async function computeModelRoute(
     blocked_node_ids?: string[];
     blocked_edge_ids?: string[];
     graph_variant?: "ifc" | "geometry" | "topologic";
+    graph?: ConnectivityGraph;
   },
 ): Promise<RouteResult> {
   const response = await fetch(`${apiBase}/models/${modelId}/route`, {

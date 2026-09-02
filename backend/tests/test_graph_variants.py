@@ -8,7 +8,14 @@ from app.schemas.footprints import (
     WallFootprint,
 )
 from app.schemas.graph import ConnectivityGraph, GraphEdge, GraphNode
-from app.services.graph_geometry import build_geometry_graph
+from app.services.graph_geometry import (
+    MIN_CLEAR_SPAN_M,
+    _frontage_strip_samples,
+    _max_clear_span_m,
+    _point_hits_wall,
+    build_geometry_graph,
+    reheal_geometry_graph,
+)
 from app.services.graph_topologic import (
     TopologicUnavailableError,
     build_topologic_graph,
@@ -969,6 +976,8 @@ def test_partial_wall_with_opening_allows_space_space():
                 point=Point2D(x=4.1, y=2.0),
                 incomplete=False,
                 method="ifc_object_placement",
+                host_global_id="W1",
+                host_is_wall=True,
             )
         ],
         stairs=[],
@@ -985,6 +994,71 @@ def test_partial_wall_with_opening_allows_space_space():
     # Portal is clear-span centre (wide/partial open), not the opening XY alone.
     assert abs(opening_edges[0].portal.x - 4.1) < 0.25
     assert 1.5 < opening_edges[0].portal.y < 3.5
+
+
+def _sealed_pair_footprints(opening: OpeningPortal) -> FootprintsDocument:
+    """Two rooms with a wall sealing the whole frontage, plus one opening."""
+    return FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", 0, 0, 4, 4),
+            _box_space("B", "L1", 4.2, 0, 8.2, 4),
+        ],
+        doors=[],
+        openings=[opening],
+        stairs=[],
+        walls=[_box_wall("W1", "L1", 4.0, 0.0, 4.2, 4.0)],
+    )
+
+
+_SEALED_PAIR_IFC = ConnectivityGraph(
+    model_id="m1",
+    variant="ifc",
+    nodes=[
+        GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+        GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+    ],
+    edges=[],
+)
+
+
+def test_furniture_opening_does_not_carve_sealed_wall():
+    """Revit exports cabinet recesses as openings; they must not punch a wall."""
+    footprints = _sealed_pair_footprints(
+        OpeningPortal(
+            global_id="O_CAB",
+            name="M_Tall Cabinet-Single Door(2):800 mm",
+            storey_global_id="L1",
+            point=Point2D(x=4.1, y=2.0),
+            incomplete=False,
+            method="ifc_mesh_xy_centroid",
+            host_global_id="F1",
+            host_is_wall=False,
+        )
+    )
+    geo = build_geometry_graph(_SEALED_PAIR_IFC, footprints)
+    assert not any(e.method == "geom_opening_space" for e in geo.edges)
+
+
+def test_wall_opening_still_carves_sealed_wall():
+    """A doorway voiding the wall stays walkable (hulls fill the real hole)."""
+    footprints = _sealed_pair_footprints(
+        OpeningPortal(
+            global_id="O_DOORWAY",
+            name="doorway",
+            storey_global_id="L1",
+            point=Point2D(x=4.1, y=2.0),
+            incomplete=False,
+            method="ifc_mesh_xy_centroid",
+            host_global_id="W1",
+            host_is_wall=True,
+        )
+    )
+    geo = build_geometry_graph(_SEALED_PAIR_IFC, footprints)
+    opening_edges = [e for e in geo.edges if e.method == "geom_opening_space"]
+    assert len(opening_edges) == 1
+    assert {opening_edges[0].source, opening_edges[0].target} == {"space:A", "space:B"}
 
 
 def test_opening_heal_skips_door_filled_pair_already_door_linked():
@@ -1106,3 +1180,133 @@ def test_opening_heal_does_not_cross_storeys():
             {"space:L1A", "space:L1B"},
             {"space:L2A", "space:L2B"},
         )
+
+
+def _stair_spaces(geo: ConnectivityGraph) -> set[str]:
+    out: set[str] = set()
+    for e in geo.edges:
+        if e.method != "geom_stair_space":
+            continue
+        out.add(e.source if e.source.startswith("space:") else e.target)
+    return out
+
+
+def test_excluding_nested_parent_reassigns_stair_to_lobby():
+    """Huge parent wins ∩ area; removing it lets the inner lobby take the stair."""
+    hull = [
+        Point2D(x=0.5, y=0.5),
+        Point2D(x=2.5, y=0.5),
+        Point2D(x=2.5, y=2.5),
+        Point2D(x=0.5, y=2.5),
+    ]
+    ifc = ConnectivityGraph(
+        model_id="m_ex",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:PARENT", kind="space", global_id="PARENT", storey_global_id="L1"),
+            GraphNode(id="space:LOBBY", kind="space", global_id="LOBBY", storey_global_id="L1"),
+            GraphNode(id="space:L2", kind="space", global_id="L2", storey_global_id="L2"),
+            GraphNode(id="stair:S", kind="stair", global_id="S", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m_ex",
+        storeys=[
+            {"global_id": "L1", "name": "L1", "elevation": 0.0},
+            {"global_id": "L2", "name": "L2", "elevation": 3.0},
+        ],
+        spaces=[
+            _box_space("PARENT", "L1", 0, 0, 40, 40),
+            # Lobby inset so ∩ with the hull is smaller than the parent's full cover.
+            _box_space("LOBBY", "L1", 0, 0, 2.4, 2.4),
+            _box_space("L2", "L2", 0, 0, 3, 3),
+        ],
+        doors=[],
+        stairs=[
+            StairFootprint(
+                global_id="S",
+                name="S",
+                storey_global_id="L1",
+                polygon=hull,
+                incomplete=False,
+                method="ifc_mesh_xy_hull",
+            )
+        ],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    assert "space:PARENT" in _stair_spaces(geo)
+    assert "space:LOBBY" not in _stair_spaces(geo)
+    assert "space:L2" in _stair_spaces(geo)
+
+    rehealed = reheal_geometry_graph(
+        ifc,
+        footprints,
+        excluded_node_ids=["space:PARENT"],
+        previous=geo,
+    )
+    spaces = _stair_spaces(rehealed)
+    assert "space:PARENT" not in spaces
+    assert "space:LOBBY" in spaces
+    assert "space:L2" in spaces  # other storey kept / still healed
+
+
+def test_reheal_empty_exclusions_returns_previous():
+    ifc = ConnectivityGraph(model_id="m", variant="ifc", nodes=[], edges=[])
+    footprints = FootprintsDocument(model_id="m", storeys=[], spaces=[], doors=[], stairs=[])
+    previous = ConnectivityGraph(model_id="m", variant="geometry", nodes=[], edges=[])
+    out = reheal_geometry_graph(ifc, footprints, excluded_node_ids=[], previous=previous)
+    assert out is previous
+
+
+def test_corner_opening_clear_span_follows_outline_order():
+    """
+    L-shaped neighbour wraps south + west of a small room. South is sealed;
+    west is a 2 m opening. Measuring along the outline (not centroids) keeps
+    that opening ≥ 0.7 m so space↔space heals.
+    """
+    a = _box_space("A", "L1", 2, 2, 5, 5)
+    b = SpaceFootprint(
+        global_id="B",
+        name="B",
+        storey_global_id="L1",
+        polygon=[
+            Point2D(x=1.85, y=1.85),
+            Point2D(x=8.0, y=1.85),
+            Point2D(x=8.0, y=1.70),
+            Point2D(x=1.70, y=1.70),
+            Point2D(x=1.70, y=8.0),
+            Point2D(x=1.85, y=8.0),
+        ],
+        incomplete=False,
+        method="ifc_placement_bbox",
+    )
+    south_wall = _box_wall("WS", "L1", 1.80, 1.80, 5.2, 2.05)
+    samples, perimeter = _frontage_strip_samples(a, b)
+    blocked = [_point_hits_wall(mid, [south_wall]) for _s, mid in samples]
+    span = _max_clear_span_m(samples, blocked, perimeter)
+    assert span >= MIN_CLEAR_SPAN_M
+
+    ifc = ConnectivityGraph(
+        model_id="m_corner",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m_corner",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[a, b],
+        doors=[],
+        openings=[],
+        stairs=[],
+        walls=[south_wall],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    opening_edges = [e for e in geo.edges if e.method == "geom_opening_space"]
+    assert len(opening_edges) == 1
+    assert {opening_edges[0].source, opening_edges[0].target} == {"space:A", "space:B"}
+

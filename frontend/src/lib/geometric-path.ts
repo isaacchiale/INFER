@@ -3,10 +3,12 @@
  * local segments constrained to space polygons via door/stair portals.
  *
  * Intermediate space centroids are skipped: only the route start/end spaces
- * use centroids; between portals we go door→door / door→stair / stair→door
- * inside the intervening space polygon via grid A* (0.1 m cells, step cost
- * inversely proportional to wall clearance, no string-pull). Graph topology
- * routing is unchanged.
+ * use centroids; between portals we go door→door / door→opening / opening→opening
+ * (and stair/lift) inside the intervening space polygon via grid A* (0.1 m cells,
+ * step cost inversely proportional to wall clearance, no string-pull). Clearance
+ * uses the IfcSpace exterior/holes plus overlapping IfcWall footprints inside the
+ * space so routes do not cut through interior walls. Graph topology routing
+ * is unchanged.
  */
 
 import type {
@@ -16,6 +18,7 @@ import type {
   Point2D,
   SpaceFootprint,
   StairFootprint,
+  WallFootprint,
 } from "@/types/footprints";
 import type { ConnectivityGraph } from "@/types/graph";
 
@@ -158,16 +161,11 @@ function portalOnSpace(
   return clampPointToSpace(portal, spacePolygon, holes);
 }
 
-/** Distance to nearest exterior or hole edge (clearance). */
-function distToSpaceWall(
-  x: number,
-  y: number,
-  exterior: Point2D[],
-  holes?: Point2D[][],
-): number {
+/** Distance to nearest edge among polygon rings. */
+function distToRings(x: number, y: number, rings: Point2D[][]): number {
   let best = Infinity;
-  const rings = [exterior, ...(holes ?? []).filter((h) => h.length >= 3)];
   for (const ring of rings) {
+    if (ring.length < 3) continue;
     const n = ring.length;
     for (let i = 0; i < n; i++) {
       const a = ring[i]!;
@@ -176,6 +174,124 @@ function distToSpaceWall(
     }
   }
   return best;
+}
+
+/** Distance to nearest exterior or hole edge (clearance). */
+function distToSpaceWall(
+  x: number,
+  y: number,
+  exterior: Point2D[],
+  holes?: Point2D[][],
+): number {
+  return distToRings(x, y, [
+    exterior,
+    ...(holes ?? []).filter((h) => h.length >= 3),
+  ]);
+}
+
+/** True if point lies in any obstacle polygon (solid interior). */
+function pointInObstacles(x: number, y: number, obstacles?: Point2D[][]): boolean {
+  for (const obs of obstacles ?? []) {
+    if (obs.length >= 3 && pointInPolygon(x, y, obs)) return true;
+  }
+  return false;
+}
+
+/**
+ * Clearance for A*: min distance to space boundary/holes and to interior
+ * wall footprints. Cells inside an obstacle are blocked (−1). Thin walls
+ * that miss the cell centre still block when within ~half a cell.
+ */
+function cellClearance(
+  x: number,
+  y: number,
+  exterior: Point2D[],
+  holes?: Point2D[][],
+  obstacles?: Point2D[][],
+): number {
+  if (!pointInSpace(x, y, exterior, holes)) return -1;
+  if (pointInObstacles(x, y, obstacles)) return -1;
+  let d = distToSpaceWall(x, y, exterior, holes);
+  if (obstacles?.length) {
+    const dObs = distToRings(x, y, obstacles);
+    // Half-cell thicken so 0.1 m grid can't slip through sub-cell walls.
+    if (dObs < LOCAL_PATH_CELL_M * 0.45) return -1;
+    d = Math.min(d, dObs);
+  }
+  return d;
+}
+
+/**
+ * IfcWall footprints that overlap a space (same storey when known).
+ * Used as solid obstacles in the local A* cost map.
+ */
+export function wallsOverlappingSpace(
+  footprints: FootprintsDocument,
+  space: SpaceFootprint,
+): Point2D[][] {
+  const walls = footprints.walls ?? [];
+  if (!walls.length || space.polygon.length < 3) return [];
+
+  const out: Point2D[][] = [];
+  for (const wall of walls) {
+    if (!wallOverlapsSpace(wall, space)) continue;
+    out.push(wall.polygon);
+  }
+  return out;
+}
+
+function wallOverlapsSpace(wall: WallFootprint, space: SpaceFootprint): boolean {
+  if (wall.incomplete || wall.polygon.length < 3) return false;
+  if (
+    wall.storey_global_id &&
+    space.storey_global_id &&
+    wall.storey_global_id !== space.storey_global_id
+  ) {
+    return false;
+  }
+
+  for (const p of wall.polygon) {
+    if (pointInSpace(p.x, p.y, space.polygon, space.holes)) return true;
+  }
+  const wc = polygonCentroid(wall.polygon);
+  if (wc && pointInSpace(wc.x, wc.y, space.polygon, space.holes)) return true;
+
+  for (const p of space.polygon) {
+    if (pointInPolygon(p.x, p.y, wall.polygon)) return true;
+  }
+  for (const hole of space.holes ?? []) {
+    for (const p of hole) {
+      if (pointInPolygon(p.x, p.y, wall.polygon)) return true;
+    }
+  }
+
+  // Thin walls can cross the room without vertices inside either ring —
+  // sample edge midpoints.
+  const n = wall.polygon.length;
+  for (let i = 0; i < n; i++) {
+    const a = wall.polygon[i]!;
+    const b = wall.polygon[(i + 1) % n]!;
+    const mx = 0.5 * (a.x + b.x);
+    const my = 0.5 * (a.y + b.y);
+    if (pointInSpace(mx, my, space.polygon, space.holes)) return true;
+  }
+  return false;
+}
+
+/** Local A* inside a space, including overlapping IfcWall obstacles. */
+function localPathInSpace(
+  start: Point2D,
+  goal: Point2D,
+  space: SpaceFootprint,
+  footprints: FootprintsDocument,
+): Point2D[] {
+  return localPathInPolygon(
+    start,
+    goal,
+    space.polygon,
+    space.holes,
+    wallsOverlappingSpace(footprints, space),
+  );
 }
 
 /** Fixed cell size for in-polygon A* (metres). */
@@ -196,12 +312,15 @@ function clearanceStepCost(stepLen: number, clearM: number): number {
  * Grid A* inside a space (door↔door, door↔centroid, etc. only).
  * Step cost ∝ 1/clearance on a 0.1 m grid (no string-pull).
  * Optional holes are treated as blocked (exterior-minus-holes).
+ * Optional `obstacles` (e.g. IfcWall footprints) are solid: interior cells
+ * blocked, and their edges reduce clearance like space walls.
  */
 export function localPathInPolygon(
   start: Point2D,
   goal: Point2D,
   polygon: Point2D[],
   holes?: Point2D[][],
+  obstacles?: Point2D[][],
 ): Point2D[] {
   const s = clampPointToSpace(start, polygon, holes);
   const g = clampPointToSpace(goal, polygon, holes);
@@ -234,11 +353,7 @@ export function localPathInPolygon(
     for (let c = 0; c < cols; c++) {
       const idx = r * cols + c;
       const p = cellCentre(c, r);
-      if (!pointInSpace(p.x, p.y, polygon, holes)) {
-        clearance[idx] = -1;
-        continue;
-      }
-      const d = distToSpaceWall(p.x, p.y, polygon, holes);
+      const d = cellClearance(p.x, p.y, polygon, holes, obstacles);
       clearance[idx] = d;
       if (d > maxClear) maxClear = d;
     }
@@ -338,6 +453,11 @@ export function localPathInPolygon(
       const nIdx = nr * cols + nc;
       const clear = clearance[nIdx]!;
       if (clear < 0 && !(nc === goalCell.c && nr === goalCell.r)) continue;
+      // No diagonal corner-cuts through blocked cells (thin IfcWalls).
+      if (dc !== 0 && dr !== 0) {
+        if (clearance[cur.r * cols + nc]! < 0) continue;
+        if (clearance[nr * cols + cur.c]! < 0) continue;
+      }
 
       const stepLen = Math.hypot(dc!, dr!) * cell;
       const tentative =
@@ -469,6 +589,60 @@ function spaceBetween(
 }
 
 /**
+ * Room to walk for a portal↔portal overlay hop.
+ *
+ * Door→door uses a space node strictly between route indices. Space↔space
+ * openings are tagged with hopFromIndex = first space of that hop, so a
+ * door sitting next to that hop has no index strictly between them — resolve
+ * the shared room as the hop endpoint adjacent to the other portal instead.
+ */
+function walkSpaceForPortalPair(
+  nodeIds: string[],
+  footprints: FootprintsDocument,
+  a: {
+    kind: string;
+    routeIndex: number;
+    hopFromIndex?: number;
+  },
+  b: {
+    kind: string;
+    routeIndex: number;
+    hopFromIndex?: number;
+  },
+): SpaceFootprint | null {
+  const between = spaceBetween(nodeIds, footprints, a.routeIndex, b.routeIndex);
+  if (between) return between;
+
+  if (a.kind === "opening" && b.kind === "opening") {
+    const fromA = a.hopFromIndex ?? a.routeIndex;
+    const fromB = b.hopFromIndex ?? b.routeIndex;
+    // A→B then B→C: shared room is B = second space of first hop.
+    if (fromB !== fromA + 1) return null;
+    const mid = gidFromNodeId(nodeIds[fromA + 1]!);
+    if (mid?.kind !== "space") return null;
+    const space = spaceByGid(footprints, mid.global_id);
+    return usableSpace(space) ? space : null;
+  }
+
+  // door/stair/lift ↔ opening (either order).
+  const opening = a.kind === "opening" ? a : b.kind === "opening" ? b : null;
+  const other = opening === a ? b : opening === b ? a : null;
+  if (!opening || !other || !isPortalKind(other.kind) || other.kind === "opening") {
+    return null;
+  }
+  const hopFrom = opening.hopFromIndex ?? opening.routeIndex;
+  const doorIdx = other.routeIndex;
+  for (const spaceIdx of [hopFrom, hopFrom + 1]) {
+    if (Math.abs(spaceIdx - doorIdx) !== 1) continue;
+    const parsed = gidFromNodeId(nodeIds[spaceIdx]!);
+    if (parsed?.kind !== "space") continue;
+    const space = spaceByGid(footprints, parsed.global_id);
+    if (usableSpace(space)) return space;
+  }
+  return null;
+}
+
+/**
  * Build geometric path from topological node_ids + footprints.
  * Start/end spaces use centroids; intermediate hops are portal↔portal
  * through the intervening space (no mid-route space centroids).
@@ -513,6 +687,7 @@ export function buildGeometricPath(
 
     // Skip intermediate space centroids: door|stair → space → door|stair
     // becomes a single portal→portal segment handled when we see the far portal.
+    // Same when the far hop is space↔space (treat that heal portal like a door).
     if (isPortalKind(a.kind) && b.kind === "space") {
       const bIsTerminal = bId === startSpaceId || bId === endSpaceId;
       const next = i + 2 < nodeIds.length ? gidFromNodeId(nodeIds[i + 2]!) : null;
@@ -532,7 +707,32 @@ export function buildGeometricPath(
         const toPt = portalOnSpace(toRaw, space.polygon, holes);
         segments.push({
           storey_global_id: space.storey_global_id,
-          points: localPathInPolygon(fromPt, toPt, space.polygon, holes),
+          points: localPathInSpace(fromPt, toPt, space, footprints),
+          incomplete: false,
+        });
+        continue;
+      }
+      if (!bIsTerminal && next && next.kind === "space") {
+        const space = spaceByGid(footprints, b.global_id);
+        const fromRaw = portalPoint(footprints, a);
+        const toRaw = portalBetweenSpaces(
+          footprints,
+          b.global_id,
+          next.global_id,
+          graph,
+        );
+        if (!usableSpace(space) || !fromRaw || !toRaw) {
+          pushIncomplete(
+            space?.storey_global_id ?? null,
+            "missing footprint for portal–space–space hop",
+          );
+          continue;
+        }
+        const fromPt = portalOnSpace(fromRaw, space.polygon, space.holes);
+        const toPt = portalOnSpace(toRaw, space.polygon, space.holes);
+        segments.push({
+          storey_global_id: space.storey_global_id,
+          points: localPathInSpace(fromPt, toPt, space, footprints),
           incomplete: false,
         });
         continue;
@@ -551,7 +751,7 @@ export function buildGeometricPath(
         const to = polygonCentroid(space.polygon)!;
         segments.push({
           storey_global_id: space.storey_global_id,
-          points: localPathInPolygon(fromPt, to, space.polygon, space.holes),
+          points: localPathInSpace(fromPt, to, space, footprints),
           incomplete: false,
         });
       }
@@ -561,6 +761,32 @@ export function buildGeometricPath(
     if (a.kind === "space" && isPortalKind(b.kind)) {
       const aIsTerminal = aId === startSpaceId || aId === endSpaceId;
       if (!aIsTerminal) {
+        // Middle room → door/stair after a space↔space hop: walk heal portal→door.
+        const prev = i > 0 ? gidFromNodeId(nodeIds[i - 1]!) : null;
+        if (prev?.kind === "space") {
+          const space = spaceByGid(footprints, a.global_id);
+          const fromRaw = portalBetweenSpaces(
+            footprints,
+            prev.global_id,
+            a.global_id,
+            graph,
+          );
+          const toRaw = portalPoint(footprints, b);
+          if (!usableSpace(space) || !fromRaw || !toRaw) {
+            pushIncomplete(
+              space?.storey_global_id ?? null,
+              "missing footprint for space–space→portal hop",
+            );
+            continue;
+          }
+          const fromPt = portalOnSpace(fromRaw, space.polygon, space.holes);
+          const toPt = portalOnSpace(toRaw, space.polygon, space.holes);
+          segments.push({
+            storey_global_id: space.storey_global_id,
+            points: localPathInSpace(fromPt, toPt, space, footprints),
+            incomplete: false,
+          });
+        }
         continue;
       }
       const space = spaceByGid(footprints, a.global_id);
@@ -576,7 +802,7 @@ export function buildGeometricPath(
       const toPt = portalOnSpace(toRaw, space.polygon, space.holes);
       segments.push({
         storey_global_id: space.storey_global_id,
-        points: localPathInPolygon(from, toPt, space.polygon, space.holes),
+        points: localPathInSpace(from, toPt, space, footprints),
         incomplete: false,
       });
       continue;
@@ -612,7 +838,7 @@ export function buildGeometricPath(
         const toPt = portalOnSpace(portal, spaceA.polygon, spaceA.holes);
         segments.push({
           storey_global_id: spaceA.storey_global_id,
-          points: localPathInPolygon(from, toPt, spaceA.polygon, spaceA.holes),
+          points: localPathInSpace(from, toPt, spaceA, footprints),
           incomplete: false,
         });
       } else if (prev?.kind === "space") {
@@ -629,12 +855,7 @@ export function buildGeometricPath(
           const toPt = portalOnSpace(portal, spaceA.polygon, spaceA.holes);
           segments.push({
             storey_global_id: spaceA.storey_global_id,
-            points: localPathInPolygon(
-              fromPt,
-              toPt,
-              spaceA.polygon,
-              spaceA.holes,
-            ),
+            points: localPathInSpace(fromPt, toPt, spaceA, footprints),
             incomplete: false,
           });
         }
@@ -647,7 +868,7 @@ export function buildGeometricPath(
         const to = polygonCentroid(spaceB.polygon)!;
         segments.push({
           storey_global_id: spaceB.storey_global_id,
-          points: localPathInPolygon(fromPt, to, spaceB.polygon, spaceB.holes),
+          points: localPathInSpace(fromPt, to, spaceB, footprints),
           incomplete: false,
         });
       }
@@ -705,8 +926,7 @@ export function continuousPolylineForStorey(
     routeIndex: number;
     /** For opening portals on space↔space hops: first space index of the hop. */
     hopFromIndex?: number;
-    spacePolygon?: Point2D[];
-    spaceHoles?: Point2D[][];
+    space?: SpaceFootprint;
   };
   const waypoints: Waypoint[] = [];
   let incomplete = false;
@@ -778,8 +998,7 @@ export function continuousPolylineForStorey(
             kind: "space",
             storey: space.storey_global_id,
             routeIndex: i,
-            spacePolygon: space.polygon,
-            spaceHoles: space.holes,
+            space: space,
           });
         }
       }
@@ -840,58 +1059,41 @@ export function continuousPolylineForStorey(
     };
   }
 
-  /** Space walked when going portal→portal for consecutive space↔space heals. */
-  const sharedSpaceForOpenings = (
-    a: Waypoint,
-    b: Waypoint,
-  ): SpaceFootprint | null => {
-    if (a.kind !== "opening" || b.kind !== "opening") return null;
-    const fromA = a.hopFromIndex ?? a.routeIndex;
-    const fromB = b.hopFromIndex ?? b.routeIndex;
-    // A→B then B→C: shared room is B = second space of first hop.
-    if (fromB !== fromA + 1) return null;
-    const mid = gidFromNodeId(nodeIds[fromA + 1]!);
-    if (mid?.kind !== "space") return null;
-    const space = spaceByGid(footprints, mid.global_id);
-    return usableSpace(space) ? space : null;
-  };
-
   const points: Point2D[] = [];
   for (let i = 0; i < waypoints.length - 1; i++) {
     const a = waypoints[i]!;
     const b = waypoints[i + 1]!;
-    let mid = spaceBetween(nodeIds, footprints, a.routeIndex, b.routeIndex);
-    if (!mid) mid = sharedSpaceForOpenings(a, b);
+    const mid = walkSpaceForPortalPair(nodeIds, footprints, a, b);
 
     let seg: Point2D[];
-    if (a.kind === "space" && a.spacePolygon && isPortalKind(b.kind)) {
-      seg = localPathInPolygon(
+    if (a.kind === "space" && a.space && isPortalKind(b.kind)) {
+      seg = localPathInSpace(
         a.point,
-        portalOnSpace(b.point, a.spacePolygon, a.spaceHoles),
-        a.spacePolygon,
-        a.spaceHoles,
+        portalOnSpace(b.point, a.space.polygon, a.space.holes),
+        a.space,
+        footprints,
       );
-    } else if (isPortalKind(a.kind) && b.kind === "space" && b.spacePolygon) {
-      seg = localPathInPolygon(
-        portalOnSpace(a.point, b.spacePolygon, b.spaceHoles),
+    } else if (isPortalKind(a.kind) && b.kind === "space" && b.space) {
+      seg = localPathInSpace(
+        portalOnSpace(a.point, b.space.polygon, b.space.holes),
         b.point,
-        b.spacePolygon,
-        b.spaceHoles,
+        b.space,
+        footprints,
       );
     } else if (isPortalKind(a.kind) && isPortalKind(b.kind) && mid) {
-      seg = localPathInPolygon(
+      seg = localPathInSpace(
         portalOnSpace(a.point, mid.polygon, mid.holes),
         portalOnSpace(b.point, mid.polygon, mid.holes),
-        mid.polygon,
-        mid.holes,
+        mid,
+        footprints,
       );
     } else if (
       a.kind === "space" &&
       b.kind === "space" &&
-      a.spacePolygon &&
-      a.spacePolygon === b.spacePolygon
+      a.space &&
+      a.space === b.space
     ) {
-      seg = localPathInPolygon(a.point, b.point, a.spacePolygon, a.spaceHoles);
+      seg = localPathInSpace(a.point, b.point, a.space, footprints);
     } else {
       // Last resort: should be rare once openings are inserted for space↔space.
       incomplete = true;
