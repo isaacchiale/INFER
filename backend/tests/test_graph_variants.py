@@ -774,6 +774,62 @@ def test_adjacent_rooms_are_not_nested_parents():
     assert all(not n.nested_parent for n in geo.nodes)
 
 
+def test_nested_child_sharing_parent_walls_is_still_detected():
+    """
+    Child flush in the parent's corner shares two walls, so three of its four
+    corners sit exactly on the parent outline where the ray cast is ambiguous.
+    It must still count as nested.
+    """
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:PARENT", kind="space", global_id="PARENT", storey_global_id="L1"),
+            GraphNode(id="space:FLUSH", kind="space", global_id="FLUSH", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("PARENT", "L1", 0, 0, 20, 10),
+            _box_space("FLUSH", "L1", 0, 0, 5, 5),
+        ],
+        doors=[],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    by_id = {n.id: n for n in geo.nodes}
+    assert by_id["space:PARENT"].nested_parent is True
+    assert by_id["space:FLUSH"].nested_parent is False
+
+
+def test_rooms_sharing_one_wall_are_not_nested_parents():
+    """Flush neighbours (no gap) must not flag each other once vertices inset."""
+    ifc = ConnectivityGraph(
+        model_id="m1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", 0, 0, 4, 4),
+            _box_space("B", "L1", 4, 0, 9, 4),
+        ],
+        doors=[],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    assert all(not n.nested_parent for n in geo.nodes)
+
+
 def test_space_in_parent_hole_is_not_nested_child():
     """Donut corridor: lift in the courtyard hole must not flag the corridor."""
     ifc = ConnectivityGraph(
@@ -1059,6 +1115,107 @@ def test_wall_opening_still_carves_sealed_wall():
     opening_edges = [e for e in geo.edges if e.method == "geom_opening_space"]
     assert len(opening_edges) == 1
     assert {opening_edges[0].source, opening_edges[0].target} == {"space:A", "space:B"}
+
+
+def _void_box(x0: float, y0: float, x1: float, y1: float) -> list[Point2D]:
+    return [
+        Point2D(x=x0, y=y0),
+        Point2D(x=x1, y=y0),
+        Point2D(x=x1, y=y1),
+        Point2D(x=x0, y=y1),
+    ]
+
+
+def test_wall_profile_void_does_not_carve_sealed_wall():
+    """
+    Revit exports a wall's own profile void as an IfcOpeningElement hosted by
+    that wall. It is large in both plan directions, so it is not a doorway.
+    """
+    footprints = _sealed_pair_footprints(
+        OpeningPortal(
+            global_id="O_PROFILE",
+            name="Basic Wall:VS-11:2294996",
+            storey_global_id="L1",
+            point=Point2D(x=4.1, y=2.0),
+            incomplete=False,
+            method="ifc_mesh_xy_centroid",
+            host_global_id="W1",
+            host_is_wall=True,
+            polygon=_void_box(3.0, 0.0, 5.2, 4.0),
+            sill_z=0.0,
+            head_z=2.9,
+        )
+    )
+    geo = build_geometry_graph(_SEALED_PAIR_IFC, footprints)
+    assert not any(e.method == "geom_opening_space" for e in geo.edges)
+
+
+def test_measured_doorway_void_carves_sealed_wall():
+    """A void thin across the wall and tall enough to walk through still heals."""
+    footprints = _sealed_pair_footprints(
+        OpeningPortal(
+            global_id="O_DOOR",
+            name="doorway",
+            storey_global_id="L1",
+            point=Point2D(x=4.1, y=2.0),
+            incomplete=False,
+            method="ifc_mesh_xy_centroid",
+            host_global_id="W1",
+            host_is_wall=True,
+            polygon=_void_box(3.98, 1.55, 4.22, 2.45),
+            sill_z=0.0,
+            head_z=2.1,
+        )
+    )
+    geo = build_geometry_graph(_SEALED_PAIR_IFC, footprints)
+    opening_edges = [e for e in geo.edges if e.method == "geom_opening_space"]
+    assert len(opening_edges) == 1
+    assert {opening_edges[0].source, opening_edges[0].target} == {"space:A", "space:B"}
+
+
+def test_low_void_does_not_carve_sealed_wall():
+    """A duct penetration is door-shaped in plan but far too short to walk."""
+    footprints = _sealed_pair_footprints(
+        OpeningPortal(
+            global_id="O_DUCT",
+            name="duct penetration",
+            storey_global_id="L1",
+            point=Point2D(x=4.1, y=2.0),
+            incomplete=False,
+            method="ifc_mesh_xy_centroid",
+            host_global_id="W1",
+            host_is_wall=True,
+            polygon=_void_box(3.98, 1.55, 4.22, 2.45),
+            sill_z=2.4,
+            head_z=2.7,
+        )
+    )
+    geo = build_geometry_graph(_SEALED_PAIR_IFC, footprints)
+    assert not any(e.method == "geom_opening_space" for e in geo.edges)
+
+
+def test_void_carves_its_own_width_not_a_fixed_radius():
+    """
+    A slot too narrow to walk through must not open the wall. The fixed carve
+    radius used to clear ~1.1m of frontage regardless of the void's real size.
+    """
+    footprints = _sealed_pair_footprints(
+        OpeningPortal(
+            global_id="O_SLOT",
+            name="narrow slot",
+            storey_global_id="L1",
+            point=Point2D(x=4.1, y=2.0),
+            incomplete=False,
+            method="ifc_mesh_xy_centroid",
+            host_global_id="W1",
+            host_is_wall=True,
+            polygon=_void_box(3.98, 1.875, 4.22, 2.125),
+            sill_z=0.0,
+            head_z=2.1,
+        )
+    )
+    geo = build_geometry_graph(_SEALED_PAIR_IFC, footprints)
+    assert not any(e.method == "geom_opening_space" for e in geo.edges)
 
 
 def test_opening_heal_skips_door_filled_pair_already_door_linked():

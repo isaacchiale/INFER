@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from copy import deepcopy
+from dataclasses import dataclass, field
 
 from app.schemas.footprints import (
     FootprintsDocument,
@@ -22,6 +23,8 @@ STAIR_INTERSECT_EPS = 1e-4
 # Nested-parent detection (geometry variant highlight only — no removal yet).
 NESTED_CHILD_VERTEX_IN_PARENT = 0.85
 NESTED_CHILD_AREA_RATIO_MAX = 0.98
+# Step child corners off the parent outline before the in/out test (shared walls).
+NESTED_VERTEX_INSET_M = 0.05
 
 
 def _normalize_excluded_node_ids(raw: Iterable[str] | None) -> set[str]:
@@ -277,8 +280,18 @@ MIN_INTERFACE_LEN_M = 0.5
 MIN_CLEAR_SPAN_M = 0.7
 # Mid-strip point is "in wall" if inside wall poly or within this distance.
 WALL_HIT_TOL_M = 0.08
-# Carve this radius around opening/door portals as clear (voids often missing from wall mesh).
+# Carve this radius around a portal whose plan extent is unknown (doors, and
+# openings from footprints built before plan hulls were recorded).
 VOID_CARVE_RADIUS_M = 0.55
+# Slack around a measured void, for sampling granularity only. Kept to half a
+# sample step: the distance test is isotropic, so slack widens the carve along
+# the wall too, and a generous value would re-inflate narrow voids.
+VOID_CARVE_SLACK_M = 0.06
+# A doorway is thin across the wall. A void this thick in its narrow direction
+# is a wall-profile void or shaft, not something to punch through a partition.
+VOID_MAX_THICKNESS_M = 0.8
+# Below this clear height a void is a duct hole, hatch or window band.
+VOID_MIN_CLEAR_HEIGHT_M = 1.8
 # Split disjoint contact patches when outline-arc gap exceeds this (≈3 sample steps).
 FRONTAGE_CHAIN_GAP_M = 0.4
 
@@ -552,15 +565,92 @@ def _clear_span_portal(
     )
 
 
+@dataclass(frozen=True)
+class VoidPortal:
+    """A place where a wall strip may be punched clear again."""
+
+    point: Point2D
+    # Plan hull of the void. Empty when the extent was never measured, in which
+    # case `radius` is the fallback reach.
+    polygon: list[Point2D] = field(default_factory=list)
+    radius: float = VOID_CARVE_RADIUS_M
+
+    def covers(self, p: Point2D) -> bool:
+        if len(self.polygon) >= 3:
+            if _point_in_polygon(p.x, p.y, self.polygon):
+                return True
+            return _dist_point_to_polygon(p.x, p.y, self.polygon) <= VOID_CARVE_SLACK_M
+        return math.hypot(p.x - self.point.x, p.y - self.point.y) <= self.radius
+
+    def reach(self) -> float:
+        """Max distance from `point` at which this portal can carve."""
+        if len(self.polygon) >= 3:
+            far = max(
+                math.hypot(v.x - self.point.x, v.y - self.point.y)
+                for v in self.polygon
+            )
+            return far + VOID_CARVE_SLACK_M
+        return self.radius
+
+
+def _caliper_widths(polygon: list[Point2D]) -> tuple[float, float]:
+    """
+    (min, max) width of a convex ring over all edge-normal directions.
+
+    Rotation invariant, unlike an axis-aligned box: a doorway in a diagonal
+    wall is still thin across the wall and long along it.
+    """
+    n = len(polygon)
+    if n < 3:
+        return 0.0, 0.0
+    widths: list[float] = []
+    for i in range(n):
+        a = polygon[i]
+        b = polygon[(i + 1) % n]
+        ex, ey = b.x - a.x, b.y - a.y
+        elen = math.hypot(ex, ey)
+        if elen < 1e-9:
+            continue
+        nx, ny = -ey / elen, ex / elen
+        projections = [p.x * nx + p.y * ny for p in polygon]
+        widths.append(max(projections) - min(projections))
+    if not widths:
+        return 0.0, 0.0
+    return min(widths), max(widths)
+
+
+def _void_is_walkable_shape(opening: OpeningPortal) -> bool:
+    """
+    Whether a void looks like something a person walks through.
+
+    Revit exports wall-profile voids, shafts, duct penetrations and window
+    bands as ``IfcOpeningElement`` alongside real doorways. Both tests are
+    purely local to the void: sill height above the floor would be the natural
+    third test, but it needs the opening's storey and that elevation to both be
+    right, and openings inherit the storey of a wall that may span floors —
+    which rejected real ground-floor doors.
+
+    Footprints built before extents were recorded have neither hull nor Z, and
+    stay eligible so cached models keep their existing edges.
+    """
+    if len(opening.polygon) >= 3:
+        thickness, _length = _caliper_widths(opening.polygon)
+        if thickness > VOID_MAX_THICKNESS_M:
+            return False
+    if opening.sill_z is not None and opening.head_z is not None:
+        if opening.head_z - opening.sill_z < VOID_MIN_CLEAR_HEIGHT_M:
+            return False
+    return True
+
+
 def _carve_voids(
     samples: list[tuple[float, Point2D]],
     blocked: list[bool],
-    portals: list[Point2D],
-    radius: float = VOID_CARVE_RADIUS_M,
+    portals: list[VoidPortal],
 ) -> None:
     for i, (_t, mid) in enumerate(samples):
         for portal in portals:
-            if math.hypot(mid.x - portal.x, mid.y - portal.y) <= radius:
+            if portal.covers(mid):
                 blocked[i] = False
                 break
 
@@ -569,7 +659,7 @@ def _strip_clear_portal(
     a: SpaceFootprint,
     b: SpaceFootprint,
     walls: list[WallFootprint],
-    void_portals: list[Point2D],
+    void_portals: list[VoidPortal],
 ) -> Point2D | None:
     """
     If the facing strip has a clear span ≥ MIN_CLEAR_SPAN_M after wall hits and
@@ -594,7 +684,7 @@ def _strip_is_walkable(
     a: SpaceFootprint,
     b: SpaceFootprint,
     walls: list[WallFootprint],
-    void_portals: list[Point2D],
+    void_portals: list[VoidPortal],
 ) -> bool:
     """True when the facing strip has a clear span ≥ MIN_CLEAR_SPAN_M."""
     return _strip_clear_portal(a, b, walls, void_portals) is not None
@@ -819,18 +909,50 @@ def _point_in_space_footprint(x: float, y: float, space: SpaceFootprint) -> bool
     return True
 
 
+def _inset_toward_centroid(
+    polygon: list[Point2D], inset: float = NESTED_VERTEX_INSET_M
+) -> list[Point2D]:
+    """
+    Ring vertices pulled slightly toward their own centroid.
+
+    A nested room shares walls with its parent, so its corners land exactly on
+    the parent outline, where the ray cast decides in/out by ray direction
+    rather than geometry. Stepping off the boundary first makes the test read
+    the room's interior. Rooms that merely abut the parent step outward from
+    it, so they stay excluded.
+    """
+    n = len(polygon)
+    if n < 3:
+        return list(polygon)
+    cx = sum(p.x for p in polygon) / n
+    cy = sum(p.y for p in polygon) / n
+    out: list[Point2D] = []
+    for p in polygon:
+        dx = cx - p.x
+        dy = cy - p.y
+        d = math.hypot(dx, dy)
+        if d < 1e-9:
+            out.append(p)
+            continue
+        # Never step past the centroid on very small rooms.
+        t = min(inset, d * 0.5) / d
+        out.append(Point2D(x=p.x + dx * t, y=p.y + dy * t))
+    return out
+
+
 def _footprint_contained(child: SpaceFootprint, parent: SpaceFootprint) -> bool:
     """
     True when child sits in the parent's walkable footprint: centroid and most
-    ring vertices in parent exterior-minus-holes. Spaces that only sit in a
-    parent hole (courtyard / lift shaft) are not nested children.
+    ring vertices in parent exterior-minus-holes. Vertices are inset first —
+    a shared wall otherwise puts them on the parent outline, where the ray cast
+    is ambiguous. Spaces that only sit in a parent hole (courtyard / lift
+    shaft) are not nested children.
     """
     if len(child.polygon) < 3 or len(parent.polygon) < 3:
         return False
-    inside = sum(
-        1 for p in child.polygon if _point_in_space_footprint(p.x, p.y, parent)
-    )
-    if inside / len(child.polygon) < NESTED_CHILD_VERTEX_IN_PARENT:
+    probes = _inset_toward_centroid(child.polygon)
+    inside = sum(1 for p in probes if _point_in_space_footprint(p.x, p.y, parent))
+    if inside / len(probes) < NESTED_CHILD_VERTEX_IN_PARENT:
         return False
     cx = sum(p.x for p in child.polygon) / len(child.polygon)
     cy = sum(p.y for p in child.polygon) / len(child.polygon)
@@ -1211,9 +1333,9 @@ def reheal_geometry_graph(
 
 def _void_portals_on_storey(
     footprints: FootprintsDocument, storey_gid: str
-) -> list[Point2D]:
+) -> list[VoidPortal]:
     """
-    Opening/door points that may carve wall strips on this storey only.
+    Opening/door portals that may carve wall strips on this storey only.
 
     Multi-storey IFCs often stack identical door XY on every floor; carving with
     another storey's door would punch false holes through sealed attic walls.
@@ -1221,8 +1343,12 @@ def _void_portals_on_storey(
     Only openings that void an ``IfcWall`` may carve: Revit exports cabinet and
     countertop recesses as ``IfcOpeningElement`` too, and those stand against
     walls, so trusting them punches doorways through solid partitions.
+
+    Wall-hosted is not enough on its own — the same entity covers wall-profile
+    voids, shafts and duct holes — so voids must also be door-shaped, and they
+    carve their own measured extent rather than a fixed radius.
     """
-    voids: list[Point2D] = []
+    voids: list[VoidPortal] = []
     for opening in footprints.openings or []:
         if opening.incomplete or opening.point is None:
             continue
@@ -1230,13 +1356,15 @@ def _void_portals_on_storey(
             continue
         if opening.storey_global_id and opening.storey_global_id != storey_gid:
             continue
-        voids.append(opening.point)
+        if not _void_is_walkable_shape(opening):
+            continue
+        voids.append(VoidPortal(point=opening.point, polygon=list(opening.polygon)))
     for door in footprints.doors or []:
         if door.incomplete or door.point is None:
             continue
         if door.storey_global_id and door.storey_global_id != storey_gid:
             continue
-        voids.append(door.point)
+        voids.append(VoidPortal(point=door.point))
     return voids
 
 
@@ -1310,13 +1438,13 @@ def _heal_space_space_interfaces(
                 if length < MIN_INTERFACE_LEN_M:
                     continue
 
-                local_voids: list[Point2D] = []
+                local_voids: list[VoidPortal] = []
                 for portal in void_portals:
-                    da = _dist_point_to_polygon(portal.x, portal.y, a.polygon)
-                    db = _dist_point_to_polygon(portal.x, portal.y, b.polygon)
-                    if da <= INTERFACE_GAP_MAX_M + VOID_CARVE_RADIUS_M and db <= (
-                        INTERFACE_GAP_MAX_M + VOID_CARVE_RADIUS_M
-                    ):
+                    p = portal.point
+                    limit = INTERFACE_GAP_MAX_M + portal.reach()
+                    da = _dist_point_to_polygon(p.x, p.y, a.polygon)
+                    db = _dist_point_to_polygon(p.x, p.y, b.polygon)
+                    if da <= limit and db <= limit:
                         local_voids.append(portal)
 
                 strip_portal = _strip_clear_portal(a, b, storey_walls, local_voids)

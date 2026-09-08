@@ -520,9 +520,27 @@ def _opening_fill_gids(ifc, opening) -> tuple[str | None, str | None]:
     return door_gid, window_gid
 
 
+def _opening_extent(opening) -> tuple[list[Point2D], float | None, float | None]:
+    """
+    Plan hull and Z range of the void mesh.
+
+    Callers use these to tell a doorway (long, thin, floor to head height) from
+    a wall-profile void or a duct hole, both of which are also exported as
+    ``IfcOpeningElement``.
+    """
+    verts, _faces = _mesh_verts_faces(opening)
+    if not verts:
+        return [], None, None
+    hull_xy = _convex_hull(_unique_xy((v[0], v[1]) for v in verts))
+    polygon = _to_points(hull_xy) if len(hull_xy) >= 3 else []
+    zs = [v[2] for v in verts]
+    return polygon, min(zs), max(zs)
+
+
 def _opening_portal(ifc, opening) -> OpeningPortal:
     host = _opening_host(ifc, opening)
     door_gid, window_gid = _opening_fill_gids(ifc, opening)
+    polygon, sill_z, head_z = _opening_extent(opening)
     common = {
         "global_id": _gid(opening),
         "name": _name(opening),
@@ -533,6 +551,9 @@ def _opening_portal(ifc, opening) -> OpeningPortal:
         "filled_by_window_global_id": window_gid,
         "host_global_id": _gid(host) if host is not None else None,
         "host_is_wall": host is not None and host.is_a("IfcWall"),
+        "polygon": polygon,
+        "sill_z": sill_z,
+        "head_z": head_z,
     }
 
     xy = _mesh_xy_points(opening)

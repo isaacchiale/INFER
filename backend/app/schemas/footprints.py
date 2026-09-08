@@ -73,6 +73,13 @@ class OpeningPortal(BaseModel):
     """True when the voided element is an IfcWall. Revit exports furniture
     recesses (cabinets, counters) as openings too; those void the furniture."""
     host_is_wall: bool = False
+    """Plan hull of the void (XY metres). Empty when unmeasured — a doorway is
+    long and thin, a wall-profile void is large in both directions."""
+    polygon: list[Point2D] = Field(default_factory=list)
+    """Lowest / highest Z of the void (metres). None when unmeasured. Used to
+    reject duct holes, hatches and window bands that nobody can walk through."""
+    sill_z: float | None = None
+    head_z: float | None = None
 
 
 class StairFootprint(BaseModel):

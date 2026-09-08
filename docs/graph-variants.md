@@ -54,6 +54,24 @@ pair of spaces that share a facing frontage:
    exports cabinet and countertop recesses as ``IfcOpeningElement`` hosted by
    ``IfcFurnishingElement``, and those stand against walls, so trusting them
    punches doorways through solid partitions.
+
+   Wall-hosted is not sufficient on its own — the same entity also covers wall
+   profile voids, shafts and duct penetrations — so a void must additionally be
+   **door-shaped**, and it carves **its own measured plan extent** rather than a
+   fixed radius. Openings therefore record a plan hull plus ``sill_z``/``head_z``:
+
+   - thicker than ~0.8 m across its narrow direction (rotation-invariant
+     caliper width) ⇒ wall-profile void or shaft, never carves;
+   - clear height under ~1.8 m ⇒ duct hole, hatch or window band, never carves;
+   - otherwise carve exactly the samples its hull covers, so a 0.3 m slot cannot
+     open a 1.1 m doorway.
+
+   Sill height above the floor is deliberately *not* tested: openings inherit the
+   storey of a wall that may span floors, which rejected real ground-floor doors.
+
+   Footprints built before extents were recorded have no hull or Z and stay
+   eligible on the fixed radius, so cached models keep their existing edges until
+   re-extracted.
 4. If a contiguous **clear span** ≥ ~0.7 m remains along the shared outline
    (room-A boundary order, not the line between space centroids) → emit
    inferred ``space_space`` (``geom_opening_space``). Partial wall + opening
@@ -71,7 +89,10 @@ Nested parents (geometry)
 Spaces whose **walkable** footprints contain smaller same-storey spaces are
 flagged ``nested_parent: true`` on the geometry graph. Containment uses
 exterior-minus-holes: a lift/courtyard space sitting only in a parent hole
-does **not** count. The Graph Viewer draws a red circle around flagged nodes.
+does **not** count. Child ring vertices are stepped slightly toward the child
+centroid before the in/out test — a nested room shares walls with its parent,
+so its corners otherwise land exactly on the parent outline where the ray cast
+is ambiguous. The Graph Viewer draws a red circle around flagged nodes.
 Right-click remove recalculates geometry healing for that node's storey
 without it (other storeys keep their inferred edges).
 
