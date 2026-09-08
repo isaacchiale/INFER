@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { Move3d, PersonStanding } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { buildRouteTubePolylines } from "@/lib/route-tube";
 import type { HazardZone, Route } from "@/types/infer";
 import { useInfer } from "@/state/infer-store";
 import {
@@ -62,7 +63,26 @@ function InferModelViewportImpl({
     setViewerCameraPose,
     setViewerModelBounds,
     setViewerCoordInverse,
+    connectivityRoute,
+    footprintsDocument,
+    connectivityGraph,
+    viewerCoordInverse,
+    viewerModelBounds,
   } = useInfer();
+
+  // Latest route inputs for post-load tube restore (avoid reloading IFC on route change).
+  const tubeInputRef = useRef({
+    connectivityRoute,
+    footprintsDocument,
+    connectivityGraph,
+    viewerCoordInverse,
+  });
+  tubeInputRef.current = {
+    connectivityRoute,
+    footprintsDocument,
+    connectivityGraph,
+    viewerCoordInverse,
+  };
 
   const switchNavMode = (mode: NavMode) => {
     setNavMode(mode);
@@ -142,7 +162,25 @@ function InferModelViewportImpl({
     void (async () => {
       try {
         // Pass a copy so the store buffer stays intact for the floorplan pane.
-        await runtimeRef.current?.loadBuffer(pendingIfc.buffer.slice(), pendingIfc.name);
+        await runtimeRef.current?.loadBuffer(
+          pendingIfc.buffer.slice(),
+          pendingIfc.name,
+        );
+        if (cancelled) return;
+        setNavMode("orbit");
+        // loadBuffer clears meshes; restore tube using post-load bounds/matrix.
+        const rt = runtimeRef.current;
+        if (!rt) return;
+        const input = tubeInputRef.current;
+        const polylines = buildRouteTubePolylines({
+          route: input.connectivityRoute,
+          footprints: input.footprintsDocument,
+          graph: input.connectivityGraph,
+          modelBounds: rt.getModelBounds(),
+          coordInverse:
+            rt.getCoordinationInverse() ?? input.viewerCoordInverse,
+        });
+        rt.setRouteTube(polylines);
       } catch (error) {
         if (!cancelled) {
           setViewerStatus(
@@ -156,6 +194,31 @@ function InferModelViewportImpl({
       cancelled = true;
     };
   }, [pendingIfc, engineReady, setViewerStatus]);
+
+  // Full-route geometric path → blue tube(s) on every storey the route uses.
+  useEffect(() => {
+    const runtime = runtimeRef.current;
+    if (!engineReady || !runtime) return;
+    // Prefer live runtime bounds/matrix — React state can lag after load.
+    const bounds = runtime.getModelBounds() ?? viewerModelBounds;
+    const coordInverse =
+      runtime.getCoordinationInverse() ?? viewerCoordInverse;
+    const polylines = buildRouteTubePolylines({
+      route: connectivityRoute,
+      footprints: footprintsDocument,
+      graph: connectivityGraph,
+      modelBounds: bounds,
+      coordInverse,
+    });
+    runtime.setRouteTube(polylines);
+  }, [
+    engineReady,
+    connectivityRoute,
+    footprintsDocument,
+    connectivityGraph,
+    viewerModelBounds,
+    viewerCoordInverse,
+  ]);
 
   // Keep route/hazard props available for future overlays (not drawn by placeholder).
   void highlightedRoute;

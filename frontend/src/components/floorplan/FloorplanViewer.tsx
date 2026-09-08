@@ -2,11 +2,16 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { Check, ChevronDown, Maximize2 } from "lucide-react";
 import { useInfer } from "@/state/infer-store";
 import { continuousPolylineForStorey } from "@/lib/geometric-path";
-import { normalizeElevationsToMetres } from "@/lib/storey-elevations";
+import {
+  elevationsForVerticalRemap,
+  normalizeElevationsToMetres,
+} from "@/lib/storey-elevations";
 import {
   ifcElevationFromThree,
+  planHeadingFromThree,
   planTranslationFromCentres,
   pointInBuildingBounds,
+  resolveCoordAxisFrame,
   storeyIdForElevation,
   threeAabbCentre,
   threeToIfcPlanResolved,
@@ -161,6 +166,25 @@ function spaceForRouteNode(
   return space;
 }
 
+/** Google-Maps-style facing cone in plan metres (Y-up world, no SVG rotate). */
+function headingConePath(
+  x: number,
+  y: number,
+  heading: number,
+  length: number,
+  halfAngleRad: number,
+): string {
+  const steps = 16;
+  const a0 = heading - halfAngleRad;
+  const a1 = heading + halfAngleRad;
+  let d = `M ${x} ${y}`;
+  for (let i = 0; i <= steps; i++) {
+    const a = a0 + ((a1 - a0) * i) / steps;
+    d += ` L ${x + Math.cos(a) * length} ${y + Math.sin(a) * length}`;
+  }
+  return `${d} Z`;
+}
+
 /** Screen-pixel drag → camera pan (viewBox units, Y-up inside the flip group). */
 function clientDeltaToPan(
   svg: SVGSVGElement,
@@ -275,23 +299,78 @@ export function FloorplanViewer({ className }: { className?: string }) {
         s.elevation != null && Number.isFinite(s.elevation),
     );
     if (!withElev.length) return [] as Array<{ global_id: string; elevation: number }>;
-    const { metres } = normalizeElevationsToMetres(withElev.map((s) => s.elevation));
+    const modelHeightM = viewerModelBounds
+      ? viewerModelBounds.maxY - viewerModelBounds.minY
+      : undefined;
+    const { metres } = normalizeElevationsToMetres(
+      withElev.map((s) => s.elevation),
+      modelHeightM,
+    );
     return withElev.map((s, i) => ({
       global_id: s.global_id,
       elevation: metres[i]!,
     }));
-  }, [footprintsDocument]);
+  }, [footprintsDocument, viewerModelBounds]);
+
+  /** Elevations for Three↔IFC height remap (exclude empty datum storeys). */
+  const remapElevationsM = useMemo(() => {
+    if (!footprintsDocument) return storeysMetres.map((s) => s.elevation);
+    return elevationsForVerticalRemap(
+      storeysMetres,
+      footprintsDocument.spaces
+        .filter((s) => !s.incomplete && s.polygon.length >= 3)
+        .map((s) => s.storey_global_id),
+    );
+  }, [footprintsDocument, storeysMetres]);
+
+  /**
+   * Axis reading for coordination-undone coords, resolved once per model.
+   * Deciding this per camera sample let the dot flip frames mid-walk.
+   */
+  const coordAxisFrame = useMemo(
+    () =>
+      resolveCoordAxisFrame(
+        viewerCoordInverse ?? null,
+        viewerModelBounds ?? null,
+        footprintBoundsTight,
+      ),
+    [viewerCoordInverse, viewerModelBounds, footprintBoundsTight],
+  );
+
+  /**
+   * Whether camera height comes from the coordination matrix or from the mesh
+   * remap. Model-level so it cannot change as the camera moves.
+   */
+  const useMeshElevation = useMemo(() => {
+    if (!viewerCoordInverse || viewerCoordInverse.length < 16) return true;
+    if (!viewerModelBounds || !storeysMetres.length) return false;
+    // Probe the mesh floor and ceiling through the matrix; if neither lands in
+    // a storey band, the matrix Z pack is unusable for this model.
+    const probes = [viewerModelBounds.minY, viewerModelBounds.maxY].map((y) =>
+      threeToIfcPlanResolved(
+        { x: 0, y, z: 0 },
+        viewerCoordInverse,
+        null,
+        coordAxisFrame,
+      ).elevation,
+    );
+    return !probes.some((e) => storeyIdForElevation(storeysMetres, e) != null);
+  }, [viewerCoordInverse, viewerModelBounds, storeysMetres, coordAxisFrame]);
 
   /**
    * 3D camera as plan blue dot: only when inside the building footprint AABB
    * and on the storey currently shown (or any storey when viewing "all").
    *
-   * Prefer Fragments coordination-matrix inverse (exact origin undo). Fall back
-   * to centre translation when that matrix is missing/identity.
+   * Every mapping choice (axis frame, elevation source, centre delta) is
+   * resolved per model, never per camera sample — otherwise the dot flips
+   * interpretation partway across a floor and vanishes.
    */
   const cameraDotInfo = useMemo(() => {
     if (!viewerCameraPose) {
-      return { dot: null as { x: number; y: number } | null, reason: "no 3D pose yet" };
+      return {
+        dot: null as { x: number; y: number; heading: number } | null,
+        reason: "no 3D pose yet",
+      };
     }
     if (!buildingBounds) {
       return { dot: null, reason: "no footprints" };
@@ -310,34 +389,33 @@ export function FloorplanViewer({ className }: { className?: string }) {
       viewerModelBounds &&
       footprintBoundsTight
     ) {
-      const delta = planTranslationFromCentres(
+      const d = planTranslationFromCentres(
         threeAabbCentre(viewerModelBounds),
         footprintBoundsTight,
       );
       planDeltaRef.current =
-        Math.abs(delta.x) < 0.05 && Math.abs(delta.y) < 0.05 ? { x: 0, y: 0 } : delta;
+        Math.abs(d.x) < 0.05 && Math.abs(d.y) < 0.05 ? { x: 0, y: 0 } : d;
     }
 
     if (!hasCoord && planDeltaRef.current == null && footprintBoundsTight) {
       return { dot: null, reason: "calibrating plan ↔ 3D origin…" };
     }
 
-    const mapped = threeToIfcPlanResolved(
-      three,
-      hasCoord ? viewerCoordInverse : null,
-      hasCoord ? null : planDeltaRef.current,
-    );
-    // When coordination matrix restores absolute IFC Z, prefer that elevation;
-    // otherwise lift Three Y onto storey elevations.
-    const elev = hasCoord
-      ? mapped.elevation
-      : ifcElevationFromThree(
-          mapped.elevation,
-          viewerModelBounds,
-          storeysMetres.map((s) => s.elevation),
-        );
+    const coord = hasCoord ? viewerCoordInverse : null;
+    const delta = hasCoord ? null : planDeltaRef.current;
+    const mapped = threeToIfcPlanResolved(three, coord, delta, coordAxisFrame);
+
+    const meshElev =
+      viewerModelBounds && remapElevationsM.length
+        ? ifcElevationFromThree(three.y, viewerModelBounds, remapElevationsM)
+        : null;
+
+    const elev =
+      useMeshElevation && meshElev != null ? meshElev : mapped.elevation;
+
     const plan = { x: mapped.x, y: mapped.y, elevation: elev };
-    if (!pointInBuildingBounds(plan.x, plan.y, buildingBounds, 2)) {
+
+    if (!pointInBuildingBounds(plan.x, plan.y, buildingBounds)) {
       return {
         dot: null,
         reason: "outside building — fly inside to see the camera dot",
@@ -354,7 +432,15 @@ export function FloorplanViewer({ className }: { className?: string }) {
         };
       }
     }
-    return { dot: { x: plan.x, y: plan.y }, reason: "tracking" };
+    const forward = viewerCameraPose.forward ?? { x: 0, y: 0, z: -1 };
+    const heading = planHeadingFromThree(
+      three,
+      forward,
+      coord,
+      delta,
+      coordAxisFrame,
+    );
+    return { dot: { x: plan.x, y: plan.y, heading }, reason: "tracking" };
   }, [
     viewerCameraPose,
     viewerModelBounds,
@@ -362,6 +448,9 @@ export function FloorplanViewer({ className }: { className?: string }) {
     buildingBounds,
     footprintBoundsTight,
     storeysMetres,
+    remapElevationsM,
+    coordAxisFrame,
+    useMeshElevation,
     activeStoreyId,
     storeys,
   ]);
@@ -800,20 +889,34 @@ export function FloorplanViewer({ className }: { className?: string }) {
 
                   {cameraDot ? (
                     <g>
+                      {/* Facing cone first (under the disc), Google Maps style. */}
+                      <path
+                        d={headingConePath(
+                          cameraDot.x,
+                          cameraDot.y,
+                          cameraDot.heading,
+                          cameraR * 4.2,
+                          (58 * Math.PI) / 180,
+                        )}
+                        fill="rgba(66,133,244,0.38)"
+                        stroke="none"
+                      />
+                      {/* White halo */}
                       <circle
                         cx={cameraDot.x}
                         cy={cameraDot.y}
-                        r={cameraR * 1.65}
-                        fill="rgba(37,99,235,0.25)"
+                        r={cameraR * 1.35}
+                        fill="#ffffff"
                         stroke="none"
                       />
+                      {/* Blue disc */}
                       <circle
                         cx={cameraDot.x}
                         cy={cameraDot.y}
                         r={cameraR}
-                        fill="#2563eb"
-                        stroke="#eff6ff"
-                        strokeWidth={doorStroke * 1.5}
+                        fill="#4285F4"
+                        stroke="#ffffff"
+                        strokeWidth={doorStroke * 0.6}
                       >
                         <title>3D camera</title>
                       </circle>

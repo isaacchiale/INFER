@@ -35,6 +35,16 @@ export type ThatOpenRuntime = {
   } | null;
   /** Inverse coordination matrix (column-major); undoes COORDINATE_TO_ORIGIN. */
   getCoordinationInverse: () => number[] | null;
+  /**
+   * Show or clear the active-storey route tube (Three world metres).
+   * Pass null or fewer than 2 points to remove.
+   */
+  setRouteTube: (
+    polylines:
+      | Array<Array<{ x: number; y: number; z: number }>>
+      | Array<{ x: number; y: number; z: number }>
+      | null,
+  ) => void;
   dispose: () => void;
 };
 
@@ -54,6 +64,14 @@ type CoordInverseFn = (m: number[] | null) => void;
 
 const FLY_SPEED = 12; // metres per second
 const FLY_FAST_MULT = 2.5; // hold Ctrl to go faster
+
+/** Route tube radius (metres). */
+const ROUTE_TUBE_RADIUS_M = 0.3;
+/** Tube radial / tubular segments. */
+const ROUTE_TUBE_RADIAL = 8;
+const ROUTE_TUBE_TUBULAR_PER_M = 4;
+/** Cap polyline density for TubeGeometry cost. */
+const ROUTE_TUBE_MAX_POINTS = 400;
 
 export async function createThatOpenRuntime(
   container: HTMLElement,
@@ -95,9 +113,92 @@ export async function createThatOpenRuntime(
   const fragments = components.get(OBC.FragmentsManager);
   fragments.init("/worker.mjs");
 
+  const routeTubeGroup = new THREE.Group();
+  routeTubeGroup.name = "infer-route-tube";
+  world.scene.three.add(routeTubeGroup);
+
+  const clearRouteTubeMeshes = () => {
+    while (routeTubeGroup.children.length) {
+      const child = routeTubeGroup.children[0]!;
+      routeTubeGroup.remove(child);
+      if (child instanceof THREE.Mesh) {
+        child.geometry.dispose();
+        const mat = child.material;
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else mat.dispose();
+      }
+    }
+  };
+
+  const addTubeMesh = (points: Array<{ x: number; y: number; z: number }>) => {
+    const simplified = simplifyPolyline(points, ROUTE_TUBE_MAX_POINTS);
+    if (simplified.length < 2) return;
+
+    const curvePts = simplified.map((p) => new THREE.Vector3(p.x, p.y, p.z));
+    // Deduplicate consecutive identical points (breaks CatmullRom).
+    const unique: THREE.Vector3[] = [curvePts[0]!];
+    for (let i = 1; i < curvePts.length; i++) {
+      if (unique[unique.length - 1]!.distanceToSquared(curvePts[i]!) > 1e-8) {
+        unique.push(curvePts[i]!);
+      }
+    }
+    if (unique.length < 2) return;
+
+    const curve = new THREE.CatmullRomCurve3(unique, false, "centripetal");
+    const length = Math.max(curve.getLength(), 0.5);
+    const tubular = Math.max(
+      12,
+      Math.min(800, Math.ceil(length * ROUTE_TUBE_TUBULAR_PER_M)),
+    );
+    const geometry = new THREE.TubeGeometry(
+      curve,
+      tubular,
+      ROUTE_TUBE_RADIUS_M,
+      ROUTE_TUBE_RADIAL,
+      false,
+    );
+    const material = new THREE.MeshBasicMaterial({
+      color: 0x3b82f6,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.renderOrder = 10;
+    mesh.frustumCulled = false;
+    mesh.name = "infer-route-tube-mesh";
+    routeTubeGroup.add(mesh);
+  };
+
+  const setRouteTube = (
+    polylines:
+      | Array<Array<{ x: number; y: number; z: number }>>
+      | Array<{ x: number; y: number; z: number }>
+      | null,
+  ) => {
+    clearRouteTubeMeshes();
+    if (!polylines || polylines.length === 0) {
+      routeTubeGroup.visible = false;
+      return;
+    }
+    // Legacy: flat point list → one tube. New: one tube per storey polyline.
+    const segments: Array<Array<{ x: number; y: number; z: number }>> =
+      Array.isArray(polylines[0]) &&
+      typeof (polylines[0] as { x?: number }).x !== "number"
+        ? (polylines as Array<Array<{ x: number; y: number; z: number }>>)
+        : [polylines as Array<{ x: number; y: number; z: number }>];
+
+    for (const pts of segments) {
+      if (pts.length >= 2) addTubeMesh(pts);
+    }
+    routeTubeGroup.visible = routeTubeGroup.children.length > 0;
+  };
+
   const scratchPos = new THREE.Vector3();
   /** Plan-dot feet: only WASD / placement update this in Fly (not mouse-look). */
   const feetWorld = new THREE.Vector3();
+  const scratchFwd = new THREE.Vector3();
+  const scratchEye = new THREE.Vector3();
   let feetValid = false;
   let lastPosePublishMs = 0;
   // Declared early — readStandingPosition / fly helpers close over this binding.
@@ -151,6 +252,34 @@ export async function createThatOpenRuntime(
     controls.getPosition(out);
   };
 
+  const readLookDirection = (out: THREE.Vector3) => {
+    // camera-controls spherical angles stay valid even when FP distance ≈ 0
+    // (eye≈target), where getWorldDirection / eye→target become unstable.
+    const az = (controls as { azimuthAngle: number }).azimuthAngle;
+    const pol = (controls as { polarAngle: number }).polarAngle;
+    if (Number.isFinite(az) && Number.isFinite(pol)) {
+      // Camera sits at target + offset; look = −offset.
+      out.set(
+        -Math.sin(pol) * Math.sin(az),
+        -Math.cos(pol),
+        -Math.sin(pol) * Math.cos(az),
+      );
+      if (out.lengthSq() > 1e-10) {
+        out.normalize();
+        return;
+      }
+    }
+    controls.getPosition(scratchEye);
+    controls.getTarget(out);
+    out.sub(scratchEye);
+    if (out.lengthSq() > 1e-10) {
+      out.normalize();
+      return;
+    }
+    world.camera.three.updateMatrixWorld(true);
+    world.camera.three.getWorldDirection(out);
+  };
+
   const publishCameraPose = (force = false) => {
     if (!onCameraPose) return;
     const now = performance.now();
@@ -158,18 +287,31 @@ export async function createThatOpenRuntime(
     if (!force && now - lastPosePublishMs < 50) return;
     lastPosePublishMs = now;
     readStandingPosition(scratchPos);
-    onCameraPose(threePositionToPlanPose(scratchPos));
+    readLookDirection(scratchFwd);
+    onCameraPose(
+      threePositionToPlanPose(scratchPos, {
+        x: scratchFwd.x,
+        y: scratchFwd.y,
+        z: scratchFwd.z,
+      }),
+    );
   };
 
   const getCameraPose = (): ViewerCameraPose => {
     readStandingPosition(scratchPos);
-    return threePositionToPlanPose(scratchPos);
+    readLookDirection(scratchFwd);
+    return threePositionToPlanPose(scratchPos, {
+      x: scratchFwd.x,
+      y: scratchFwd.y,
+      z: scratchFwd.z,
+    });
   };
 
   world.camera.controls.addEventListener("update", () => {
     fragments.core.update();
-    // Fly: mouse-look must not republish — feet only move via WASD / placement.
-    if (navMode !== "fly") publishCameraPose();
+    // Always republish (throttled): Fly feet stay pinned via readStandingPosition,
+    // but look direction must update the floorplan heading arrow.
+    publishCameraPose();
   });
 
   /** Building pivot for Orbit — always the loaded model AABB centre. */
@@ -221,8 +363,8 @@ export async function createThatOpenRuntime(
     });
   };
 
-  /** Re-lock orbit pivot to building centre; keep eye position when sane. */
-  const reanchorOrbitToBuilding = async () => {
+  /** Re-lock orbit pivot to building centre; optionally force a full-building framing. */
+  const reanchorOrbitToBuilding = async (forceFit = false) => {
     refreshOrbitTarget();
     const target = hasOrbitTarget ? orbitTarget.clone() : new THREE.Vector3(0, 0, 0);
     const pos = new THREE.Vector3();
@@ -230,7 +372,8 @@ export async function createThatOpenRuntime(
 
     const dist = pos.distanceTo(target);
     // After FirstPerson, camera is often on top of the old FP target — push out.
-    if (!Number.isFinite(dist) || dist < 3) {
+    // On model load, always frame the full AABB.
+    if (forceFit || !Number.isFinite(dist) || dist < 3) {
       pos.set(
         target.x + orbitRadius * 0.7,
         target.y + orbitRadius * 0.45,
@@ -378,6 +521,7 @@ export async function createThatOpenRuntime(
   onStatus?.("3D viewer ready.", "info");
 
   const clear = async () => {
+    clearRouteTubeMeshes();
     for (const id of [...fragments.list.keys()]) {
       await fragments.core.disposeModel(id);
     }
@@ -461,44 +605,49 @@ export async function createThatOpenRuntime(
       refreshOrbitTarget();
 
       // Exact origin undo for georeferenced IFCs (Trapelo etc.).
+      // Retry a few frames — matrix is sometimes not ready on the first tick.
       publishCoordInverse(null);
-      for (const [, model] of fragments.list) {
-        try {
-          const getMatrix = (
-            model as {
-              getCoordinationMatrix?: () => Promise<THREE.Matrix4> | THREE.Matrix4;
+      for (let attempt = 0; attempt < 6; attempt++) {
+        let published = false;
+        for (const [, model] of fragments.list) {
+          try {
+            const getMatrix = (
+              model as {
+                getCoordinationMatrix?: () => Promise<THREE.Matrix4> | THREE.Matrix4;
+              }
+            ).getCoordinationMatrix;
+            if (!getMatrix) continue;
+            const matrix = await Promise.resolve(getMatrix.call(model));
+            if (matrix && (matrix as THREE.Matrix4).isMatrix4) {
+              const mat = matrix as THREE.Matrix4;
+              const inv = mat.clone().invert();
+              const t = new THREE.Vector3();
+              const s = new THREE.Vector3();
+              const q = new THREE.Quaternion();
+              inv.decompose(t, q, s);
+              const tFwd = new THREE.Vector3();
+              mat.decompose(tFwd, q, s);
+              const shifted = t.lengthSq() > 1e-4 || tFwd.lengthSq() > 1e-4;
+              if (shifted) {
+                publishCoordInverse(inv.toArray());
+                published = true;
+                break;
+              }
             }
-          ).getCoordinationMatrix;
-          if (!getMatrix) continue;
-          const matrix = await Promise.resolve(getMatrix.call(model));
-          if (matrix && (matrix as THREE.Matrix4).isMatrix4) {
-            const inv = (matrix as THREE.Matrix4).clone().invert();
-            // Identity / near-identity ⇒ no useful coordination shift.
-            const t = new THREE.Vector3();
-            const s = new THREE.Vector3();
-            const q = new THREE.Quaternion();
-            inv.decompose(t, q, s);
-            const shifted = t.lengthSq() > 1e-6;
-            publishCoordInverse(shifted ? inv.toArray() : null);
-            break;
+          } catch {
+            /* model may not expose coordinates yet */
           }
-        } catch {
-          /* model may not expose coordinates yet */
         }
+        if (published) break;
+        await new Promise<void>((r) => requestAnimationFrame(() => r()));
+        refreshOrbitTarget();
       }
 
-      if (navMode === "fly") {
-        const eye = new THREE.Vector3();
-        controls.getPosition(eye);
-        world.camera.set("FirstPerson");
-        hardenFirstPersonControls();
-        await controls.moveTo(eye.x, eye.y, eye.z, false);
-        hardenFirstPersonControls();
-        captureFeetFromControls();
-      } else {
-        world.camera.set("Orbit");
-        await reanchorOrbitToBuilding();
-      }
+      // Always land in Orbit with the full building framed (ignore prior Fly).
+      stopFlyLoop();
+      navMode = "orbit";
+      world.camera.set("Orbit");
+      await reanchorOrbitToBuilding(true);
       publishCameraPose(true);
       onStatus?.(`3D view loaded: ${name}`, "info");
     },
@@ -518,8 +667,10 @@ export async function createThatOpenRuntime(
         : null,
     getCoordinationInverse: () =>
       coordinationInverse ? [...coordinationInverse] : null,
+    setRouteTube,
     dispose() {
       stopFlyLoop();
+      clearRouteTubeMeshes();
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("resize", resize);
@@ -545,6 +696,19 @@ function applyOrbitControlTuning(controls: {
   controls.minDistance = 1;
   controls.maxDistance = 10_000;
   controls.truckSpeed = 2;
+}
+
+/** Keep endpoints; stride-sample the middle when over maxCount. */
+function simplifyPolyline<T>(points: T[], maxCount: number): T[] {
+  if (points.length <= maxCount) return points;
+  const out: T[] = [];
+  const last = points.length - 1;
+  const step = last / (maxCount - 1);
+  for (let i = 0; i < maxCount; i++) {
+    const idx = i === maxCount - 1 ? last : Math.round(i * step);
+    out.push(points[idx]!);
+  }
+  return out;
 }
 
 function waitForSize(el: HTMLElement, timeoutMs = 4000): Promise<void> {
