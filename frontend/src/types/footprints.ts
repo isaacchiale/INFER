@@ -38,6 +38,15 @@ export type OpeningPortal = {
   method: "ifc_mesh_xy_centroid" | "ifc_object_placement" | "unavailable";
   filled_by_door_global_id?: string | null;
   filled_by_window_global_id?: string | null;
+  /** Element voided via IfcRelVoidsElement. */
+  host_global_id?: string | null;
+  /** False for furniture recesses (cabinets, counters), which are openings too. */
+  host_is_wall?: boolean;
+  /** Plan hull of the void. A doorway is long and thin; a wall-profile void is large both ways. */
+  polygon?: Point2D[];
+  /** Lowest / highest Z of the void, metres. */
+  sill_z?: number | null;
+  head_z?: number | null;
 };
 
 export type StairFootprint = {

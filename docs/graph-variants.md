@@ -96,5 +96,23 @@ is ambiguous. The Graph Viewer draws a red circle around flagged nodes.
 Right-click remove recalculates geometry healing for that node's storey
 without it (other storeys keep their inferred edges).
 
+Route overlay — doorway voids in the local A*
+---------------------------------------------
+The plan/3D route overlay runs a clearance-weighted A* inside each space, with
+overlapping ``IfcWall`` hulls as solid obstacles. Those hulls fill in their own
+doorways, exactly as in the strip test above, so a space whose footprint spans
+a wall — a hall and its landing exported as one ``IfcSpace`` — reads as two
+disconnected halves and A* has nowhere to go.
+
+Wall cells are therefore re-opened where a **wall-hosted, non-window** opening
+records a plan hull that is thin on one axis (≲ 1 m), matched by plan position
+rather than storey, since door and opening storey tags are unreliable in
+exported models. Carving can only re-enable cells the space polygon already
+claims as walkable, so it cannot invent a route outside the room.
+
+When A* still cannot reach the goal, the overlay retries against the space
+polygon alone instead of falling back to a straight chord — the polygon is the
+authority on walkability, and a chord draws visibly through walls.
+
 Source IFC is never modified.
 """

@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   buildGeometricPath,
   continuousPolylineForStorey,
+  doorwayVoidsInSpace,
   localPathInPolygon,
   pathSegmentsForStorey,
   pointInPolygon,
@@ -616,6 +617,153 @@ describe("geometric-path", () => {
       assert.ok(
         path.segments.some((s) => s.points.length > 2),
         `expected A* segment for ${route.join(">")}`,
+      );
+    }
+  });
+
+  /**
+   * Room 10×10 split across the middle by one of its own walls, with a 0.9 m
+   * doorway in it. The wall footprint is a solid hull that fills that doorway
+   * in, so without carving A* is stranded and the overlay draws a chord.
+   */
+  const severedRoom = (opening: Record<string, unknown> | null): FootprintsDocument => ({
+    schema_version: "1.0",
+    model_id: "t",
+    coordinate_system: "ifc_world_xy_metres",
+    storeys: [{ global_id: "S1", name: "L1", elevation: 0 }],
+    spaces: [
+      {
+        global_id: "R",
+        name: "R",
+        storey_global_id: "S1",
+        polygon: [
+          { x: 0, y: 0 },
+          { x: 10, y: 0 },
+          { x: 10, y: 10 },
+          { x: 0, y: 10 },
+        ],
+        incomplete: false,
+        method: "ifc_mesh_xy_outline",
+      },
+    ],
+    doors: [
+      {
+        global_id: "D_IN",
+        name: "In",
+        storey_global_id: "S1",
+        point: { x: 0, y: 2 },
+        segment: [],
+        incomplete: false,
+        method: "ifc_object_placement",
+      },
+      {
+        global_id: "D_OUT",
+        name: "Out",
+        storey_global_id: "S1",
+        point: { x: 0, y: 8 },
+        segment: [],
+        incomplete: false,
+        method: "ifc_object_placement",
+      },
+    ],
+    stairs: [],
+    walls: [
+      {
+        global_id: "W",
+        name: "Divider",
+        storey_global_id: "S1",
+        polygon: [
+          { x: 0, y: 4.94 },
+          { x: 10, y: 4.94 },
+          { x: 10, y: 5.06 },
+          { x: 0, y: 5.06 },
+        ],
+        incomplete: false,
+        method: "ifc_mesh_xy_hull",
+      },
+    ],
+    openings: opening ? [opening] : [],
+  } as unknown as FootprintsDocument);
+
+  const doorwayOpening = {
+    global_id: "O_DOOR",
+    name: "Doorway",
+    storey_global_id: "S1",
+    point: { x: 6.5, y: 5 },
+    segment: [],
+    incomplete: false,
+    method: "ifc_mesh_xy_centroid",
+    filled_by_door_global_id: "D_MID",
+    filled_by_window_global_id: null,
+    host_global_id: "W",
+    host_is_wall: true,
+    polygon: [
+      { x: 6.05, y: 4.94 },
+      { x: 6.95, y: 4.94 },
+      { x: 6.95, y: 5.06 },
+      { x: 6.05, y: 5.06 },
+    ],
+    sill_z: 0,
+    head_z: 2.03,
+  };
+
+  it("doorwayVoidsInSpace keeps wall doorways and drops furniture recesses", () => {
+    const fp = severedRoom(doorwayOpening);
+    assert.equal(doorwayVoidsInSpace(fp, fp.spaces[0]!).length, 1);
+
+    // Same void, but it recesses a cabinet rather than a wall.
+    const furniture = severedRoom({ ...doorwayOpening, host_is_wall: false });
+    assert.equal(doorwayVoidsInSpace(furniture, furniture.spaces[0]!).length, 0);
+
+    // Wall-profile void: large on both plan axes, so not a doorway.
+    const wallProfile = severedRoom({
+      ...doorwayOpening,
+      polygon: [
+        { x: 1, y: 1 },
+        { x: 9, y: 1 },
+        { x: 9, y: 9 },
+        { x: 1, y: 9 },
+      ],
+    });
+    assert.equal(doorwayVoidsInSpace(wallProfile, wallProfile.spaces[0]!).length, 0);
+  });
+
+  it("walks the doorway when a wall hull severs a room in two", () => {
+    const fp = severedRoom(doorwayOpening);
+    const line = continuousPolylineForStorey(
+      ["space:R", "door:D_IN", "space:R", "door:D_OUT"],
+      fp,
+      "S1",
+    );
+    assert.ok(line.points.length > 20, "expected A* density, not a chord");
+
+    const crossings = [];
+    for (let i = 1; i < line.points.length; i++) {
+      const a = line.points[i - 1]!;
+      const b = line.points[i]!;
+      if (a.y > 5 === b.y > 5) continue;
+      crossings.push(a.x + ((5 - a.y) / (b.y - a.y)) * (b.x - a.x));
+    }
+    assert.ok(crossings.length > 0, "path never crossed the divider");
+    for (const x of crossings) {
+      assert.ok(x > 6 && x < 7, `crossed the wall at x=${x}, not via the doorway`);
+    }
+  });
+
+  it("stays inside the space when a sealed wall leaves A* nowhere to go", () => {
+    // No opening at all: the divider is solid. The overlay must not answer with
+    // a straight chord that leaves the room.
+    const fp = severedRoom(null);
+    const line = continuousPolylineForStorey(
+      ["space:R", "door:D_IN", "space:R", "door:D_OUT"],
+      fp,
+      "S1",
+    );
+    assert.ok(line.points.length > 20, "expected a routed path, not a chord");
+    for (const p of line.points) {
+      assert.ok(
+        pointInSpace(p.x, p.y, fp.spaces[0]!.polygon),
+        `path left the space at ${p.x},${p.y}`,
       );
     }
   });

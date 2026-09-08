@@ -198,9 +198,22 @@ function pointInObstacles(x: number, y: number, obstacles?: Point2D[][]): boolea
 }
 
 /**
+ * Inside a doorway void, or within the same half-cell used to thicken
+ * obstacles below. Without that tolerance a doorway thinner than the grid
+ * would have its approach cells blocked and re-seal the gap.
+ */
+function inDoorwayVoid(x: number, y: number, voids?: Point2D[][]): boolean {
+  if (!voids?.length) return false;
+  if (pointInObstacles(x, y, voids)) return true;
+  return distToRings(x, y, voids) <= LOCAL_PATH_CELL_M * 0.45;
+}
+
+/**
  * Clearance for A*: min distance to space boundary/holes and to interior
  * wall footprints. Cells inside an obstacle are blocked (−1). Thin walls
- * that miss the cell centre still block when within ~half a cell.
+ * that miss the cell centre still block when within ~half a cell. Doorway
+ * voids re-open wall cells, because wall footprints are solid hulls that fill
+ * in their own openings.
  */
 function cellClearance(
   x: number,
@@ -208,17 +221,18 @@ function cellClearance(
   exterior: Point2D[],
   holes?: Point2D[][],
   obstacles?: Point2D[][],
+  doorwayVoids?: Point2D[][],
 ): number {
   if (!pointInSpace(x, y, exterior, holes)) return -1;
-  if (pointInObstacles(x, y, obstacles)) return -1;
-  let d = distToSpaceWall(x, y, exterior, holes);
-  if (obstacles?.length) {
-    const dObs = distToRings(x, y, obstacles);
-    // Half-cell thicken so 0.1 m grid can't slip through sub-cell walls.
-    if (dObs < LOCAL_PATH_CELL_M * 0.45) return -1;
-    d = Math.min(d, dObs);
-  }
-  return d;
+  const dSpace = distToSpaceWall(x, y, exterior, holes);
+  if (!obstacles?.length) return dSpace;
+
+  const dObs = distToRings(x, y, obstacles);
+  // Half-cell thicken so 0.1 m grid can't slip through sub-cell walls.
+  const blocked =
+    pointInObstacles(x, y, obstacles) || dObs < LOCAL_PATH_CELL_M * 0.45;
+  if (blocked) return inDoorwayVoid(x, y, doorwayVoids) ? dSpace : -1;
+  return Math.min(dSpace, dObs);
 }
 
 /**
@@ -278,6 +292,54 @@ function wallOverlapsSpace(wall: WallFootprint, space: SpaceFootprint): boolean 
   return false;
 }
 
+/** Widest a doorway void may be across its thin axis (metres). */
+const DOORWAY_VOID_MAX_THICKNESS_M = 1.0;
+
+/**
+ * Doorway voids overlapping a space, in plan.
+ *
+ * Wall footprints are solid hulls, so a doorway inside a space's own walls
+ * reads as a barrier and can strand A* on one side of the room. Storey tags on
+ * openings are unreliable in exported models, so voids are matched by plan
+ * position instead; that is safe because carving only re-opens cells the space
+ * polygon already claims as walkable.
+ */
+export function doorwayVoidsInSpace(
+  footprints: FootprintsDocument,
+  space: SpaceFootprint,
+): Point2D[][] {
+  if (space.polygon.length < 3) return [];
+
+  const out: Point2D[][] = [];
+  for (const opening of footprints.openings ?? []) {
+    if (!opening.host_is_wall || opening.filled_by_window_global_id) continue;
+    const poly = opening.polygon ?? [];
+    if (poly.length < 3) continue;
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of poly) {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+    // Wall-profile voids are large on both axes; a doorway is thin on one.
+    if (Math.min(maxX - minX, maxY - minY) > DOORWAY_VOID_MAX_THICKNESS_M) {
+      continue;
+    }
+
+    const touches =
+      poly.some((p) => pointInSpace(p.x, p.y, space.polygon, space.holes)) ||
+      (opening.point != null &&
+        pointInSpace(opening.point.x, opening.point.y, space.polygon, space.holes));
+    if (touches) out.push(poly);
+  }
+  return out;
+}
+
 /** Local A* inside a space, including overlapping IfcWall obstacles. */
 function localPathInSpace(
   start: Point2D,
@@ -285,13 +347,20 @@ function localPathInSpace(
   space: SpaceFootprint,
   footprints: FootprintsDocument,
 ): Point2D[] {
-  return localPathInPolygon(
+  const obstacles = wallsOverlappingSpace(footprints, space);
+  const attempt = astarInPolygon(
     start,
     goal,
     space.polygon,
     space.holes,
-    wallsOverlappingSpace(footprints, space),
+    obstacles,
+    doorwayVoidsInSpace(footprints, space),
   );
+  if (attempt.reached || !obstacles.length) return attempt.points;
+  // Wall hulls cut the room in two and no doorway explains the split. The
+  // space polygon is the authority on where you may walk, so retry against it
+  // alone rather than emit a chord straight through the walls.
+  return astarInPolygon(start, goal, space.polygon, space.holes).points;
 }
 
 /** Fixed cell size for in-polygon A* (metres). */
@@ -321,10 +390,24 @@ export function localPathInPolygon(
   polygon: Point2D[],
   holes?: Point2D[][],
   obstacles?: Point2D[][],
+  doorwayVoids?: Point2D[][],
 ): Point2D[] {
+  return astarInPolygon(start, goal, polygon, holes, obstacles, doorwayVoids)
+    .points;
+}
+
+/** A* worker. `reached` is false when the goal cell was unreachable. */
+function astarInPolygon(
+  start: Point2D,
+  goal: Point2D,
+  polygon: Point2D[],
+  holes?: Point2D[][],
+  obstacles?: Point2D[][],
+  doorwayVoids?: Point2D[][],
+): { points: Point2D[]; reached: boolean } {
   const s = clampPointToSpace(start, polygon, holes);
   const g = clampPointToSpace(goal, polygon, holes);
-  if (dist(s, g) < 1e-6) return [s];
+  if (dist(s, g) < 1e-6) return { points: [s], reached: true };
 
   let minX = Infinity;
   let minY = Infinity;
@@ -353,7 +436,7 @@ export function localPathInPolygon(
     for (let c = 0; c < cols; c++) {
       const idx = r * cols + c;
       const p = cellCentre(c, r);
-      const d = cellClearance(p.x, p.y, polygon, holes, obstacles);
+      const d = cellClearance(p.x, p.y, polygon, holes, obstacles, doorwayVoids);
       clearance[idx] = d;
       if (d > maxClear) maxClear = d;
     }
@@ -444,7 +527,7 @@ export function localPathInPolygon(
       }
       raw.push(s);
       raw.reverse();
-      return raw;
+      return { points: raw, reached: true };
     }
     for (const [dc, dr] of neighbors) {
       const nc = cur.c + dc!;
@@ -476,7 +559,7 @@ export function localPathInPolygon(
     }
   }
 
-  return [s, g];
+  return { points: [s, g], reached: false };
 }
 
 function spaceByGid(doc: FootprintsDocument, gid: string): SpaceFootprint | undefined {
