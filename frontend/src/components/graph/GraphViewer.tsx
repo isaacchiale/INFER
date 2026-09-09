@@ -1,16 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronDown, Maximize2 } from "lucide-react";
-import { computeRoute } from "@/api/routing";
 import {
   buildModelGraph,
-  computeModelRoute,
   getModelGraph,
   rehealModelGraph,
 } from "@/api/models";
 import { useInfer } from "@/state/infer-store";
 import { useAppTheme } from "@/hooks/use-app-theme";
 import {
-  blockedEdgeIdsFromExclusions,
   buildGraphLayout,
   deriveStoreyBands,
   graphPalette,
@@ -20,7 +17,7 @@ import {
   type CytoscapeRuntime,
 } from "@/viewer/cytoscape-runtime";
 import type { GraphLayout } from "@/lib/graph-layout";
-import type { GraphNode, GraphVariant, RouteResult } from "@/types/graph";
+import type { GraphVariant } from "@/types/graph";
 import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
@@ -41,13 +38,6 @@ const VARIANT_OPTIONS: { id: GraphVariant; label: string }[] = [
 const GLASS =
   "rounded-[6px] border border-border bg-background/90 shadow-sm backdrop-blur-[2px]";
 
-function shortLabel(node: GraphNode): string {
-  if (node.code) return node.code;
-  const name = (node.name || "").trim();
-  if (name) return name.length > 24 ? `${name.slice(0, 22)}…` : name;
-  return node.global_id.slice(0, 8);
-}
-
 export function GraphViewer({ className }: { className?: string }) {
   const {
     connectivityGraph,
@@ -60,6 +50,8 @@ export function GraphViewer({ className }: { className?: string }) {
     toggleExcludedNode,
     excludedEdgeIds,
     toggleExcludedEdge,
+    selectedElementIds,
+    selectElement,
   } = useInfer();
   const theme = useAppTheme();
   const graph = connectivityGraph;
@@ -107,11 +99,12 @@ export function GraphViewer({ className }: { className?: string }) {
   const layoutRef = useRef<GraphLayout | null>(null);
   const themeRef = useRef(theme);
   const fittedGraphIdRef = useRef<string | null>(null);
-  const clickMode = useRef<"origin" | "destination">("origin");
   const toggleExcludedRef = useRef(toggleExcludedNode);
   toggleExcludedRef.current = toggleExcludedNode;
   const toggleExcludedEdgeRef = useRef(toggleExcludedEdge);
   toggleExcludedEdgeRef.current = toggleExcludedEdge;
+  const selectElementRef = useRef(selectElement);
+  selectElementRef.current = selectElement;
   const [engineReady, setEngineReady] = useState(false);
   const [cyError, setCyError] = useState<string | null>(null);
 
@@ -119,19 +112,13 @@ export function GraphViewer({ className }: { className?: string }) {
   themeRef.current = theme;
   const graphId = graph ? `${graph.model_id}:${variant}` : null;
 
-  const spaceOptions = useMemo(
+  const spaceCount = useMemo(
     () =>
       graph
-        ? graph.nodes.filter((n) => n.kind === "space" && !excludedNodeIds.has(n.id))
-        : [],
+        ? graph.nodes.filter((n) => n.kind === "space" && !excludedNodeIds.has(n.id)).length
+        : 0,
     [graph, excludedNodeIds],
   );
-
-  const [origin, setOrigin] = useState("");
-  const [destination, setDestination] = useState("");
-  const [route, setRoute] = useState<RouteResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
 
   // Sync dropdown when a new model is ingested (defaults to IFC).
   useEffect(() => {
@@ -167,30 +154,10 @@ export function GraphViewer({ className }: { className?: string }) {
     }
   };
 
+  // Room→room routing moved to floorplan navmesh click-to-click.
   useEffect(() => {
-    if (!graph) {
-      setOrigin("");
-      setDestination("");
-      setRoute(null);
-      setConnectivityRoute(null);
-      setError(null);
-      return;
-    }
-    const spaces = graph.nodes.filter(
-      (n) => n.kind === "space" && !excludedNodeIds.has(n.id),
-    );
-    if (!spaces.length) {
-      setOrigin("");
-      setDestination("");
-      return;
-    }
-    const ids = new Set(spaces.map((s) => s.id));
-    const first = spaces[0];
-    const second = spaces[Math.min(1, spaces.length - 1)];
-    if (!first || !second) return;
-    setOrigin((prev) => (prev && ids.has(prev) ? prev : first.id));
-    setDestination((prev) => (prev && ids.has(prev) ? prev : second.id));
-  }, [graph, excludedNodeIds, setConnectivityRoute]);
+    setConnectivityRoute(null);
+  }, [graphId, setConnectivityRoute]);
 
   const liveRehealRef = useRef(false);
   useEffect(() => {
@@ -226,83 +193,6 @@ export function GraphViewer({ className }: { className?: string }) {
     };
   }, [backendModelId, excludedNodeIds, graphSource, setConnectivityGraphOnly, variant]);
 
-  const blockedNodeIds = useMemo(() => [...excludedNodeIds], [excludedNodeIds]);
-  // Display edges use synthetic viz-door ids; expand to real space_door / space_space ids.
-  const blockedEdgeIds = useMemo(
-    () => (graph ? blockedEdgeIdsFromExclusions(graph, excludedEdgeIds) : [...excludedEdgeIds]),
-    [graph, excludedEdgeIds],
-  );
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!graph || !origin || !destination) {
-      setRoute(null);
-      setConnectivityRoute(null);
-      setBusy(false);
-      return;
-    }
-    if (excludedNodeIds.has(origin) || excludedNodeIds.has(destination)) {
-      setRoute(null);
-      setConnectivityRoute(null);
-      setBusy(false);
-      return;
-    }
-    setBusy(true);
-    setError(null);
-
-    const run =
-      backendModelId && graphSource === "model"
-        ? computeModelRoute(backendModelId, {
-            origin_node_id: origin,
-            destination_node_id: destination,
-            graph_variant: variant,
-            blocked_node_ids: blockedNodeIds,
-            blocked_edge_ids: blockedEdgeIds,
-            graph: variant === "geometry" ? graph : undefined,
-          })
-        : computeRoute({
-            origin_node_id: origin,
-            destination_node_id: destination,
-            graph,
-            blocked_node_ids: blockedNodeIds,
-            blocked_edge_ids: blockedEdgeIds,
-          });
-
-    void run
-      .then((result) => {
-        if (!cancelled) {
-          setRoute(result);
-          setConnectivityRoute(result);
-        }
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          setRoute(null);
-          setConnectivityRoute(null);
-          setError(err instanceof Error ? err.message : "Route failed");
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setBusy(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    origin,
-    destination,
-    backendModelId,
-    graphSource,
-    graph,
-    variant,
-    blockedNodeIds,
-    blockedEdgeIds,
-    excludedNodeIds,
-    excludedEdgeIds,
-    setConnectivityRoute,
-  ]);
-
   // Boot Cytoscape once — same pattern as InferModelViewport / That Open.
   useEffect(() => {
     const host = hostRef.current;
@@ -319,13 +209,7 @@ export function GraphViewer({ className }: { className?: string }) {
         }
         runtimeRef.current = runtime;
         runtime.onSpaceTap((id) => {
-          if (clickMode.current === "origin") {
-            setOrigin(id);
-            clickMode.current = "destination";
-          } else {
-            setDestination(id);
-            clickMode.current = "origin";
-          }
+          selectElementRef.current(id);
         });
         runtime.onNodeCxtTap((id) => {
           toggleExcludedRef.current(id);
@@ -376,19 +260,11 @@ export function GraphViewer({ className }: { className?: string }) {
 
   useEffect(() => {
     if (!engineReady || !runtimeRef.current) return;
-    const pathNodes = route?.found ? (route.node_ids ?? []) : [];
-    const pathEdgeIds = route?.found ? (route.edge_ids ?? []) : [];
-    const selected = [origin, destination].filter(Boolean);
-    runtimeRef.current.setPath(pathNodes, pathEdgeIds, selected);
-  }, [route, origin, destination, engineReady]);
-
-  const pathLabel = !hasGraph
-    ? EMPTY
-    : busy
-      ? "…"
-      : route?.found
-        ? `${route.hops} hops`
-        : EMPTY;
+    const selected = selectedElementIds.filter(
+      (id) => id.startsWith("space:") && !excludedNodeIds.has(id),
+    );
+    runtimeRef.current.setPath([], [], selected);
+  }, [selectedElementIds, excludedNodeIds, engineReady]);
 
   return (
     <div
@@ -407,7 +283,7 @@ export function GraphViewer({ className }: { className?: string }) {
             overscrollBehavior: "contain",
           }}
           aria-label="Connectivity graph canvas"
-          title="Left-click space: set origin/destination. Right-click node: remove or restore. Right-click link: disable or restore (dashed)."
+          title="Left-click space: select/deselect (multi). Right-click node: remove or restore. Right-click link: disable or restore (dashed). Pathfinding: right-click start/end on the floorplan navmesh."
         />
         <div className="pointer-events-none absolute left-2 top-2 z-50 flex flex-col items-start gap-1.5">
           <DropdownMenu>
@@ -518,69 +394,22 @@ export function GraphViewer({ className }: { className?: string }) {
       </div>
 
       <div className="relative z-10 shrink-0 border-t border-border bg-surface-raised px-3 py-2 text-[12px]">
-        <div className="mb-2 flex items-center justify-between gap-2">
-          <p className="min-w-0 truncate text-[11px] text-amber-500">
-            {!error && route && !route.found && hasGraph ? "No path exists" : null}
-          </p>
+        <div className="mb-1 flex items-center justify-end gap-2">
           <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
             {graphSource === "model"
               ? `Live · ${VARIANT_OPTIONS.find((o) => o.id === variant)?.label ?? variant}`
               : EMPTY}
           </span>
         </div>
-        <div className="mb-2 flex flex-wrap gap-x-3 gap-y-1">
+        <div className="flex flex-wrap gap-x-3 gap-y-1">
           <span>
             Topology Size:{" "}
-            <strong>{hasGraph ? `${spaceOptions.length} rooms` : EMPTY}</strong>
+            <strong>{hasGraph ? `${spaceCount} rooms` : EMPTY}</strong>
           </span>
           <span>
             Network Connections:{" "}
             <strong>{hasGraph ? `${graph!.edges.length} links` : EMPTY}</strong>
           </span>
-          <span className={cn(route?.found && "text-primary")}>
-            Shortest Path: <strong>{pathLabel}</strong>
-          </span>
-        </div>
-        <div className="flex flex-wrap items-end gap-2">
-          <label className="grid gap-0.5 text-[11px] text-muted-foreground">
-            Start Room
-            <select
-              className="h-8 min-w-[120px] max-w-[200px] rounded-md border border-input bg-background px-2 text-xs text-foreground disabled:opacity-60"
-              value={origin}
-              disabled={!spaceOptions.length}
-              onChange={(e) => setOrigin(e.target.value)}
-            >
-              {!spaceOptions.length ? (
-                <option value="">{EMPTY}</option>
-              ) : (
-                spaceOptions.map((n) => (
-                  <option key={n.id} value={n.id}>
-                    {shortLabel(n)}
-                  </option>
-                ))
-              )}
-            </select>
-          </label>
-          <label className="grid gap-0.5 text-[11px] text-muted-foreground">
-            Target Room
-            <select
-              className="h-8 min-w-[120px] max-w-[200px] rounded-md border border-input bg-background px-2 text-xs text-foreground disabled:opacity-60"
-              value={destination}
-              disabled={!spaceOptions.length}
-              onChange={(e) => setDestination(e.target.value)}
-            >
-              {!spaceOptions.length ? (
-                <option value="">{EMPTY}</option>
-              ) : (
-                spaceOptions.map((n) => (
-                  <option key={n.id} value={n.id}>
-                    {shortLabel(n)}
-                  </option>
-                ))
-              )}
-            </select>
-          </label>
-          {error && <p className="text-[11px] text-destructive">{error}</p>}
         </div>
       </div>
     </div>

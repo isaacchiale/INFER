@@ -18,12 +18,21 @@ import type {
 } from "@/types/infer";
 import type { ConnectivityGraph, RouteResult } from "@/types/graph";
 import type { EntitiesExtract } from "@/api/models";
-import type { FootprintsDocument } from "@/types/footprints";
+import type { FootprintsDocument, Point2D } from "@/types/footprints";
 import type { ViewerCameraPose, ThreeAabb, Mat4Elements } from "@/lib/viewer-camera-pose";
 
 export type WorkMode = "model" | "navigate" | "layers" | "validate" | "scenario";
 
 export type StoreyDisplayMode = "all" | "isolate" | "ghost" | "explode";
+
+/** Floorplan click-to-click route (pins + A* polyline). Survives IFC/navmesh mode toggles. */
+export type NavmeshRoute = {
+  storeyId: string;
+  start: Point2D;
+  end: Point2D | null;
+  /** Set when both pins exist and A* succeeded. */
+  points: Point2D[] | null;
+};
 
 export interface RouteRequest {
   origin: string;
@@ -118,6 +127,9 @@ interface InferState {
   footprintsDocument: FootprintsDocument | null;
   connectivityRoute: RouteResult | null;
   setConnectivityRoute: (route: RouteResult | null) => void;
+  /** Click-to-click navmesh path (floorplan + 3D tube). */
+  navmeshRoute: NavmeshRoute | null;
+  setNavmeshRoute: (route: NavmeshRoute | null) => void;
   /** Swap graph variant (IFC / geometry / topologic) without clearing entities/footprints. */
   setConnectivityGraphOnly: (graph: ConnectivityGraph) => void;
   /** Graph node ids temporarily removed from the live network (right-click toggle). */
@@ -179,6 +191,7 @@ export function InferProvider({ children }: { children: ReactNode }) {
   const [entitiesExtract, setEntitiesExtract] = useState<EntitiesExtract | null>(null);
   const [footprintsDocument, setFootprintsDocument] = useState<FootprintsDocument | null>(null);
   const [connectivityRoute, setConnectivityRoute] = useState<RouteResult | null>(null);
+  const [navmeshRoute, setNavmeshRoute] = useState<NavmeshRoute | null>(null);
   const [excludedNodeIds, setExcludedNodeIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -194,6 +207,10 @@ export function InferProvider({ children }: { children: ReactNode }) {
       else next.add(nodeId);
       return next;
     });
+    // Drop floorplan/graph highlight when the node is removed (or restored).
+    setSelectedElementIds((prev) =>
+      prev.includes(nodeId) ? prev.filter((id) => id !== nodeId) : prev,
+    );
   }, []);
 
   const clearExcludedNodes = useCallback(() => {
@@ -233,6 +250,7 @@ export function InferProvider({ children }: { children: ReactNode }) {
       setEntitiesExtract(payload.entities);
       setFootprintsDocument(payload.footprints ?? null);
       setConnectivityRoute(null);
+      setNavmeshRoute(null);
       setExcludedNodeIds(new Set());
       setExcludedEdgeIds(new Set());
       const firstStorey =
@@ -248,6 +266,7 @@ export function InferProvider({ children }: { children: ReactNode }) {
     setEntitiesExtract(null);
     setFootprintsDocument(null);
     setConnectivityRoute(null);
+    setNavmeshRoute(null);
     setExcludedNodeIds(new Set());
     setExcludedEdgeIds(new Set());
     setPendingIfc(null);
@@ -277,7 +296,13 @@ export function InferProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const selectElement = useCallback((id: string | null) => {
-    setSelectedElementIds(id ? [id] : []);
+    if (!id) {
+      setSelectedElementIds([]);
+      return;
+    }
+    setSelectedElementIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
   }, []);
 
   const updateRequest = useCallback((patch: Partial<RouteRequest>) => {
@@ -394,6 +419,8 @@ export function InferProvider({ children }: { children: ReactNode }) {
       footprintsDocument,
       connectivityRoute,
       setConnectivityRoute,
+      navmeshRoute,
+      setNavmeshRoute,
       setConnectivityGraphOnly,
       excludedNodeIds,
       toggleExcludedNode,
@@ -450,6 +477,7 @@ export function InferProvider({ children }: { children: ReactNode }) {
       entitiesExtract,
       footprintsDocument,
       connectivityRoute,
+      navmeshRoute,
       setConnectivityGraphOnly,
       excludedNodeIds,
       toggleExcludedNode,

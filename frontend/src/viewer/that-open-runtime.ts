@@ -17,11 +17,38 @@ export type ViewerStatusKind = "info" | "error" | "loading";
 
 export type NavMode = "orbit" | "fly";
 
+/** What the 3D pane draws: the IFC fragments model, or a portal navmesh. */
+export type GeometryDisplayMode = "ifc" | "navmesh";
+
+export type NavmeshThreeRegion = {
+  id: string;
+  /** Ring in Three metres (Y-up). */
+  vertices: Array<{ x: number; y: number; z: number }>;
+  holes?: Array<Array<{ x: number; y: number; z: number }>>;
+};
+
+export type NavmeshThreePortal = {
+  id: string;
+  kind: "door" | "space";
+  /** Door: false = IFC, true = geometry heal. */
+  inferred?: boolean;
+  point: { x: number; y: number; z: number };
+};
+
 export type ThatOpenRuntime = {
   loadBuffer: (buffer: Uint8Array, name: string) => Promise<void>;
   clear: () => Promise<void>;
   setNavMode: (mode: NavMode) => Promise<void>;
   getNavMode: () => NavMode;
+  setGeometryDisplayMode: (mode: GeometryDisplayMode) => void;
+  getGeometryDisplayMode: () => GeometryDisplayMode;
+  /**
+   * Replace the navmesh overlay (Three world metres). Pass null to clear.
+   * Callers hide/show the IFC model via {@link setGeometryDisplayMode}.
+   */
+  setNavmesh: (
+    data: { regions: NavmeshThreeRegion[]; portals: NavmeshThreePortal[] } | null,
+  ) => void;
   /** Latest camera pose in plan metres + elevation (Three Y-up → IFC XY). */
   getCameraPose: () => ViewerCameraPose;
   /** Loaded model AABB in Three metres, or null if empty. */
@@ -45,8 +72,23 @@ export type ThatOpenRuntime = {
       | Array<{ x: number; y: number; z: number }>
       | null,
   ) => void;
+  /**
+   * Clip / restore IFC geometry by a vertical band in Three.js world Y,
+   * or show the full building.
+   */
+  setStoreyFilter: (filter: StoreyFilter) => Promise<void>;
   dispose: () => void;
 };
+
+export type StoreyFilter =
+  | { kind: "all" }
+  | {
+      kind: "band";
+      /** Three.js world Y — geometry below this is clipped away. */
+      minY: number;
+      /** Three.js world Y — geometry above this is clipped away (cuts ceiling). */
+      maxY: number;
+    };
 
 type StatusFn = (message: string, kind?: ViewerStatusKind) => void;
 type CameraPoseFn = (pose: ViewerCameraPose) => void;
@@ -192,6 +234,255 @@ export async function createThatOpenRuntime(
       if (pts.length >= 2) addTubeMesh(pts);
     }
     routeTubeGroup.visible = routeTubeGroup.children.length > 0;
+  };
+
+  const navmeshGroup = new THREE.Group();
+  navmeshGroup.name = "infer-navmesh";
+  world.scene.three.add(navmeshGroup);
+
+  let geometryDisplayMode: GeometryDisplayMode = "ifc";
+  let storeyFilter: StoreyFilter = { kind: "all" };
+  const storeyClipPlanes: THREE.Plane[] = [
+    new THREE.Plane(),
+    new THREE.Plane(),
+  ];
+
+  const glRenderer = () =>
+    (world.renderer as { three?: THREE.WebGLRenderer } | null)?.three ?? null;
+
+  const applyMaterialClipping = (planes: THREE.Plane[]) => {
+    for (const [, model] of fragments.list) {
+      const obj = (model as { object?: THREE.Object3D }).object;
+      if (!obj) continue;
+      obj.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const mat of mats) {
+          if (!mat || typeof mat !== "object") continue;
+          const m = mat as THREE.Material & {
+            clippingPlanes?: THREE.Plane[];
+            clipShadows?: boolean;
+            needsUpdate?: boolean;
+          };
+          m.clippingPlanes = planes;
+          m.clipShadows = true;
+          m.needsUpdate = true;
+        }
+      });
+    }
+    // Future materials from Fragments LOD swaps.
+    try {
+      for (const [, material] of fragments.core.models.materials.list) {
+        const m = material as THREE.Material & {
+          clippingPlanes?: THREE.Plane[];
+          clipShadows?: boolean;
+          needsUpdate?: boolean;
+        };
+        if (!m || typeof m !== "object") continue;
+        m.clippingPlanes = planes;
+        m.clipShadows = true;
+        m.needsUpdate = true;
+      }
+    } catch {
+      /* materials list may be unavailable mid-load */
+    }
+  };
+
+  const applyStoreyFilter = async (next: StoreyFilter) => {
+    storeyFilter = next;
+    // Only clip while IFC geometry is shown; navmesh stays full-height stacked.
+    if (geometryDisplayMode !== "ifc") return;
+
+    const gl = glRenderer();
+
+    if (next.kind === "all") {
+      if (gl) {
+        gl.clippingPlanes = [];
+        gl.localClippingEnabled = false;
+      }
+      applyMaterialClipping([]);
+      try {
+        // Restore any category hides (ceilings/roofs) from a prior isolate.
+        for (const model of fragments.list.values()) {
+          await model.setVisible(undefined, true);
+        }
+      } catch {
+        /* ignore */
+      }
+      void fragments.core.update(true);
+      return;
+    }
+
+    // Plane: n·x + c = 0; clip where n·x + c < 0.
+    storeyClipPlanes[0]!.set(new THREE.Vector3(0, 1, 0), -next.minY);
+    storeyClipPlanes[1]!.set(new THREE.Vector3(0, -1, 0), next.maxY);
+    const planes = [storeyClipPlanes[0]!, storeyClipPlanes[1]!];
+
+    if (gl) {
+      gl.localClippingEnabled = true;
+      gl.clippingPlanes = planes;
+    }
+    applyMaterialClipping(planes);
+
+    // Explicitly hide ceiling / roof categories so we don't look "through" culled faces.
+    try {
+      for (const model of fragments.list.values()) {
+        await model.setVisible(undefined, true);
+        const ceilingCats = await model.getItemsOfCategories([
+          /COVERING/i,
+          /ROOF/i,
+        ]);
+        const ceilingIds = Object.values(ceilingCats).flat();
+        if (ceilingIds.length) await model.setVisible(ceilingIds, false);
+      }
+    } catch (err) {
+      console.warn("Ceiling hide failed", err);
+    }
+
+    void fragments.core.update(true);
+  };
+
+  const setStoreyFilter = async (filter: StoreyFilter) => {
+    await applyStoreyFilter(filter);
+  };
+
+  const clearNavmeshMeshes = () => {
+    while (navmeshGroup.children.length) {
+      const child = navmeshGroup.children[0]!;
+      navmeshGroup.remove(child);
+      child.traverse((obj) => {
+        const mesh = obj as THREE.Mesh;
+        if (mesh.geometry) mesh.geometry.dispose();
+        const mat = mesh.material;
+        if (!mat) return;
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else mat.dispose();
+      });
+    }
+  };
+
+  const setIfcModelVisible = (visible: boolean) => {
+    for (const [, model] of fragments.list) {
+      const obj = (model as { object?: THREE.Object3D }).object;
+      if (obj) obj.visible = visible;
+    }
+  };
+
+  const setGeometryDisplayMode = (mode: GeometryDisplayMode) => {
+    geometryDisplayMode = mode;
+    const showIfc = mode === "ifc";
+    setIfcModelVisible(showIfc);
+    navmeshGroup.visible = mode === "navmesh";
+    // Keep the route tube in both IFC and navmesh views.
+    routeTubeGroup.visible = routeTubeGroup.children.length > 0;
+    if (showIfc) {
+      void applyStoreyFilter(storeyFilter);
+    } else {
+      // Stacked navmesh needs the full height — clear global clip planes.
+      const gl = glRenderer();
+      if (gl) {
+        gl.clippingPlanes = [];
+        gl.localClippingEnabled = false;
+      }
+      applyMaterialClipping([]);
+    }
+    void fragments.core.update(true);
+  };
+
+  const setNavmesh = (
+    data: { regions: NavmeshThreeRegion[]; portals: NavmeshThreePortal[] } | null,
+  ) => {
+    clearNavmeshMeshes();
+    if (!data) {
+      navmeshGroup.visible = geometryDisplayMode === "navmesh";
+      return;
+    }
+
+    const regionMat = new THREE.MeshBasicMaterial({
+      color: 0x94a3b8,
+      transparent: true,
+      opacity: 0.35,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const regionEdgeMat = new THREE.LineBasicMaterial({
+      color: 0x64748b,
+      transparent: true,
+      opacity: 0.95,
+    });
+
+    for (const region of data.regions) {
+      if (region.vertices.length < 3) continue;
+      const avgY =
+        region.vertices.reduce((s, v) => s + v.y, 0) / region.vertices.length;
+      const shape = new THREE.Shape();
+      const first = region.vertices[0]!;
+      shape.moveTo(first.x, -first.z);
+      for (let i = 1; i < region.vertices.length; i++) {
+        const v = region.vertices[i]!;
+        shape.lineTo(v.x, -v.z);
+      }
+      shape.closePath();
+      for (const hole of region.holes ?? []) {
+        if (hole.length < 3) continue;
+        const path = new THREE.Path();
+        path.moveTo(hole[0]!.x, -hole[0]!.z);
+        for (let i = 1; i < hole.length; i++) {
+          path.lineTo(hole[i]!.x, -hole[i]!.z);
+        }
+        path.closePath();
+        shape.holes.push(path);
+      }
+      const geom = new THREE.ShapeGeometry(shape);
+      const pos = geom.getAttribute("position");
+      for (let i = 0; i < pos.count; i++) {
+        // Shape is in X/–Z; lift onto storey plane (Three Y).
+        const x = pos.getX(i);
+        const zShape = pos.getY(i);
+        pos.setXYZ(i, x, avgY, -zShape);
+      }
+      pos.needsUpdate = true;
+      geom.computeVertexNormals();
+      const mesh = new THREE.Mesh(geom, regionMat.clone());
+      mesh.name = `navmesh-region:${region.id}`;
+      mesh.renderOrder = 2;
+      mesh.frustumCulled = false;
+      navmeshGroup.add(mesh);
+
+      const edgePts: number[] = [];
+      for (const v of region.vertices) {
+        edgePts.push(v.x, avgY + 0.02, v.z);
+      }
+      edgePts.push(first.x, avgY + 0.02, first.z);
+      const edgeGeom = new THREE.BufferGeometry();
+      edgeGeom.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute(edgePts, 3),
+      );
+      const edge = new THREE.Line(edgeGeom, regionEdgeMat.clone());
+      edge.frustumCulled = false;
+      navmeshGroup.add(edge);
+    }
+
+    for (const portal of data.portals) {
+      const color =
+        portal.kind === "space"
+          ? 0x22c55e
+          : portal.inferred
+            ? 0xeab308
+            : 0xf97316;
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.25, 12, 10),
+        new THREE.MeshBasicMaterial({ color }),
+      );
+      marker.position.set(portal.point.x, portal.point.y + 0.15, portal.point.z);
+      marker.name = `navmesh-portal:${portal.id}`;
+      marker.frustumCulled = false;
+      navmeshGroup.add(marker);
+    }
+
+    navmeshGroup.visible = geometryDisplayMode === "navmesh";
   };
 
   const scratchPos = new THREE.Vector3();
@@ -408,6 +699,16 @@ export async function createThatOpenRuntime(
       material.polygonOffsetUnits = 1;
       material.polygonOffsetFactor = Math.random();
     }
+    if (storeyFilter.kind === "band") {
+      const m = material as THREE.Material & {
+        clippingPlanes?: THREE.Plane[];
+        clipShadows?: boolean;
+        needsUpdate?: boolean;
+      };
+      m.clippingPlanes = [storeyClipPlanes[0]!, storeyClipPlanes[1]!];
+      m.clipShadows = true;
+      m.needsUpdate = true;
+    }
   });
 
   const ifcLoader = components.get(OBC.IfcLoader);
@@ -522,6 +823,7 @@ export async function createThatOpenRuntime(
 
   const clear = async () => {
     clearRouteTubeMeshes();
+    clearNavmeshMeshes();
     for (const id of [...fragments.list.keys()]) {
       await fragments.core.disposeModel(id);
     }
@@ -649,10 +951,16 @@ export async function createThatOpenRuntime(
       world.camera.set("Orbit");
       await reanchorOrbitToBuilding(true);
       publishCameraPose(true);
+      setGeometryDisplayMode(geometryDisplayMode);
+      await applyStoreyFilter(storeyFilter);
       onStatus?.(`3D view loaded: ${name}`, "info");
     },
     setNavMode,
     getNavMode: () => navMode,
+    setGeometryDisplayMode,
+    getGeometryDisplayMode: () => geometryDisplayMode,
+    setNavmesh,
+    setStoreyFilter,
     getCameraPose,
     getModelBounds: () =>
       hasOrbitTarget && !modelBox.isEmpty()
@@ -671,6 +979,7 @@ export async function createThatOpenRuntime(
     dispose() {
       stopFlyLoop();
       clearRouteTubeMeshes();
+      clearNavmeshMeshes();
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("resize", resize);

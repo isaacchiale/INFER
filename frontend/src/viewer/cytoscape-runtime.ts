@@ -433,7 +433,7 @@ export async function createCytoscapeRuntime(
   cy.on("tap", "node", (evt) => {
     const id = String(evt.target.id());
     if (!id.startsWith("space:")) return;
-    // Left-click only picks live (non-excluded) spaces for origin/destination.
+    // Left-click toggles live (non-excluded) spaces in the multi-selection.
     if (Number(evt.target.data("excluded")) === 1) return;
     spaceHandler?.(id);
   });

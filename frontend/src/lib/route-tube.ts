@@ -273,6 +273,47 @@ export function buildRouteTubePolylines(
 }
 
 /**
+ * Lift a click-to-click plan polyline (one storey) into Three for the blue tube.
+ */
+export function buildPlanRouteTubePolylines(args: {
+  points: Array<{ x: number; y: number }> | null | undefined;
+  storeyId: string | null | undefined;
+  footprints: FootprintsDocument | null;
+  modelBounds?: ThreeAabb | null;
+  coordInverse?: Mat4Elements | null;
+}): ThreeCameraPosition[][] | null {
+  const { points, storeyId, footprints, modelBounds, coordInverse } = args;
+  if (!points || points.length < 2 || !storeyId || !footprints || !modelBounds) {
+    return null;
+  }
+
+  const planBounds = footprintPlanBounds(footprints);
+  if (!planBounds) return null;
+
+  const modelHeightM = modelBounds.maxY - modelBounds.minY;
+  const metres = storeysMetres(footprints, modelHeightM);
+  const storeyElevationsM = elevationsForVerticalRemap(
+    metres,
+    spaceStoreyIds(footprints),
+  );
+  const liftOpts = resolveRouteTubeLiftOptions({
+    planBounds,
+    probeElevationM: storeyElevationsM.length
+      ? Math.min(...storeyElevationsM)
+      : metres.length
+        ? Math.min(...metres.map((s) => s.elevation))
+        : 0,
+    modelBounds,
+    storeyElevationsM,
+    coordInverse,
+  });
+
+  const elevation = metres.find((s) => s.global_id === storeyId)?.elevation ?? 0;
+  const lifted = liftPlanPolylineToThree(points, elevation, liftOpts);
+  return lifted.length >= 2 ? [lifted] : null;
+}
+
+/**
  * @deprecated Prefer {@link buildRouteTubePolylines}. Returns the first storey
  * polyline only (legacy single-tube callers / tests).
  */

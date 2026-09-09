@@ -10,7 +10,7 @@ export function Inspector() {
   const [showRaw, setShowRaw] = useState(false);
 
   const id = selectedElementIds[0];
-  const space = spaces.find((s) => s.id === id) ?? spaces[0];
+  const space = spaces.find((s) => s.id === id);
   if (!id || !space) return null;
   const storey = storeys.find((s) => s.id === space.storeyId);
 

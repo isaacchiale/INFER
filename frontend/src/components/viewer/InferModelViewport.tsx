@@ -1,17 +1,38 @@
-import { memo, useEffect, useRef, useState } from "react";
-import { Move3d, PersonStanding } from "lucide-react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { Box, Check, ChevronDown, Move3d, Network, PersonStanding } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { buildRouteTubePolylines } from "@/lib/route-tube";
+import { buildAllStoreyNavmeshes, buildStoreyNavmesh } from "@/lib/navmesh";
+import {
+  buildPlanRouteTubePolylines,
+  buildRouteTubePolylines,
+  resolveRouteTubeLiftOptions,
+} from "@/lib/route-tube";
+import {
+  elevationsForVerticalRemap,
+  normalizeElevationsToMetres,
+} from "@/lib/storey-elevations";
+import { ifcPlanToThree, liftPlanPolylineToThree } from "@/lib/viewer-camera-pose";
 import type { HazardZone, Route } from "@/types/infer";
 import { useInfer } from "@/state/infer-store";
 import {
   createThatOpenRuntime,
+  type GeometryDisplayMode,
   type NavMode,
+  type StoreyFilter,
   type ThatOpenRuntime,
 } from "@/viewer/that-open-runtime";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 const GLASS =
   "rounded-[6px] border border-border bg-background/90 shadow-sm backdrop-blur-[2px]";
+
+/** Navmesh slabs sit just above each storey elevation. */
+const NAVMESH_HEIGHT_OFFSET_M = 0.05;
 
 /**
  * INFER ⇄ BIM viewer integration boundary.
@@ -56,6 +77,9 @@ function InferModelViewportImpl({
   const [engineReady, setEngineReady] = useState(false);
   const [engineError, setEngineError] = useState<string | null>(null);
   const [navMode, setNavMode] = useState<NavMode>("orbit");
+  const [geometryMode, setGeometryMode] = useState<GeometryDisplayMode>("ifc");
+  /** Independent of floorplan `activeStoreyId`. */
+  const [viewerStoreyId, setViewerStoreyId] = useState<string | "all">("all");
 
   const {
     pendingIfc,
@@ -64,21 +88,27 @@ function InferModelViewportImpl({
     setViewerModelBounds,
     setViewerCoordInverse,
     connectivityRoute,
+    navmeshRoute,
     footprintsDocument,
     connectivityGraph,
     viewerCoordInverse,
     viewerModelBounds,
+    excludedNodeIds,
+    excludedEdgeIds,
+    entitiesExtract,
   } = useInfer();
 
   // Latest route inputs for post-load tube restore (avoid reloading IFC on route change).
   const tubeInputRef = useRef({
     connectivityRoute,
+    navmeshRoute,
     footprintsDocument,
     connectivityGraph,
     viewerCoordInverse,
   });
   tubeInputRef.current = {
     connectivityRoute,
+    navmeshRoute,
     footprintsDocument,
     connectivityGraph,
     viewerCoordInverse,
@@ -88,6 +118,150 @@ function InferModelViewportImpl({
     setNavMode(mode);
     void runtimeRef.current?.setNavMode(mode);
   };
+
+  const switchGeometryMode = (mode: GeometryDisplayMode) => {
+    setGeometryMode(mode);
+    runtimeRef.current?.setGeometryDisplayMode(mode);
+  };
+
+  const storeys = useMemo(() => {
+    const fromFp = footprintsDocument?.storeys ?? [];
+    if (fromFp.length) {
+      return [...fromFp].sort((a, b) => (a.elevation ?? 0) - (b.elevation ?? 0));
+    }
+    return (entitiesExtract?.storeys ?? []).map((s) => ({
+      global_id: s.global_id,
+      name: s.name,
+      elevation: s.elevation ?? null,
+    }));
+  }, [footprintsDocument, entitiesExtract]);
+
+  const viewerStoreyLabel = useMemo(() => {
+    if (viewerStoreyId === "all") return "All levels";
+    if (!storeys.length) return "No storeys";
+    const match = storeys.find((s) => s.global_id === viewerStoreyId);
+    if (!match) return "Select storey";
+    return (
+      match.name?.trim() ||
+      (match.elevation != null ? `E${match.elevation}` : match.global_id.slice(0, 8))
+    );
+  }, [storeys, viewerStoreyId]);
+
+  // Drop stale viewer storey when the model changes.
+  useEffect(() => {
+    if (viewerStoreyId === "all") return;
+    if (storeys.some((s) => s.global_id === viewerStoreyId)) return;
+    setViewerStoreyId("all");
+  }, [storeys, viewerStoreyId]);
+
+  // Isolate IFC geometry with a vertical clip band (reliable vs IFC containment).
+  useEffect(() => {
+    if (!engineReady || !runtimeRef.current) return;
+    const runtime = runtimeRef.current;
+
+    if (viewerStoreyId === "all") {
+      void runtime.setStoreyFilter({ kind: "all" });
+      return;
+    }
+
+    const bounds = runtime.getModelBounds() ?? viewerModelBounds;
+    if (!bounds || !footprintsDocument) {
+      void runtime.setStoreyFilter({ kind: "all" });
+      return;
+    }
+
+    const raw = (footprintsDocument.storeys ?? []).filter(
+      (s): s is { global_id: string; name: string; elevation: number } =>
+        s.elevation != null && Number.isFinite(s.elevation),
+    );
+    if (!raw.length) {
+      void runtime.setStoreyFilter({ kind: "all" });
+      return;
+    }
+
+    const modelHeightM = bounds.maxY - bounds.minY;
+    const { metres } = normalizeElevationsToMetres(
+      raw.map((s) => s.elevation),
+      modelHeightM,
+    );
+    const ranked = raw
+      .map((s, i) => ({
+        global_id: s.global_id,
+        elevation: metres[i]!,
+      }))
+      .sort((a, b) => a.elevation - b.elevation);
+
+    const idx = ranked.findIndex((s) => s.global_id === viewerStoreyId);
+    if (idx < 0) {
+      void runtime.setStoreyFilter({ kind: "all" });
+      return;
+    }
+
+    const elev = ranked[idx]!.elevation;
+    const nextElev =
+      idx + 1 < ranked.length ? ranked[idx + 1]!.elevation : elev + 3.5;
+    const storeyHeight = Math.max(nextElev - elev, 1.5);
+    // Keep the floor; cut well below the next storey so the ceiling / upper
+    // slab is gone when looking down (open-top floor plate).
+    const minElevM = elev - 0.25;
+    const maxElevM = elev + storeyHeight * 0.78;
+
+    const spaceIds = footprintsDocument.spaces
+      .filter((s) => !s.incomplete && s.storey_global_id)
+      .map((s) => s.storey_global_id!);
+    const storeyElevationsM = elevationsForVerticalRemap(
+      ranked.map((s) => ({ global_id: s.global_id, elevation: s.elevation })),
+      spaceIds,
+    );
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const s of footprintsDocument.spaces) {
+      if (s.incomplete) continue;
+      for (const p of s.polygon) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
+    }
+    if (!Number.isFinite(minX)) {
+      void runtime.setStoreyFilter({ kind: "all" });
+      return;
+    }
+
+    const liftOpts = resolveRouteTubeLiftOptions({
+      planBounds: { minX, maxX, minY, maxY },
+      probeElevationM: storeyElevationsM.length
+        ? Math.min(...storeyElevationsM)
+        : elev,
+      modelBounds: bounds,
+      storeyElevationsM,
+      coordInverse: runtime.getCoordinationInverse() ?? viewerCoordInverse,
+    });
+    // No height offset — clip against true storey elevations.
+    liftOpts.heightOffsetM = 0;
+
+    const midX = (minX + maxX) / 2;
+    const midY = (minY + maxY) / 2;
+    const lo = ifcPlanToThree(midX, midY, minElevM, liftOpts);
+    const hi = ifcPlanToThree(midX, midY, maxElevM, liftOpts);
+    const filter: StoreyFilter = {
+      kind: "band",
+      minY: Math.min(lo.y, hi.y),
+      maxY: Math.max(lo.y, hi.y),
+    };
+    void runtime.setStoreyFilter(filter);
+  }, [
+    engineReady,
+    viewerStoreyId,
+    pendingIfc,
+    footprintsDocument,
+    viewerModelBounds,
+    viewerCoordInverse,
+  ]);
 
   // Boot That Open once the host is mounted (client-only).
   useEffect(() => {
@@ -172,14 +346,24 @@ function InferModelViewportImpl({
         const rt = runtimeRef.current;
         if (!rt) return;
         const input = tubeInputRef.current;
-        const polylines = buildRouteTubePolylines({
-          route: input.connectivityRoute,
+        const navTube = buildPlanRouteTubePolylines({
+          points: input.navmeshRoute?.points,
+          storeyId: input.navmeshRoute?.storeyId,
           footprints: input.footprintsDocument,
-          graph: input.connectivityGraph,
           modelBounds: rt.getModelBounds(),
           coordInverse:
             rt.getCoordinationInverse() ?? input.viewerCoordInverse,
         });
+        const polylines =
+          navTube ??
+          buildRouteTubePolylines({
+            route: input.connectivityRoute,
+            footprints: input.footprintsDocument,
+            graph: input.connectivityGraph,
+            modelBounds: rt.getModelBounds(),
+            coordInverse:
+              rt.getCoordinationInverse() ?? input.viewerCoordInverse,
+          });
         rt.setRouteTube(polylines);
       } catch (error) {
         if (!cancelled) {
@@ -195,7 +379,7 @@ function InferModelViewportImpl({
     };
   }, [pendingIfc, engineReady, setViewerStatus]);
 
-  // Full-route geometric path → blue tube(s) on every storey the route uses.
+  // Click-to-click navmesh path (preferred) or legacy graph route → blue tube.
   useEffect(() => {
     const runtime = runtimeRef.current;
     if (!engineReady || !runtime) return;
@@ -203,19 +387,166 @@ function InferModelViewportImpl({
     const bounds = runtime.getModelBounds() ?? viewerModelBounds;
     const coordInverse =
       runtime.getCoordinationInverse() ?? viewerCoordInverse;
-    const polylines = buildRouteTubePolylines({
-      route: connectivityRoute,
+    const navTube = buildPlanRouteTubePolylines({
+      points: navmeshRoute?.points,
+      storeyId: navmeshRoute?.storeyId,
       footprints: footprintsDocument,
-      graph: connectivityGraph,
       modelBounds: bounds,
       coordInverse,
     });
+    const polylines =
+      navTube ??
+      buildRouteTubePolylines({
+        route: connectivityRoute,
+        footprints: footprintsDocument,
+        graph: connectivityGraph,
+        modelBounds: bounds,
+        coordInverse,
+      });
     runtime.setRouteTube(polylines);
   }, [
     engineReady,
+    navmeshRoute,
     connectivityRoute,
     footprintsDocument,
     connectivityGraph,
+    viewerModelBounds,
+    viewerCoordInverse,
+  ]);
+
+  // Portal navmeshes — all storeys stacked, or one level when isolated.
+  useEffect(() => {
+    const runtime = runtimeRef.current;
+    if (!engineReady || !runtime) return;
+
+    if (geometryMode !== "navmesh") {
+      runtime.setNavmesh(null);
+      return;
+    }
+
+    if (!footprintsDocument || !connectivityGraph) {
+      runtime.setNavmesh(null);
+      return;
+    }
+
+    const bounds = runtime.getModelBounds() ?? viewerModelBounds;
+    if (!bounds) {
+      runtime.setNavmesh(null);
+      return;
+    }
+
+    const opts = { excludedNodeIds, excludedEdgeIds };
+    const meshes =
+      viewerStoreyId === "all"
+        ? buildAllStoreyNavmeshes(footprintsDocument, connectivityGraph, opts)
+        : (() => {
+            const one = buildStoreyNavmesh(
+              footprintsDocument,
+              connectivityGraph,
+              viewerStoreyId,
+              opts,
+            );
+            return one.regions.length ? [one] : [];
+          })();
+    if (!meshes.length) {
+      runtime.setNavmesh(null);
+      return;
+    }
+
+    const raw = (footprintsDocument.storeys ?? []).filter(
+      (s): s is { global_id: string; name: string; elevation: number } =>
+        s.elevation != null && Number.isFinite(s.elevation),
+    );
+    const modelHeightM = bounds.maxY - bounds.minY;
+    const { metres } = normalizeElevationsToMetres(
+      raw.map((s) => s.elevation),
+      modelHeightM,
+    );
+    const storeysM = raw.map((s, i) => ({
+      global_id: s.global_id,
+      elevation: metres[i]!,
+    }));
+    const spaceIds = footprintsDocument.spaces
+      .filter((s) => !s.incomplete && s.storey_global_id)
+      .map((s) => s.storey_global_id!);
+    const storeyElevationsM = elevationsForVerticalRemap(storeysM, spaceIds);
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const mesh of meshes) {
+      for (const r of mesh.regions) {
+        for (const p of r.polygon) {
+          minX = Math.min(minX, p.x);
+          minY = Math.min(minY, p.y);
+          maxX = Math.max(maxX, p.x);
+          maxY = Math.max(maxY, p.y);
+        }
+      }
+    }
+    if (!Number.isFinite(minX)) {
+      runtime.setNavmesh(null);
+      return;
+    }
+
+    const liftOpts = {
+      ...resolveRouteTubeLiftOptions({
+        planBounds: { minX, maxX, minY, maxY },
+        probeElevationM: storeyElevationsM.length
+          ? Math.min(...storeyElevationsM)
+          : storeysM.length
+            ? Math.min(...storeysM.map((s) => s.elevation))
+            : 0,
+        modelBounds: bounds,
+        storeyElevationsM,
+        coordInverse: runtime.getCoordinationInverse() ?? viewerCoordInverse,
+      }),
+      heightOffsetM: NAVMESH_HEIGHT_OFFSET_M,
+    };
+
+    const regions: Array<{
+      id: string;
+      vertices: Array<{ x: number; y: number; z: number }>;
+      holes: Array<Array<{ x: number; y: number; z: number }>>;
+    }> = [];
+    const portals: Array<{
+      id: string;
+      kind: "door" | "space";
+      inferred?: boolean;
+      point: { x: number; y: number; z: number };
+    }> = [];
+    for (const mesh of meshes) {
+      const elevation =
+        storeysM.find((s) => s.global_id === mesh.storeyId)?.elevation ?? 0;
+      for (const r of mesh.regions) {
+        regions.push({
+          id: `${mesh.storeyId}:${r.spaceId}`,
+          vertices: liftPlanPolylineToThree(r.polygon, elevation, liftOpts),
+          holes: r.holes.map((h) => liftPlanPolylineToThree(h, elevation, liftOpts)),
+        });
+      }
+      for (const p of mesh.portals) {
+        const point = liftPlanPolylineToThree([p.point], elevation, liftOpts)[0];
+        if (!point) continue;
+        portals.push({
+          id: `${mesh.storeyId}:${p.id}`,
+          kind: p.kind,
+          inferred: p.inferred,
+          point,
+        });
+      }
+    }
+
+    runtime.setNavmesh({ regions, portals });
+  }, [
+    engineReady,
+    geometryMode,
+    viewerStoreyId,
+    footprintsDocument,
+    connectivityGraph,
+    excludedNodeIds,
+    excludedEdgeIds,
     viewerModelBounds,
     viewerCoordInverse,
   ]);
@@ -244,35 +575,114 @@ function InferModelViewportImpl({
       />
 
       {engineReady && !engineError && (
-        <div className={cn(GLASS, "pointer-events-auto absolute left-3 top-3 z-20 flex overflow-hidden")}>
-          <button
-            type="button"
-            onClick={() => switchNavMode("orbit")}
-            className={cn(
-              "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
-              navMode === "orbit"
-                ? "bg-muted text-foreground"
-                : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-            )}
-            title="Orbit camera"
-          >
-            <Move3d className="size-3.5" aria-hidden />
-            Orbit
-          </button>
-          <button
-            type="button"
-            onClick={() => switchNavMode("fly")}
-            className={cn(
-              "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
-              navMode === "fly"
-                ? "bg-muted text-foreground"
-                : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-            )}
-            title="First-person fly (WASD, Space, Shift)"
-          >
-            <PersonStanding className="size-3.5" aria-hidden />
-            Fly
-          </button>
+        <div className="pointer-events-auto absolute left-3 top-3 z-20 flex flex-col items-start gap-1.5">
+          <div className={cn(GLASS, "flex overflow-hidden")}>
+            <button
+              type="button"
+              onClick={() => switchNavMode("orbit")}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                navMode === "orbit"
+                  ? "bg-muted text-foreground"
+                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+              )}
+              title="Orbit camera"
+            >
+              <Move3d className="size-3.5" aria-hidden />
+              Orbit
+            </button>
+            <button
+              type="button"
+              onClick={() => switchNavMode("fly")}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                navMode === "fly"
+                  ? "bg-muted text-foreground"
+                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+              )}
+              title="First-person fly (WASD, Space, Shift)"
+            >
+              <PersonStanding className="size-3.5" aria-hidden />
+              Fly
+            </button>
+          </div>
+
+          <div className={cn(GLASS, "flex overflow-hidden")}>
+            <button
+              type="button"
+              onClick={() => switchGeometryMode("ifc")}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                geometryMode === "ifc"
+                  ? "bg-muted text-foreground"
+                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+              )}
+              title="Show IFC geometry"
+            >
+              <Box className="size-3.5" aria-hidden />
+              IFC Geometry
+            </button>
+            <button
+              type="button"
+              onClick={() => switchGeometryMode("navmesh")}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                geometryMode === "navmesh"
+                  ? "bg-muted text-foreground"
+                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+              )}
+              title="Show portal navmesh (all levels or the selected storey)"
+            >
+              <Network className="size-3.5" aria-hidden />
+              Navmesh
+            </button>
+          </div>
+
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                disabled={!storeys.length}
+                className={cn(
+                  GLASS,
+                  "flex h-8 max-w-[220px] items-center gap-1.5 px-2.5 text-[12px] text-foreground transition-colors hover:bg-muted disabled:opacity-40",
+                )}
+                title="3D storey filter — isolates IFC geometry and navmesh (independent of floorplan)"
+              >
+                <span className="min-w-0 truncate">{viewerStoreyLabel}</span>
+                <ChevronDown aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="max-h-64 min-w-[10rem] overflow-y-auto">
+              <DropdownMenuItem
+                className="text-[12px]"
+                onSelect={() => setViewerStoreyId("all")}
+              >
+                {viewerStoreyId === "all" ? (
+                  <Check className="size-3.5" />
+                ) : (
+                  <span className="size-3.5" />
+                )}
+                All levels
+              </DropdownMenuItem>
+              {storeys.map((s) => {
+                const label =
+                  s.name?.trim() ||
+                  (s.elevation != null ? `E${s.elevation}` : s.global_id.slice(0, 8));
+                const active = viewerStoreyId === s.global_id;
+                return (
+                  <DropdownMenuItem
+                    key={s.global_id}
+                    className="text-[12px]"
+                    onSelect={() => setViewerStoreyId(s.global_id)}
+                  >
+                    {active ? <Check className="size-3.5" /> : <span className="size-3.5" />}
+                    {label}
+                  </DropdownMenuItem>
+                );
+              })}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       )}
 
