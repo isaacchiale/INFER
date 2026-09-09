@@ -165,6 +165,79 @@ export function toDisplayGraph(graph: ConnectivityGraph): DisplayGraph {
   return { nodes, edges };
 }
 
+/**
+ * Map soft-disabled display edges to real graph edge ids for routing.
+ *
+ * The viewer collapses door↔space↔door into synthetic `viz-door:…` edges and
+ * may show only one line when several mechanisms connect the same pair. Blocking
+ * those display ids alone does nothing on the backend — expand to:
+ * - every direct graph edge between the display endpoints
+ * - both legs of every door that links those two spaces
+ */
+export function blockedEdgeIdsFromExclusions(
+  graph: ConnectivityGraph,
+  excludedEdgeIds: ReadonlySet<string>,
+): string[] {
+  if (!excludedEdgeIds.size) return [];
+
+  const display = toDisplayGraph(graph);
+  const displayById = new Map(display.edges.map((e) => [e.id, e]));
+
+  const spacesByDoor = new Map<string, Set<string>>();
+  for (const edge of graph.edges) {
+    const doorId = edge.source.startsWith("door:")
+      ? edge.source
+      : edge.target.startsWith("door:")
+        ? edge.target
+        : null;
+    const spaceId = edge.source.startsWith("space:")
+      ? edge.source
+      : edge.target.startsWith("space:")
+        ? edge.target
+        : null;
+    if (!doorId || !spaceId) continue;
+    const set = spacesByDoor.get(doorId) ?? new Set<string>();
+    set.add(spaceId);
+    spacesByDoor.set(doorId, set);
+  }
+
+  const blocked = new Set<string>();
+
+  const blockPair = (a: string, b: string) => {
+    for (const edge of graph.edges) {
+      if (
+        (edge.source === a && edge.target === b) ||
+        (edge.source === b && edge.target === a)
+      ) {
+        blocked.add(edge.id);
+      }
+    }
+    for (const [doorId, spaces] of spacesByDoor) {
+      if (!spaces.has(a) || !spaces.has(b)) continue;
+      for (const edge of graph.edges) {
+        const ends = new Set([edge.source, edge.target]);
+        if (ends.has(doorId) && (ends.has(a) || ends.has(b))) {
+          blocked.add(edge.id);
+        }
+      }
+    }
+  };
+
+  for (const eid of excludedEdgeIds) {
+    const displayEdge = displayById.get(eid);
+    if (displayEdge) {
+      blockPair(displayEdge.source, displayEdge.target);
+      continue;
+    }
+    // Raw graph edge id (or stale id) — still forward it.
+    blocked.add(eid);
+    const real = graph.edges.find((e) => e.id === eid);
+    if (real) blockPair(real.source, real.target);
+  }
+
+  return [...blocked];
+}
+
 export type LayoutNode = {
   id: string;
   kind: "label" | "space" | "stair" | "lift";
@@ -187,6 +260,8 @@ export type LayoutEdge = {
   inferred?: boolean;
   /** Heal colour channel: door=yellow, space=green, stair=purple. */
   heal?: "door" | "space" | "stair";
+  /** Soft-removed (right-click): drawn dashed, ignored by routing. */
+  excluded?: boolean;
 };
 
 export type GraphLayout = {
@@ -531,11 +606,13 @@ function forceLayoutStorey(
  * Level-banded layout: each storey is force-directed; bands stack top→bottom
  * in elevation order with a fixed {@link LAYOUT_BAND_GAP} between levels.
  * Excluded nodes are parked in a grid to the right of stair/lift portals.
+ * Excluded edges stay in the layout (dashed) so node positions do not jump.
  */
 export function buildGraphLayout(
   graph: ConnectivityGraph,
   bands: StoreyBand[],
   excludedIds: ReadonlySet<string> = new Set(),
+  excludedEdgeIds: ReadonlySet<string> = new Set(),
 ): GraphLayout {
   const display = toDisplayGraph(graph);
   const bandIndex = new Map(bands.map((b, i) => [b.id, i]));
@@ -730,7 +807,7 @@ export function buildGraphLayout(
       nodes.push({
         id: portal.id,
         kind: portal.kind as "stair" | "lift",
-        label: raw.length > 16 ? portal.kind : raw,
+        label: raw.length > 16 ? `${raw.slice(0, 14)}…` : raw,
         x: portalColumnX,
         y,
         w: LAYOUT_PORTAL_W,
@@ -789,6 +866,7 @@ export function buildGraphLayout(
       vertical: edge.kind === "vertical",
       inferred,
       heal: healKindForEdge(edge.method, edge.kind, inferred),
+      excluded: excludedEdgeIds.has(edge.id),
     });
   }
 

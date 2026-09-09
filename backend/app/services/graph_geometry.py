@@ -8,6 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 from app.schemas.footprints import (
+    DoorPortal,
     FootprintsDocument,
     OpeningPortal,
     Point2D,
@@ -17,7 +18,12 @@ from app.schemas.footprints import (
 from app.schemas.graph import ConnectivityGraph, GraphEdge, GraphNode
 
 
+# Legacy clearance when a door has no facing normal (old footprints.json).
 DOOR_CLEARANCE_M = 1.0
+# Inflate the door plan AABB by this much; only intersecting spaces are candidates.
+DOOR_INFLATE_M = 0.5
+# Max ray length along ±door normal to the first space footprint.
+DOOR_RAY_MAX_M = 1.0
 # Stair links require real footprint ∩ hull (no soft clearance — that linked whole floors).
 STAIR_INTERSECT_EPS = 1e-4
 # Nested-parent detection (geometry variant highlight only — no removal yet).
@@ -710,12 +716,236 @@ def _opening_on_interface(
     return _door_between_spaces(portal, a, b)
 
 
+def _door_aabb(door: DoorPortal) -> tuple[float, float, float, float] | None:
+    """Axis-aligned bounds of the door polygon, segment, or point."""
+    pts: list[Point2D] = []
+    if door.polygon and len(door.polygon) >= 2:
+        pts.extend(door.polygon)
+    elif len(door.segment) >= 2:
+        pts.extend(door.segment)
+    elif door.point is not None:
+        # Tiny box so inflate still has something to grow.
+        p = door.point
+        return (p.x - 0.05, p.y - 0.05, p.x + 0.05, p.y + 0.05)
+    else:
+        return None
+    xs = [p.x for p in pts]
+    ys = [p.y for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _inflate_aabb(
+    box: tuple[float, float, float, float], pad: float
+) -> tuple[float, float, float, float]:
+    minx, miny, maxx, maxy = box
+    return (minx - pad, miny - pad, maxx + pad, maxy + pad)
+
+
+def _aabb_intersects(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> bool:
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+def _space_aabb(space: SpaceFootprint) -> tuple[float, float, float, float] | None:
+    if len(space.polygon) < 3:
+        return None
+    xs = [p.x for p in space.polygon]
+    ys = [p.y for p in space.polygon]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _spaces_intersecting_inflated_door(
+    door: DoorPortal, spaces: list[SpaceFootprint]
+) -> list[SpaceFootprint]:
+    box = _door_aabb(door)
+    if box is None:
+        return []
+    inflated = _inflate_aabb(box, DOOR_INFLATE_M)
+    out: list[SpaceFootprint] = []
+    for space in spaces:
+        sb = _space_aabb(space)
+        if sb is None:
+            continue
+        if _aabb_intersects(inflated, sb):
+            out.append(space)
+    return out
+
+
+def _ray_enter_t(
+    ox: float, oy: float, dx: float, dy: float, polygon: list[Point2D]
+) -> float | None:
+    """
+    Smallest t ≥ 0 where the ray (ox,oy)+t·(dx,dy) enters the polygon.
+    If the origin is already inside, returns 0.
+    """
+    if len(polygon) < 3:
+        return None
+    if _point_in_polygon(ox, oy, polygon):
+        return 0.0
+    best: float | None = None
+    n = len(polygon)
+    for i in range(n):
+        a = polygon[i]
+        b = polygon[(i + 1) % n]
+        ex, ey = b.x - a.x, b.y - a.y
+        den = dx * ey - dy * ex
+        if abs(den) < 1e-12:
+            continue
+        # Solve ox+t dx = a+u ex, oy+t dy = a+u ey
+        t = ((a.x - ox) * ey - (a.y - oy) * ex) / den
+        u = ((a.x - ox) * dy - (a.y - oy) * dx) / den
+        if t < -1e-9 or u < -1e-9 or u > 1.0 + 1e-9:
+            continue
+        if best is None or t < best:
+            best = max(t, 0.0)
+    return best
+
+
+def _first_space_along_ray(
+    ox: float,
+    oy: float,
+    dx: float,
+    dy: float,
+    candidates: list[SpaceFootprint],
+    *,
+    max_t: float = DOOR_RAY_MAX_M,
+    skip_gids: set[str] | None = None,
+) -> tuple[float, SpaceFootprint] | None:
+    skip = skip_gids or set()
+    best: tuple[float, SpaceFootprint] | None = None
+    for space in candidates:
+        if space.global_id in skip:
+            continue
+        t = _ray_enter_t(ox, oy, dx, dy, space.polygon)
+        if t is None or t > max_t + 1e-9:
+            continue
+        if best is None or t < best[0] or (
+            abs(t - best[0]) <= 1e-9 and space.global_id < best[1].global_id
+        ):
+            best = (t, space)
+    return best
+
+
+def _pick_door_spaces_oriented(
+    door: DoorPortal, candidates: list[SpaceFootprint]
+) -> list[SpaceFootprint]:
+    """
+    Inflate-filter + ±normal raycast. At most two spaces (one per side).
+
+    Spaces that contain the door are hosts (always linked). Each ray then
+    looks for the first *further* hit (t > 0) so a door sitting inside room A
+    near corridor B still picks up B on the outward ray.
+    """
+    if door.point is None or door.normal is None or not candidates:
+        return []
+    nx, ny = door.normal.x, door.normal.y
+    L = math.hypot(nx, ny)
+    if L < 1e-9:
+        return []
+    nx, ny = nx / L, ny / L
+    ox, oy = door.point.x, door.point.y
+
+    hosts = [
+        s for s in candidates
+        if _point_in_polygon(ox, oy, s.polygon)
+    ]
+    # Prefer smaller containing spaces first (nested child over parent).
+    hosts.sort(key=lambda s: (_polygon_area(s.polygon), s.global_id))
+
+    picked: list[SpaceFootprint] = []
+    seen: set[str] = set()
+    for space in hosts:
+        if space.global_id in seen:
+            continue
+        seen.add(space.global_id)
+        picked.append(space)
+        if len(picked) >= 2:
+            return picked
+
+    def first_further(dx: float, dy: float) -> SpaceFootprint | None:
+        best: tuple[float, SpaceFootprint] | None = None
+        for space in candidates:
+            if space.global_id in seen:
+                continue
+            t = _ray_enter_t(ox, oy, dx, dy, space.polygon)
+            # Strictly beyond the door: skip the host's t=0 hit.
+            if t is None or t <= 1e-6 or t > DOOR_RAY_MAX_M + 1e-9:
+                continue
+            if best is None or t < best[0] or (
+                abs(t - best[0]) <= 1e-9 and space.global_id < best[1].global_id
+            ):
+                best = (t, space)
+        return best[1] if best else None
+
+    for dx, dy in ((nx, ny), (-nx, -ny)):
+        if len(picked) >= 2:
+            break
+        hit = first_further(dx, dy)
+        if hit is None or hit.global_id in seen:
+            continue
+        seen.add(hit.global_id)
+        picked.append(hit)
+
+    # Exterior / mid-gap door with no host: allow t=0 hits from the rays.
+    if not picked:
+        plus = _first_space_along_ray(ox, oy, nx, ny, candidates)
+        minus = _first_space_along_ray(ox, oy, -nx, -ny, candidates)
+        for hit in (plus, minus):
+            if hit is None:
+                continue
+            space = hit[1]
+            if space.global_id in seen:
+                continue
+            seen.add(space.global_id)
+            picked.append(space)
+            if len(picked) >= 2:
+                break
+
+    return picked
+
+
+def _pick_second_space_oriented(
+    door: DoorPortal,
+    ifc_space: SpaceFootprint,
+    candidates: list[SpaceFootprint],
+) -> SpaceFootprint | None:
+    """IFC already linked one space: take the nearest further hit on either ray."""
+    if door.point is None or door.normal is None:
+        return None
+    nx, ny = door.normal.x, door.normal.y
+    L = math.hypot(nx, ny)
+    if L < 1e-9:
+        return None
+    nx, ny = nx / L, ny / L
+    ox, oy = door.point.x, door.point.y
+    skip = {ifc_space.global_id}
+
+    best: tuple[float, SpaceFootprint] | None = None
+    for dx, dy in ((nx, ny), (-nx, -ny)):
+        for space in candidates:
+            if space.global_id in skip:
+                continue
+            t = _ray_enter_t(ox, oy, dx, dy, space.polygon)
+            if t is None or t > DOOR_RAY_MAX_M + 1e-9:
+                continue
+            # If IFC space already contains the door, require a further hit.
+            ifc_contains = _point_in_polygon(ox, oy, ifc_space.polygon)
+            if ifc_contains and t <= 1e-6:
+                continue
+            if best is None or t < best[0] or (
+                abs(t - best[0]) <= 1e-9 and space.global_id < best[1].global_id
+            ):
+                best = (t, space)
+    return best[1] if best else None
+
+
 def _pick_door_spaces(
     door: Point2D, ranked: list[tuple[float, SpaceFootprint]]
 ) -> list[SpaceFootprint]:
     """
-    At most 2 spaces: prefer the nearest pair the door sits between.
-    If no valid pair exists, keep only the nearest space (one-sided / exterior).
+    Legacy (no door normal): at most 2 spaces via between-math.
+    Prefer the nearest pair the door sits between; else nearest one-sided.
     """
     if not ranked:
         return []
@@ -742,8 +972,8 @@ def _pick_second_space_for_ifc_door(
     ranked: list[tuple[float, SpaceFootprint]],
 ) -> SpaceFootprint | None:
     """
-    IFC already linked one space: among other candidates within clearance, pick the
-    closest that passes the between-math **with that IFC space** (not vs each other).
+    Legacy IFC one-link partner: closest candidate that passes between-math
+    with the IFC space.
     """
     best: tuple[float, SpaceFootprint] | None = None
     for dist, space in ranked:
@@ -1129,9 +1359,10 @@ def build_geometry_graph(
     # --- Door healing ---
     # Cap: a door has at most 2 space links total (IFC ∪ geom).
     #   ≥2 IFC links → skip door entirely
-    #   1 IFC link  → add at most one partner that passes between-math WITH that
-    #                 IFC space (closest such candidate)
-    #   0 IFC links → pick ≤2 via between/nearest as before
+    #   1 IFC link  → add at most one partner
+    #   0 IFC links → pick ≤2
+    # Oriented doors (normal set): inflate AABB 0.5 m → candidates, then ±ray.
+    # Legacy doors (no normal): clearance rank + between-math (old footprints).
     space_fp_by_gid = {
         s.global_id: s for s in _all_complete_spaces(footprints, excluded)
     }
@@ -1154,32 +1385,45 @@ def build_geometry_graph(
 
         px, py = door.point.x, door.point.y
         door_pt = Point2D(x=px, y=py)
-        ranked: list[tuple[float, SpaceFootprint]] = []
-        for space in _spaces_for_storey(
+        storey_spaces = _spaces_for_storey(
             footprints, door.storey_global_id, excluded
-        ):
-            space_id = f"space:{space.global_id}"
-            if space_id not in node_by_id:
-                continue
-            d = _dist_point_to_polygon(px, py, space.polygon)
-            if d > DOOR_CLEARANCE_M:
-                continue
-            ranked.append((d, space))
-        ranked.sort(key=lambda t: (t[0], t[1].global_id))
+        )
+        storey_spaces = [
+            s for s in storey_spaces if f"space:{s.global_id}" in node_by_id
+        ]
 
         to_add: list[SpaceFootprint] = []
-        if len(existing_space_ids) == 1:
-            ifc_gid = existing_space_ids[0].removeprefix("space:")
-            ifc_fp = space_fp_by_gid.get(ifc_gid)
-            if ifc_fp is None:
-                # IFC linked a space we have no complete footprint for — cannot
-                # run between-math; leave the single IFC link as-is.
-                continue
-            partner = _pick_second_space_for_ifc_door(door_pt, ifc_fp, ranked)
-            if partner is not None:
-                to_add = [partner]
+        if door.normal is not None:
+            candidates = _spaces_intersecting_inflated_door(door, storey_spaces)
+            if len(existing_space_ids) == 1:
+                ifc_gid = existing_space_ids[0].removeprefix("space:")
+                ifc_fp = space_fp_by_gid.get(ifc_gid)
+                if ifc_fp is None:
+                    continue
+                partner = _pick_second_space_oriented(door, ifc_fp, candidates)
+                if partner is not None:
+                    to_add = [partner]
+            else:
+                to_add = _pick_door_spaces_oriented(door, candidates)
         else:
-            to_add = _pick_door_spaces(door_pt, ranked)
+            ranked: list[tuple[float, SpaceFootprint]] = []
+            for space in storey_spaces:
+                d = _dist_point_to_polygon(px, py, space.polygon)
+                if d > DOOR_CLEARANCE_M:
+                    continue
+                ranked.append((d, space))
+            ranked.sort(key=lambda t: (t[0], t[1].global_id))
+
+            if len(existing_space_ids) == 1:
+                ifc_gid = existing_space_ids[0].removeprefix("space:")
+                ifc_fp = space_fp_by_gid.get(ifc_gid)
+                if ifc_fp is None:
+                    continue
+                partner = _pick_second_space_for_ifc_door(door_pt, ifc_fp, ranked)
+                if partner is not None:
+                    to_add = [partner]
+            else:
+                to_add = _pick_door_spaces(door_pt, ranked)
 
         for space in to_add:
             space_id = f"space:{space.global_id}"

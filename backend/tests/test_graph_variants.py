@@ -56,6 +56,43 @@ def _box_wall(gid: str, storey: str, x0: float, y0: float, x1: float, y1: float)
     )
 
 
+def _oriented_door(
+    gid: str,
+    storey: str,
+    x: float,
+    y: float,
+    *,
+    nx: float,
+    ny: float,
+    half_along: float = 0.45,
+    half_through: float = 0.06,
+) -> DoorPortal:
+    """Thin rectangle door: normal (nx,ny) is through-wall facing."""
+    L = (nx * nx + ny * ny) ** 0.5
+    nx, ny = nx / L, ny / L
+    ax, ay = -ny, nx  # along leaf
+    poly = [
+        Point2D(x=x - ax * half_along - nx * half_through, y=y - ay * half_along - ny * half_through),
+        Point2D(x=x + ax * half_along - nx * half_through, y=y + ay * half_along - ny * half_through),
+        Point2D(x=x + ax * half_along + nx * half_through, y=y + ay * half_along + ny * half_through),
+        Point2D(x=x - ax * half_along + nx * half_through, y=y - ay * half_along + ny * half_through),
+    ]
+    return DoorPortal(
+        global_id=gid,
+        name=gid,
+        storey_global_id=storey,
+        point=Point2D(x=x, y=y),
+        segment=[
+            Point2D(x=x - ax * half_along, y=y - ay * half_along),
+            Point2D(x=x + ax * half_along, y=y + ay * half_along),
+        ],
+        polygon=poly,
+        normal=Point2D(x=nx, y=ny),
+        incomplete=False,
+        method="ifc_object_placement",
+    )
+
+
 def test_geometry_heals_door_and_stair():
     ifc = ConnectivityGraph(
         model_id="m1",
@@ -418,6 +455,183 @@ def test_door_heal_ifc_one_link_partners_only_against_ifc_space():
     }
     assert all_links == {"space:RED", "space:GREEN"}
     assert "space:BLUE" not in all_links
+
+
+def test_oriented_door_raycast_links_both_sides():
+    """±normal rays hit A and B; corner room C is not along the normal."""
+    ifc = ConnectivityGraph(
+        model_id="m_orient",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+            GraphNode(id="space:C", kind="space", global_id="C", storey_global_id="L1"),
+            GraphNode(id="door:D", kind="door", global_id="D", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m_orient",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", -4, -1, -0.05, 1),
+            _box_space("B", "L1", 0.05, -1, 4, 1),
+            _box_space("C", "L1", -1, 1.2, 1, 3),  # above — not on ±X
+        ],
+        doors=[_oriented_door("D", "L1", 0, 0, nx=1, ny=0)],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    linked = {
+        e.source if e.source.startswith("space:") else e.target
+        for e in geo.edges
+        if e.method == "geom_door_space"
+    }
+    assert linked == {"space:A", "space:B"}
+    assert "space:C" not in linked
+
+
+def test_oriented_door_inside_room_still_hits_corridor():
+    """Door inside A near the wall; +normal ray reaches corridor B."""
+    ifc = ConnectivityGraph(
+        model_id="m_orient_in",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+            GraphNode(id="door:D", kind="door", global_id="D", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m_orient_in",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", 0, 0, 4, 4),
+            _box_space("B", "L1", 4.3, 0, 8, 4),
+        ],
+        doors=[_oriented_door("D", "L1", 3.9, 2, nx=1, ny=0)],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    linked = {
+        e.source if e.source.startswith("space:") else e.target
+        for e in geo.edges
+        if e.method == "geom_door_space"
+    }
+    assert linked == {"space:A", "space:B"}
+
+
+def test_oriented_door_same_side_only_nearest():
+    """Both rooms on +normal side → only the first ray hit."""
+    ifc = ConnectivityGraph(
+        model_id="m_orient_side",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:B", kind="space", global_id="B", storey_global_id="L1"),
+            GraphNode(id="door:D", kind="door", global_id="D", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    footprints = FootprintsDocument(
+        model_id="m_orient_side",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", 0.2, -1, 2, 1),
+            _box_space("B", "L1", 0.5, -1, 3, 1),
+        ],
+        doors=[_oriented_door("D", "L1", 0, 0, nx=1, ny=0)],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    linked = {
+        e.source if e.source.startswith("space:") else e.target
+        for e in geo.edges
+        if e.method == "geom_door_space"
+    }
+    assert linked == {"space:A"}
+
+
+def test_oriented_door_inflate_excludes_far_room():
+    """Room beyond the 0.5 m inflate box is not a ray candidate."""
+    ifc = ConnectivityGraph(
+        model_id="m_orient_far",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:A", kind="space", global_id="A", storey_global_id="L1"),
+            GraphNode(id="space:FAR", kind="space", global_id="FAR", storey_global_id="L1"),
+            GraphNode(id="door:D", kind="door", global_id="D", storey_global_id="L1"),
+        ],
+        edges=[],
+    )
+    # FAR starts 2 m away — outside 0.5 m inflate around a ~0.1 m thick door.
+    footprints = FootprintsDocument(
+        model_id="m_orient_far",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("A", "L1", -4, -1, -0.05, 1),
+            _box_space("FAR", "L1", 2.0, -1, 4, 1),
+        ],
+        doors=[_oriented_door("D", "L1", 0, 0, nx=1, ny=0)],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    linked = {
+        e.source if e.source.startswith("space:") else e.target
+        for e in geo.edges
+        if e.method == "geom_door_space"
+    }
+    assert linked == {"space:A"}
+    assert "space:FAR" not in linked
+
+
+def test_oriented_door_ifc_one_link_picks_other_ray():
+    """IFC→RED; oriented ray toward GREEN adds only GREEN, not BLUE beyond it."""
+    ifc = ConnectivityGraph(
+        model_id="m_orient_ifc1",
+        variant="ifc",
+        nodes=[
+            GraphNode(id="space:RED", kind="space", global_id="RED", storey_global_id="L1"),
+            GraphNode(id="space:GREEN", kind="space", global_id="GREEN", storey_global_id="L1"),
+            GraphNode(id="space:BLUE", kind="space", global_id="BLUE", storey_global_id="L1"),
+            GraphNode(id="door:D", kind="door", global_id="D", storey_global_id="L1"),
+        ],
+        edges=[
+            GraphEdge(
+                id="eR",
+                kind="space_door",
+                source="space:RED",
+                target="door:D",
+                method="ifc_rel_space_boundary",
+                inferred=False,
+            ),
+        ],
+    )
+    footprints = FootprintsDocument(
+        model_id="m_orient_ifc1",
+        storeys=[{"global_id": "L1", "name": "L1", "elevation": 0.0}],
+        spaces=[
+            _box_space("RED", "L1", -4, -1, 0, 1),
+            _box_space("GREEN", "L1", 0.05, -1, 2, 1),
+            _box_space("BLUE", "L1", 0.5, -1, 3, 1),
+        ],
+        doors=[_oriented_door("D", "L1", 0, 0, nx=1, ny=0)],
+        stairs=[],
+    )
+    geo = build_geometry_graph(ifc, footprints)
+    geom = [
+        e.source if e.source.startswith("space:") else e.target
+        for e in geo.edges
+        if e.method == "geom_door_space"
+    ]
+    assert geom == ["space:GREEN"]
+    all_links = {
+        e.source if e.source.startswith("space:") else e.target
+        for e in geo.edges
+        if e.kind == "space_door"
+    }
+    assert all_links == {"space:RED", "space:GREEN"}
 
 
 def test_door_heal_rejects_same_side_of_ifc_host():

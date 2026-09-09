@@ -23,7 +23,12 @@ export type DoorPortal = {
   name: string;
   storey_global_id: string | null;
   point: Point2D | null;
+  /** Long axis of the leaf in plan (two endpoints), when known. */
   segment: Point2D[];
+  /** Plan hull of the door (thin rectangle). Empty/omitted when unmeasured. */
+  polygon?: Point2D[];
+  /** Unit XY through the wall (door facing). */
+  normal?: Point2D | null;
   incomplete: boolean;
   method: "ifc_mesh_xy_centroid" | "ifc_object_placement" | "unavailable";
 };

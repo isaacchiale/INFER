@@ -811,21 +811,39 @@ export function FloorplanViewer({ className }: { className?: string }) {
                       })
                     : null}
                   {layers.doors
-                    ? doors.map((d) =>
-                        d.point ? (
+                    ? doors.map((d) => {
+                        const poly = d.polygon && d.polygon.length >= 3 ? d.polygon : null;
+                        if (poly) {
+                          const dPath = poly
+                            .map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`)
+                            .join(" ") + " Z";
+                          return (
+                            <path
+                              key={d.global_id}
+                              d={dPath}
+                              fill="#f59e0b"
+                              fillOpacity={0.85}
+                              stroke="none"
+                            >
+                              <title>{d.name || d.global_id}</title>
+                            </path>
+                          );
+                        }
+                        if (!d.point) return null;
+                        // Legacy footprints without a plan rectangle.
+                        return (
                           <circle
                             key={d.global_id}
                             cx={d.point.x}
                             cy={d.point.y}
                             r={doorR}
                             fill="#f59e0b"
-                            stroke="#92400e"
-                            strokeWidth={doorStroke}
+                            stroke="none"
                           >
                             <title>{d.name || d.global_id}</title>
                           </circle>
-                        ) : null,
-                      )
+                        );
+                      })
                     : null}
 
                   {layers.route && pathD ? (
@@ -992,7 +1010,9 @@ export function FloorplanViewer({ className }: { className?: string }) {
                   {
                     key: "doors" as const,
                     label: "Door",
-                    swatch: <span className="inline-block size-2 rounded-full bg-[#f59e0b]" />,
+                    swatch: (
+                      <span className="inline-block h-1.5 w-3 rounded-[1px] bg-[#f59e0b]" />
+                    ),
                   },
                   {
                     key: "stairs" as const,

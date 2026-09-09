@@ -19,12 +19,16 @@ export type CytoscapeRuntime = {
     selectedNodeIds?: string[],
   ) => void;
   setTheme: (theme: "light" | "dark") => void;
+  /** Soft-remove / restore edges without rebuilding node positions. */
+  setExcludedEdges: (edgeIds: ReadonlySet<string>) => void;
   resize: () => void;
   fit: () => void;
   destroy: () => void;
   onSpaceTap: (handler: (nodeId: string) => void) => void;
   /** Right-click toggle for spaces / stairs / lifts (including excluded grid). */
   onNodeCxtTap: (handler: (nodeId: string) => void) => void;
+  /** Right-click toggle soft-remove / restore for connections. */
+  onEdgeCxtTap: (handler: (edgeId: string) => void) => void;
 };
 
 function stylesheet(p: GraphThemePalette): StylesheetJson {
@@ -126,12 +130,16 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
     {
       selector: "edge",
       style: {
-        width: 3,
+        width: 3.5,
         "line-color": p.edge,
         "curve-style": "bezier",
         "target-arrow-shape": "none",
         opacity: p.edgeOpacity,
         "z-index": 1,
+        // Enlarge hit target — thin strokes are nearly impossible to right-click.
+        "overlay-padding": 14,
+        "overlay-opacity": 0,
+        events: "yes",
       },
     },
     // Heal colours: door=yellow, space↔space=green, stair=purple.
@@ -165,7 +173,7 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
     {
       selector: "edge[vertical = 1]",
       style: {
-        "line-style": "dashed",
+        "line-style": "solid",
         "line-color": p.vertical,
         width: 2.5,
         opacity: p.verticalOpacity,
@@ -175,11 +183,21 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
     {
       selector: "edge[vertical = 1][heal = 'stair']",
       style: {
-        "line-style": "dashed",
+        "line-style": "solid",
         "line-color": "#7c3aed",
         width: 2.75,
         opacity: 0.95,
         "z-index": 2,
+      },
+    },
+    {
+      selector: "edge[excluded = 1]",
+      style: {
+        "line-style": "dashed",
+        "line-dash-pattern": [8, 6],
+        opacity: 0.4,
+        width: 3,
+        "z-index": 0,
       },
     },
     {
@@ -198,11 +216,12 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
 /** Positions in layout model space only — no container bake. */
 export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
   const elements: ElementDefinition[] = [];
-  const seen = new Set<string>();
+  const nodeSeen = new Set<string>();
+  const edgeSeen = new Set<string>();
 
   for (const node of layout.nodes) {
-    if (seen.has(node.id)) continue;
-    seen.add(node.id);
+    if (nodeSeen.has(node.id)) continue;
+    nodeSeen.add(node.id);
     elements.push({
       group: "nodes",
       data: {
@@ -220,8 +239,8 @@ export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
   }
 
   for (const edge of layout.edges) {
-    if (seen.has(edge.id)) continue;
-    seen.add(edge.id);
+    if (edgeSeen.has(edge.id)) continue;
+    edgeSeen.add(edge.id);
     elements.push({
       group: "edges",
       data: {
@@ -231,8 +250,11 @@ export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
         vertical: edge.vertical ? 1 : 0,
         inferred: edge.inferred ? 1 : 0,
         heal: edge.heal ?? "",
+        excluded: edge.excluded ? 1 : 0,
         onPath: 0,
       },
+      selectable: true,
+      grabbable: false,
     });
   }
 
@@ -407,6 +429,7 @@ export async function createCytoscapeRuntime(
 
   let spaceHandler: ((nodeId: string) => void) | null = null;
   let cxtHandler: ((nodeId: string) => void) | null = null;
+  let edgeCxtHandler: ((edgeId: string) => void) | null = null;
   cy.on("tap", "node", (evt) => {
     const id = String(evt.target.id());
     if (!id.startsWith("space:")) return;
@@ -425,6 +448,14 @@ export async function createCytoscapeRuntime(
       return;
     }
     cxtHandler?.(id);
+  });
+  // Prefer edge target; also catch bubbled cxttap when the stroke is hard to hit.
+  cy.on("cxttap", "edge", (evt) => {
+    evt.preventDefault();
+    evt.stopPropagation();
+    const id = String(evt.target.id());
+    if (!id) return;
+    edgeCxtHandler?.(id);
   });
   // Stop the browser context menu over the canvas (right-click restore/remove).
   container.addEventListener("contextmenu", (e) => {
@@ -519,6 +550,13 @@ export async function createCytoscapeRuntime(
         });
       });
     },
+    setExcludedEdges(edgeIds) {
+      cy.batch(() => {
+        cy.edges().forEach((e) => {
+          e.data("excluded", edgeIds.has(e.id()) ? 1 : 0);
+        });
+      });
+    },
     setTheme(next) {
       const p = graphPalette(next);
       cy.style().fromJson(stylesheet(p)).update();
@@ -545,6 +583,9 @@ export async function createCytoscapeRuntime(
     },
     onNodeCxtTap(handler) {
       cxtHandler = handler;
+    },
+    onEdgeCxtTap(handler) {
+      edgeCxtHandler = handler;
     },
   };
 }

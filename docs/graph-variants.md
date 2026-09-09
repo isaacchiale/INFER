@@ -32,14 +32,25 @@ Door healing (geometry)
 A door has at most two space links (IFC ∪ geom):
 
 - **≥2 IFC links** — no geometry top-up for that door
-- **1 IFC link** — add at most one partner: closest same-storey candidate within
-  1 m that passes the between-math **with the IFC-linked space**
-- **0 IFC links** — pick ≤2 spaces via between/nearest rules
+- **1 IFC link** — add at most one partner on the other side of the door
+- **0 IFC links** — pick ≤2 spaces (typically one per side)
 
-Between-math uses closest footprint points (not centroids): opposite approach
-directions when outside both (angle ≳ ~110°, contacts collinear through the
-door); when on/in one space, the other contact must lie along that space's
-outward wall normal at the door and near the same opening.
+When the door footprint carries a **facing normal** (plan thin-rectangle from the
+door mesh or ``ObjectPlacement`` axes):
+
+1. Inflate the door's plan AABB by **0.5 m** — only same-storey spaces whose
+   footprints intersect that box are candidates (fuzzy near-match).
+2. From the door point, cast a short ray (**≤ 1.0 m**) along ``±normal``.
+   The first candidate footprint each ray enters becomes a linked space.
+   A space that already contains the door counts as a hit at distance 0.
+
+This rejects same-side / around-the-corner rooms that the old centroid-style
+rules could mis-pair, while still linking a door that sits inside one room
+near an adjacent corridor.
+
+When ``normal`` is missing (older ``footprints.json``), fall back to the
+previous clearance + between-math rules (closest outline points, opposite
+approach / outward wall normal, 1 m clearance).
 
 Space↔space healing (geometry) — wall strip
 -------------------------------------------

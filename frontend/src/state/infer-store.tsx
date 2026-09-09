@@ -124,6 +124,10 @@ interface InferState {
   excludedNodeIds: ReadonlySet<string>;
   toggleExcludedNode: (nodeId: string) => void;
   clearExcludedNodes: () => void;
+  /** Soft-removed edges (right-click): shown dashed, blocked for routing. */
+  excludedEdgeIds: ReadonlySet<string>;
+  toggleExcludedEdge: (edgeId: string) => void;
+  clearExcludedEdges: () => void;
   graphSource: "demo" | "model" | "none";
   setModelGraph: (payload: {
     modelId: string;
@@ -178,6 +182,9 @@ export function InferProvider({ children }: { children: ReactNode }) {
   const [excludedNodeIds, setExcludedNodeIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  const [excludedEdgeIds, setExcludedEdgeIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const removedRef = useRef<ScenarioCondition | null>(null);
 
   const toggleExcludedNode = useCallback((nodeId: string) => {
@@ -191,6 +198,19 @@ export function InferProvider({ children }: { children: ReactNode }) {
 
   const clearExcludedNodes = useCallback(() => {
     setExcludedNodeIds(new Set());
+  }, []);
+
+  const toggleExcludedEdge = useCallback((edgeId: string) => {
+    setExcludedEdgeIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(edgeId)) next.delete(edgeId);
+      else next.add(edgeId);
+      return next;
+    });
+  }, []);
+
+  const clearExcludedEdges = useCallback(() => {
+    setExcludedEdgeIds(new Set());
   }, []);
 
   const queueIfcFile = useCallback(async (file: File) => {
@@ -214,6 +234,7 @@ export function InferProvider({ children }: { children: ReactNode }) {
       setFootprintsDocument(payload.footprints ?? null);
       setConnectivityRoute(null);
       setExcludedNodeIds(new Set());
+      setExcludedEdgeIds(new Set());
       const firstStorey =
         payload.footprints?.storeys[0]?.global_id ?? payload.entities.storeys[0]?.global_id;
       if (firstStorey) setActiveStoreyId(firstStorey);
@@ -228,6 +249,7 @@ export function InferProvider({ children }: { children: ReactNode }) {
     setFootprintsDocument(null);
     setConnectivityRoute(null);
     setExcludedNodeIds(new Set());
+    setExcludedEdgeIds(new Set());
     setPendingIfc(null);
     setViewerCameraPose(null);
     setViewerModelBounds(null);
@@ -376,6 +398,9 @@ export function InferProvider({ children }: { children: ReactNode }) {
       excludedNodeIds,
       toggleExcludedNode,
       clearExcludedNodes,
+      excludedEdgeIds,
+      toggleExcludedEdge,
+      clearExcludedEdges,
       graphSource: connectivityGraph ? "model" : "none",
       setModelGraph,
       clearModelGraph,
@@ -429,6 +454,9 @@ export function InferProvider({ children }: { children: ReactNode }) {
       excludedNodeIds,
       toggleExcludedNode,
       clearExcludedNodes,
+      excludedEdgeIds,
+      toggleExcludedEdge,
+      clearExcludedEdges,
       setModelGraph,
       clearModelGraph,
     ],

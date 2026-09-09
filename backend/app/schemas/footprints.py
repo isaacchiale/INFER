@@ -41,7 +41,12 @@ class DoorPortal(BaseModel):
     name: str = ""
     storey_global_id: str | None = None
     point: Point2D | None = None
+    """Long axis of the leaf in plan (two endpoints), when known."""
     segment: list[Point2D] = Field(default_factory=list)
+    """Plan hull of the door (thin rectangle). Empty when unmeasured."""
+    polygon: list[Point2D] = Field(default_factory=list)
+    """Unit XY vector through the wall (door facing). Used for ± ray heal."""
+    normal: Point2D | None = None
     incomplete: bool = False
     method: Literal[
         "ifc_mesh_xy_centroid",

@@ -9,7 +9,12 @@ import {
 } from "@/api/models";
 import { useInfer } from "@/state/infer-store";
 import { useAppTheme } from "@/hooks/use-app-theme";
-import { buildGraphLayout, deriveStoreyBands, graphPalette } from "@/lib/graph-layout";
+import {
+  blockedEdgeIdsFromExclusions,
+  buildGraphLayout,
+  deriveStoreyBands,
+  graphPalette,
+} from "@/lib/graph-layout";
 import {
   createCytoscapeRuntime,
   type CytoscapeRuntime,
@@ -53,6 +58,8 @@ export function GraphViewer({ className }: { className?: string }) {
     setConnectivityGraphOnly,
     excludedNodeIds,
     toggleExcludedNode,
+    excludedEdgeIds,
+    toggleExcludedEdge,
   } = useInfer();
   const theme = useAppTheme();
   const graph = connectivityGraph;
@@ -71,8 +78,11 @@ export function GraphViewer({ className }: { className?: string }) {
   );
 
   const layout = useMemo(
-    () => (graph && hasGraph ? buildGraphLayout(graph, bands, excludedNodeIds) : null),
-    [graph, bands, hasGraph, excludedNodeIds],
+    () =>
+      graph && hasGraph
+        ? buildGraphLayout(graph, bands, excludedNodeIds, excludedEdgeIds)
+        : null,
+    [graph, bands, hasGraph, excludedNodeIds, excludedEdgeIds],
   );
 
   /** Include edge inferred flags so green styling refreshes on variant switch. */
@@ -82,11 +92,15 @@ export function GraphViewer({ className }: { className?: string }) {
       .map((n) => `${n.id}:${n.x.toFixed(1)}:${n.y.toFixed(1)}:${n.excluded ? 1 : 0}`)
       .join("|");
     const edges = layout.edges
-      .map((e) => `${e.id}:${e.inferred ? 1 : 0}:${e.heal ?? ""}`)
+      .map(
+        (e) =>
+          `${e.id}:${e.inferred ? 1 : 0}:${e.heal ?? ""}:${e.excluded ? 1 : 0}`,
+      )
       .join("|");
     const excludedKey = [...excludedNodeIds].sort().join(",");
-    return `${nodes}#${edges}#${variant}#${excludedKey}`;
-  }, [layout, variant, excludedNodeIds]);
+    const excludedEdgesKey = [...excludedEdgeIds].sort().join(",");
+    return `${nodes}#${edges}#${variant}#${excludedKey}#${excludedEdgesKey}`;
+  }, [layout, variant, excludedNodeIds, excludedEdgeIds]);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
   const runtimeRef = useRef<CytoscapeRuntime | null>(null);
@@ -96,6 +110,8 @@ export function GraphViewer({ className }: { className?: string }) {
   const clickMode = useRef<"origin" | "destination">("origin");
   const toggleExcludedRef = useRef(toggleExcludedNode);
   toggleExcludedRef.current = toggleExcludedNode;
+  const toggleExcludedEdgeRef = useRef(toggleExcludedEdge);
+  toggleExcludedEdgeRef.current = toggleExcludedEdge;
   const [engineReady, setEngineReady] = useState(false);
   const [cyError, setCyError] = useState<string | null>(null);
 
@@ -211,6 +227,11 @@ export function GraphViewer({ className }: { className?: string }) {
   }, [backendModelId, excludedNodeIds, graphSource, setConnectivityGraphOnly, variant]);
 
   const blockedNodeIds = useMemo(() => [...excludedNodeIds], [excludedNodeIds]);
+  // Display edges use synthetic viz-door ids; expand to real space_door / space_space ids.
+  const blockedEdgeIds = useMemo(
+    () => (graph ? blockedEdgeIdsFromExclusions(graph, excludedEdgeIds) : [...excludedEdgeIds]),
+    [graph, excludedEdgeIds],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -236,6 +257,7 @@ export function GraphViewer({ className }: { className?: string }) {
             destination_node_id: destination,
             graph_variant: variant,
             blocked_node_ids: blockedNodeIds,
+            blocked_edge_ids: blockedEdgeIds,
             graph: variant === "geometry" ? graph : undefined,
           })
         : computeRoute({
@@ -243,6 +265,7 @@ export function GraphViewer({ className }: { className?: string }) {
             destination_node_id: destination,
             graph,
             blocked_node_ids: blockedNodeIds,
+            blocked_edge_ids: blockedEdgeIds,
           });
 
     void run
@@ -274,7 +297,9 @@ export function GraphViewer({ className }: { className?: string }) {
     graph,
     variant,
     blockedNodeIds,
+    blockedEdgeIds,
     excludedNodeIds,
+    excludedEdgeIds,
     setConnectivityRoute,
   ]);
 
@@ -305,6 +330,9 @@ export function GraphViewer({ className }: { className?: string }) {
         runtime.onNodeCxtTap((id) => {
           toggleExcludedRef.current(id);
         });
+        runtime.onEdgeCxtTap((id) => {
+          toggleExcludedEdgeRef.current(id);
+        });
         runtime.setTheme(themeRef.current);
         // Layout + fit come only from the layout effect — avoid a double setLayout
         // race that cancels the first fit and re-frames while the user zooms.
@@ -331,6 +359,11 @@ export function GraphViewer({ className }: { className?: string }) {
     if (!engineReady || !runtimeRef.current) return;
     runtimeRef.current.setTheme(theme);
   }, [theme, engineReady]);
+
+  useEffect(() => {
+    if (!engineReady || !runtimeRef.current) return;
+    runtimeRef.current.setExcludedEdges(excludedEdgeIds);
+  }, [excludedEdgeIds, engineReady, layoutFingerprint]);
 
   useEffect(() => {
     if (!engineReady || !runtimeRef.current) return;
@@ -374,7 +407,7 @@ export function GraphViewer({ className }: { className?: string }) {
             overscrollBehavior: "contain",
           }}
           aria-label="Connectivity graph canvas"
-          title="Left-click space: set origin/destination. Right-click node: remove or restore."
+          title="Left-click space: set origin/destination. Right-click node: remove or restore. Right-click link: disable or restore (dashed)."
         />
         <div className="pointer-events-none absolute left-2 top-2 z-50 flex flex-col items-start gap-1.5">
           <DropdownMenu>
@@ -428,9 +461,19 @@ export function GraphViewer({ className }: { className?: string }) {
               </span>
             </div>
           )}
-          {excludedNodeIds.size > 0 && (
+          {(excludedNodeIds.size > 0 || excludedEdgeIds.size > 0) && (
             <span className="rounded-md border border-border/80 bg-background/90 px-2 py-1 text-[10px] text-muted-foreground backdrop-blur-sm">
-              {excludedNodeIds.size} removed — right-click to restore
+              {[
+                excludedNodeIds.size > 0
+                  ? `${excludedNodeIds.size} node${excludedNodeIds.size === 1 ? "" : "s"} removed`
+                  : null,
+                excludedEdgeIds.size > 0
+                  ? `${excludedEdgeIds.size} link${excludedEdgeIds.size === 1 ? "" : "s"} disabled`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}{" "}
+              — right-click to restore
             </span>
           )}
           {variantBusy && (

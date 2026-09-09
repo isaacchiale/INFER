@@ -11,13 +11,15 @@ Method (spaces):
 4. If neither works → incomplete=True, empty polygon.
 
 Stairs stay on convex hull / bbox for plan overlay (v1).
-Door portals use mesh XY centroid, else ObjectPlacement translation.
+Door portals use mesh plan hull (thin rectangle + facing normal) when possible,
+else ObjectPlacement axes / OverallWidth×OverallDepth, else a point only.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
 from typing import Iterable
+import math
 
 import ifcopenshell
 import ifcopenshell.geom
@@ -369,6 +371,205 @@ def _placement_xy(element) -> tuple[float, float] | None:
         return None
 
 
+def _placement_axes_xy(
+    element,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None:
+    """
+    World origin + unit local-X / local-Y projected to XY.
+    For IfcDoor, local X is typically along the opening width and local Y
+    through the wall (facing) — we still verify thinness when Overall* exists.
+    """
+    if getattr(element, "ObjectPlacement", None) is None:
+        return None
+    try:
+        matrix = ifcopenshell.util.placement.get_local_placement(element.ObjectPlacement)
+    except Exception:  # noqa: BLE001
+        return None
+    ox, oy = float(matrix[0][3]), float(matrix[1][3])
+    lx = (float(matrix[0][0]), float(matrix[1][0]))
+    ly = (float(matrix[0][1]), float(matrix[1][1]))
+    llx = math.hypot(lx[0], lx[1])
+    lly = math.hypot(ly[0], ly[1])
+    if llx < 1e-9 or lly < 1e-9:
+        return None
+    return (
+        (ox, oy),
+        (lx[0] / llx, lx[1] / llx),
+        (ly[0] / lly, ly[1] / lly),
+    )
+
+
+def _rect_from_centre(
+    cx: float,
+    cy: float,
+    along: tuple[float, float],
+    through: tuple[float, float],
+    half_along: float,
+    half_through: float,
+) -> list[Point2D]:
+    ax, ay = along
+    tx, ty = through
+    corners = [
+        (cx - ax * half_along - tx * half_through, cy - ay * half_along - ty * half_through),
+        (cx + ax * half_along - tx * half_through, cy + ay * half_along - ty * half_through),
+        (cx + ax * half_along + tx * half_through, cy + ay * half_along + ty * half_through),
+        (cx - ax * half_along + tx * half_through, cy - ay * half_along + ty * half_through),
+    ]
+    return [Point2D(x=x, y=y) for x, y in corners]
+
+
+def _orientation_from_hull(
+    xy: list[tuple[float, float]],
+) -> tuple[Point2D, list[Point2D], Point2D, list[Point2D]] | None:
+    """
+    From a plan point cloud: centroid, thin rectangle, unit through-wall normal,
+    and leaf segment (long axis endpoints).
+    """
+    hull = _convex_hull(_unique_xy(xy))
+    if len(hull) < 2:
+        return None
+    cx = sum(p[0] for p in hull) / len(hull)
+    cy = sum(p[1] for p in hull) / len(hull)
+    if len(hull) == 2:
+        (x0, y0), (x1, y1) = hull[0], hull[1]
+        along_len = math.hypot(x1 - x0, y1 - y0)
+        if along_len < 1e-9:
+            return None
+        ax, ay = (x1 - x0) / along_len, (y1 - y0) / along_len
+        nx, ny = -ay, ax
+        half_along = along_len * 0.5
+        half_through = 0.05
+        poly = _rect_from_centre(cx, cy, (ax, ay), (nx, ny), half_along, half_through)
+        return (
+            Point2D(x=cx, y=cy),
+            poly,
+            Point2D(x=nx, y=ny),
+            [Point2D(x=cx - ax * half_along, y=cy - ay * half_along),
+             Point2D(x=cx + ax * half_along, y=cy + ay * half_along)],
+        )
+
+    # Rotating calipers on hull edges: thinnest direction = through-wall normal.
+    best_thick = float("inf")
+    best: tuple[float, float, float, float, float, float] | None = None
+    n = len(hull)
+    for i in range(n):
+        x0, y0 = hull[i]
+        x1, y1 = hull[(i + 1) % n]
+        ex, ey = x1 - x0, y1 - y0
+        el = math.hypot(ex, ey)
+        if el < 1e-9:
+            continue
+        ax, ay = ex / el, ey / el
+        nx, ny = -ay, ax
+        projs_a = [p[0] * ax + p[1] * ay for p in hull]
+        projs_n = [p[0] * nx + p[1] * ny for p in hull]
+        thick = max(projs_n) - min(projs_n)
+        along_span = max(projs_a) - min(projs_a)
+        if thick < best_thick - 1e-9 or (
+            abs(thick - best_thick) <= 1e-9 and along_span > (best[4] if best else 0)
+        ):
+            best_thick = thick
+            best = (ax, ay, nx, ny, along_span, thick)
+    if best is None:
+        return None
+    ax, ay, nx, ny, along_span, thick = best
+    # Ensure "through" is the thinner axis.
+    if along_span < thick:
+        ax, ay, nx, ny = nx, ny, ax, ay
+        along_span, thick = thick, along_span
+    half_along = max(along_span * 0.5, 0.15)
+    half_through = max(thick * 0.5, 0.04)
+    poly = _rect_from_centre(cx, cy, (ax, ay), (nx, ny), half_along, half_through)
+    segment = [
+        Point2D(x=cx - ax * half_along, y=cy - ay * half_along),
+        Point2D(x=cx + ax * half_along, y=cy + ay * half_along),
+    ]
+    return Point2D(x=cx, y=cy), poly, Point2D(x=nx, y=ny), segment
+
+
+def _orientation_from_placement(door) -> tuple[Point2D, list[Point2D], Point2D, list[Point2D]] | None:
+    axes = _placement_axes_xy(door)
+    if axes is None:
+        return None
+    (ox, oy), lx, ly = axes
+    width = getattr(door, "OverallWidth", None)
+    depth = getattr(door, "OverallDepth", None)
+    w = float(width) if width else 0.9
+    d = float(depth) if depth else 0.12
+    # Thinner Overall* axis is through-wall; prefer local Y when equal-ish.
+    if d <= w:
+        along, through = lx, ly
+        half_along, half_through = w * 0.5, max(d * 0.5, 0.04)
+    else:
+        along, through = ly, lx
+        half_along, half_through = d * 0.5, max(w * 0.5, 0.04)
+    poly = _rect_from_centre(ox, oy, along, through, half_along, half_through)
+    segment = [
+        Point2D(x=ox - along[0] * half_along, y=oy - along[1] * half_along),
+        Point2D(x=ox + along[0] * half_along, y=oy + along[1] * half_along),
+    ]
+    return Point2D(x=ox, y=oy), poly, Point2D(x=through[0], y=through[1]), segment
+
+
+def _door_portal(ifc, door) -> DoorPortal:
+    gid = _gid(door)
+    storey = _storey_gid(ifc, door)
+    name = _name(door)
+
+    xy = _mesh_xy_points(door)
+    oriented = _orientation_from_hull(xy) if xy else None
+    if oriented is None:
+        oriented = _orientation_from_placement(door)
+
+    if oriented is not None:
+        point, polygon, normal, segment = oriented
+        method = "ifc_mesh_xy_centroid" if xy else "ifc_object_placement"
+        return DoorPortal(
+            global_id=gid,
+            name=name,
+            storey_global_id=storey,
+            point=point,
+            segment=segment,
+            polygon=polygon,
+            normal=normal,
+            incomplete=False,
+            method=method,
+        )
+
+    # Last resort: point only (legacy behaviour).
+    if xy:
+        cx = sum(p[0] for p in xy) / len(xy)
+        cy = sum(p[1] for p in xy) / len(xy)
+        return DoorPortal(
+            global_id=gid,
+            name=name,
+            storey_global_id=storey,
+            point=Point2D(x=cx, y=cy),
+            incomplete=False,
+            method="ifc_mesh_xy_centroid",
+        )
+
+    origin = _placement_xy(door)
+    if origin is not None:
+        return DoorPortal(
+            global_id=gid,
+            name=name,
+            storey_global_id=storey,
+            point=Point2D(x=origin[0], y=origin[1]),
+            incomplete=False,
+            method="ifc_object_placement",
+        )
+
+    return DoorPortal(
+        global_id=gid,
+        name=name,
+        storey_global_id=storey,
+        point=None,
+        incomplete=True,
+        method="unavailable",
+    )
+
+
 def _bbox_polygon_from_placement(element) -> list[tuple[float, float]] | None:
     origin = _placement_xy(element)
     if origin is None:
@@ -443,45 +644,6 @@ def _space_footprint(ifc, space) -> SpaceFootprint:
         storey_global_id=storey,
         polygon=[],
         holes=[],
-        incomplete=True,
-        method="unavailable",
-    )
-
-
-def _door_portal(ifc, door) -> DoorPortal:
-    gid = _gid(door)
-    storey = _storey_gid(ifc, door)
-    name = _name(door)
-
-    xy = _mesh_xy_points(door)
-    if xy:
-        cx = sum(p[0] for p in xy) / len(xy)
-        cy = sum(p[1] for p in xy) / len(xy)
-        return DoorPortal(
-            global_id=gid,
-            name=name,
-            storey_global_id=storey,
-            point=Point2D(x=cx, y=cy),
-            incomplete=False,
-            method="ifc_mesh_xy_centroid",
-        )
-
-    origin = _placement_xy(door)
-    if origin is not None:
-        return DoorPortal(
-            global_id=gid,
-            name=name,
-            storey_global_id=storey,
-            point=Point2D(x=origin[0], y=origin[1]),
-            incomplete=False,
-            method="ifc_object_placement",
-        )
-
-    return DoorPortal(
-        global_id=gid,
-        name=name,
-        storey_global_id=storey,
-        point=None,
         incomplete=True,
         method="unavailable",
     )
