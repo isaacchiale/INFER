@@ -13,7 +13,7 @@ import {
   doorwayVoidsInSpace,
   MinHeap,
 } from "@/lib/geometric-path";
-import type { FootprintsDocument, Point2D, SpaceFootprint } from "@/types/footprints";
+import type { DoorPortal, FootprintsDocument, Point2D, SpaceFootprint } from "@/types/footprints";
 import type { ConnectivityGraph, GraphEdge } from "@/types/graph";
 
 export type NavmeshRegion = {
@@ -83,44 +83,76 @@ export function doorIdFromVizEdge(edgeId: string): string | null {
   return null;
 }
 
+function spacesById(footprints: FootprintsDocument): Map<string, SpaceFootprint> {
+  const map = new Map<string, SpaceFootprint>();
+  for (const s of footprints.spaces) map.set(s.global_id, s);
+  return map;
+}
+
+function doorsByGlobalId(footprints: FootprintsDocument): Map<string, DoorPortal> {
+  const map = new Map<string, DoorPortal>();
+  for (const d of footprints.doors) map.set(d.global_id, d);
+  return map;
+}
+
+/** Sorted "a|b" key so either edge direction maps to the same bucket. */
+function pairKey(a: string, b: string): string {
+  return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+function edgesById(graph: ConnectivityGraph): Map<string, GraphEdge> {
+  const map = new Map<string, GraphEdge>();
+  for (const e of graph.edges) map.set(e.id, e);
+  return map;
+}
+
+function edgesByPairKey(graph: ConnectivityGraph): Map<string, GraphEdge[]> {
+  const map = new Map<string, GraphEdge[]>();
+  for (const e of graph.edges) {
+    const key = pairKey(e.source, e.target);
+    const list = map.get(key);
+    if (list) list.push(e);
+    else map.set(key, [e]);
+  }
+  return map;
+}
+
 function spaceOnStorey(
-  footprints: FootprintsDocument,
+  spaceById: Map<string, SpaceFootprint>,
   spaceNodeId: string,
   storeyId: string,
 ): boolean {
   if (!spaceNodeId.startsWith("space:")) return false;
   const gid = spaceNodeId.slice("space:".length);
-  const space = footprints.spaces.find((s) => s.global_id === gid);
+  const space = spaceById.get(gid);
   if (!space || space.incomplete || space.polygon.length < 3) return false;
   return space.storey_global_id === storeyId;
 }
 
 function portalPointForDisplayEdge(
-  footprints: FootprintsDocument,
-  graph: ConnectivityGraph,
   edge: GraphEdge & { collapsed?: boolean },
+  doorById: Map<string, DoorPortal>,
+  edgeById: Map<string, GraphEdge>,
+  edgesByPair: Map<string, GraphEdge[]>,
+  spaceById: Map<string, SpaceFootprint>,
 ): Point2D | null {
   const doorId = doorIdFromVizEdge(edge.id);
   if (doorId) {
     const gid = doorId.slice("door:".length);
-    const door = footprints.doors.find((d) => d.global_id === gid);
+    const door = doorById.get(gid);
     if (door?.point) return { x: door.point.x, y: door.point.y };
     if (door?.segment && door.segment.length >= 2) {
       return midpoint(door.segment[0]!, door.segment[1]!);
     }
   }
 
-  const real = graph.edges.find((e) => e.id === edge.id);
+  const real = edgeById.get(edge.id);
   if (real?.portal && Number.isFinite(real.portal.x) && Number.isFinite(real.portal.y)) {
     return { x: real.portal.x, y: real.portal.y };
   }
 
   // Any direct graph edge between the same pair with a portal.
-  for (const e of graph.edges) {
-    const pair =
-      (e.source === edge.source && e.target === edge.target) ||
-      (e.source === edge.target && e.target === edge.source);
-    if (!pair) continue;
+  for (const e of edgesByPair.get(pairKey(edge.source, edge.target)) ?? []) {
     if (e.portal && Number.isFinite(e.portal.x) && Number.isFinite(e.portal.y)) {
       return { x: e.portal.x, y: e.portal.y };
     }
@@ -128,8 +160,8 @@ function portalPointForDisplayEdge(
 
   const aGid = edge.source.startsWith("space:") ? edge.source.slice(6) : null;
   const bGid = edge.target.startsWith("space:") ? edge.target.slice(6) : null;
-  const a = aGid ? footprints.spaces.find((s) => s.global_id === aGid) : null;
-  const b = bGid ? footprints.spaces.find((s) => s.global_id === bGid) : null;
+  const a = aGid ? spaceById.get(aGid) : null;
+  const b = bGid ? spaceById.get(bGid) : null;
   if (a && b && a.polygon.length >= 3 && b.polygon.length >= 3) {
     return midpoint(polygonCentroid(a.polygon), polygonCentroid(b.polygon));
   }
@@ -147,10 +179,25 @@ export function buildStoreyNavmesh(
   opts: {
     excludedNodeIds?: ReadonlySet<string>;
     excludedEdgeIds?: ReadonlySet<string>;
+    /**
+     * Precomputed by callers that build meshes for every storey in one pass
+     * (e.g. buildAllStoreyNavmeshes) — toDisplayGraph's result doesn't depend
+     * on storeyId, so recomputing it per storey would redo the same full
+     * graph pass N times for an N-storey building.
+     */
+    display?: ReturnType<typeof toDisplayGraph>;
+    spaceById?: Map<string, SpaceFootprint>;
+    doorById?: Map<string, DoorPortal>;
+    edgeById?: Map<string, GraphEdge>;
+    edgesByPair?: Map<string, GraphEdge[]>;
   } = {},
 ): StoreyNavmesh {
   const excludedNodes = opts.excludedNodeIds ?? new Set<string>();
   const excludedEdges = opts.excludedEdgeIds ?? new Set<string>();
+  const spaceById = opts.spaceById ?? spacesById(footprints);
+  const doorById = opts.doorById ?? doorsByGlobalId(footprints);
+  const edgeById = opts.edgeById ?? edgesById(graph);
+  const edgesByPair = opts.edgesByPair ?? edgesByPairKey(graph);
 
   const regions: NavmeshRegion[] = [];
   for (const space of footprints.spaces) {
@@ -168,7 +215,7 @@ export function buildStoreyNavmesh(
   }
 
   const regionIds = new Set(regions.map((r) => r.spaceId));
-  const display = toDisplayGraph(graph);
+  const display = opts.display ?? toDisplayGraph(graph);
   const portals: NavmeshPortal[] = [];
   const seen = new Set<string>();
 
@@ -177,8 +224,8 @@ export function buildStoreyNavmesh(
     if (excludedEdges.has(edge.id)) continue;
     if (excludedNodes.has(edge.source) || excludedNodes.has(edge.target)) continue;
     if (!regionIds.has(edge.source) || !regionIds.has(edge.target)) continue;
-    if (!spaceOnStorey(footprints, edge.source, storeyId)) continue;
-    if (!spaceOnStorey(footprints, edge.target, storeyId)) continue;
+    if (!spaceOnStorey(spaceById, edge.source, storeyId)) continue;
+    if (!spaceOnStorey(spaceById, edge.target, storeyId)) continue;
 
     const a = edge.source < edge.target ? edge.source : edge.target;
     const b = edge.source < edge.target ? edge.target : edge.source;
@@ -186,7 +233,7 @@ export function buildStoreyNavmesh(
     if (seen.has(key)) continue;
     seen.add(key);
 
-    const point = portalPointForDisplayEdge(footprints, graph, edge);
+    const point = portalPointForDisplayEdge(edge, doorById, edgeById, edgesByPair, spaceById);
     if (!point) continue;
 
     const kind: NavmeshPortal["kind"] =
@@ -251,7 +298,7 @@ export function buildStoreyNavmesh(
     const spaceId = spaces[0]!;
     if (!regionIds.has(spaceId)) continue;
     if (excludedNodes.has(doorId) || excludedNodes.has(spaceId)) continue;
-    if (!spaceOnStorey(footprints, spaceId, storeyId)) continue;
+    if (!spaceOnStorey(spaceById, spaceId, storeyId)) continue;
 
     const id = `viz-exit:${doorId}:${spaceId}`;
     if (excludedEdges.has(id)) continue;
@@ -299,8 +346,26 @@ export function buildAllStoreyNavmeshes(
   for (const id of storeyIds) {
     if (!ordered.includes(id)) ordered.push(id);
   }
+  // Computed once and shared across storeys: none of these depend on
+  // storeyId, so recomputing them per storey would redo the same full
+  // graph/footprints pass N times for an N-storey building, and the .find()
+  // scans they replace turn each portal lookup into O(1) map gets.
+  const display = toDisplayGraph(graph);
+  const spaceById = spacesById(footprints);
+  const doorById = doorsByGlobalId(footprints);
+  const edgeById = edgesById(graph);
+  const edgesByPair = edgesByPairKey(graph);
   return ordered
-    .map((id) => buildStoreyNavmesh(footprints, graph, id, opts))
+    .map((id) =>
+      buildStoreyNavmesh(footprints, graph, id, {
+        ...opts,
+        display,
+        spaceById,
+        doorById,
+        edgeById,
+        edgesByPair,
+      }),
+    )
     .filter((m) => m.regions.length > 0);
 }
 

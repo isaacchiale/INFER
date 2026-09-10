@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from typing import Iterable
+import logging
 import math
 
 import ifcopenshell
@@ -38,6 +39,8 @@ from app.schemas.footprints import (
 )
 from app.services.graph import _gid, _name, _storey_gid
 from app.services.ifc_units import length_to_metres
+
+logger = logging.getLogger(__name__)
 
 # Quantize XY when matching mesh edges (metres).
 _XY_NDIGITS = 4
@@ -178,6 +181,7 @@ def _mesh_verts_faces(element) -> tuple[list[tuple[float, float, float]], list[t
             faces.append((int(faces_raw[i]), int(faces_raw[i + 1]), int(faces_raw[i + 2])))
         return verts, faces
     except Exception:  # noqa: BLE001
+        logger.debug("no mesh geometry for %s", getattr(element, "GlobalId", "?"), exc_info=True)
         return [], []
 
 
@@ -369,6 +373,7 @@ def _placement_xy(element) -> tuple[float, float] | None:
         matrix = ifcopenshell.util.placement.get_local_placement(element.ObjectPlacement)
         return float(matrix[0][3]), float(matrix[1][3])
     except Exception:  # noqa: BLE001
+        logger.debug("no placement xy for %s", getattr(element, "GlobalId", "?"), exc_info=True)
         return None
 
 
@@ -385,6 +390,7 @@ def _placement_axes_xy(
     try:
         matrix = ifcopenshell.util.placement.get_local_placement(element.ObjectPlacement)
     except Exception:  # noqa: BLE001
+        logger.debug("no placement axes for %s", getattr(element, "GlobalId", "?"), exc_info=True)
         return None
     ox, oy = float(matrix[0][3]), float(matrix[1][3])
     lx = (float(matrix[0][0]), float(matrix[1][0]))

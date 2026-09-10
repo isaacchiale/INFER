@@ -23,8 +23,6 @@ import type { ViewerCameraPose, ThreeAabb, Mat4Elements } from "@/lib/viewer-cam
 
 export type WorkMode = "model" | "navigate" | "layers" | "validate" | "scenario";
 
-export type StoreyDisplayMode = "all" | "isolate" | "ghost" | "explode";
-
 /**
  * Floorplan click-to-click route (pins + A* polyline). Survives IFC/navmesh
  * mode toggles and storey switches — the end pin may land on a different
@@ -59,8 +57,6 @@ interface InferState {
   // viewport
   activeStoreyId: string | "all";
   setActiveStoreyId: (id: string | "all") => void;
-  storeyMode: StoreyDisplayMode;
-  setStoreyMode: (m: StoreyDisplayMode) => void;
   layers: LayerState[];
   toggleLayer: (id: LayerId) => void;
   setAllLayers: (visible: boolean) => void;
@@ -76,8 +72,6 @@ interface InferState {
   computing: boolean;
   computeRoute: () => void;
   clearRoute: () => void;
-  comparison: { original: Route; revised: Route } | null;
-  setComparison: (c: { original: Route; revised: Route } | null) => void;
 
   // animation
   animation: { playing: boolean; stepIndex: number };
@@ -98,14 +92,6 @@ interface InferState {
   setSelectedIssueId: (id: string | null) => void;
 
   // chrome
-  panelCollapsed: boolean;
-  setPanelCollapsed: (v: boolean) => void;
-  railCollapsed: boolean;
-  setRailCollapsed: (v: boolean) => void;
-  statusExpanded: boolean;
-  setStatusExpanded: (v: boolean) => void;
-  emergencyMode: boolean;
-  setEmergencyMode: (v: boolean) => void;
   ingestOpen: boolean;
   setIngestOpen: (v: boolean) => void;
 
@@ -211,7 +197,6 @@ export function InferProvider({ children }: { children: ReactNode }) {
 function InferProviderInner({ children }: { children: ReactNode }) {
   const [workMode, setWorkMode] = useState<WorkMode>("model");
   const [activeStoreyId, setActiveStoreyId] = useState<string | "all">("all");
-  const [storeyMode, setStoreyMode] = useState<StoreyDisplayMode>("all");
   const [layers, setLayers] = useState<LayerState[]>(defaultLayers);
   const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
   const [request, setRequest] = useState<RouteRequest>({
@@ -223,14 +208,9 @@ function InferProviderInner({ children }: { children: ReactNode }) {
   });
   const [route, setRoute] = useState<Route | null>(defaultRoute);
   const [computing, setComputing] = useState(false);
-  const [comparison, setComparison] = useState<{ original: Route; revised: Route } | null>(null);
   const [animation, setAnimation] = useState({ playing: false, stepIndex: 0 });
   const [conditions, setConditions] = useState<ScenarioCondition[]>(mockScenario.conditions);
   const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
-  const [panelCollapsed, setPanelCollapsed] = useState(false);
-  const [railCollapsed, setRailCollapsed] = useState(false);
-  const [statusExpanded, setStatusExpanded] = useState(false);
-  const [emergencyMode, setEmergencyMode] = useState(false);
   const [ingestOpen, setIngestOpen] = useState(false);
   const [pendingIfc, setPendingIfc] = useState<{ name: string; buffer: Uint8Array } | null>(
     null,
@@ -383,7 +363,6 @@ function InferProviderInner({ children }: { children: ReactNode }) {
 
   const clearRoute = useCallback(() => {
     setRoute(null);
-    setComparison(null);
     setAnimation({ playing: false, stepIndex: 0 });
   }, []);
 
@@ -419,8 +398,6 @@ function InferProviderInner({ children }: { children: ReactNode }) {
       setWorkMode,
       activeStoreyId,
       setActiveStoreyId,
-      storeyMode,
-      setStoreyMode,
       layers,
       toggleLayer,
       setAllLayers,
@@ -432,8 +409,6 @@ function InferProviderInner({ children }: { children: ReactNode }) {
       computing,
       computeRoute,
       clearRoute,
-      comparison,
-      setComparison,
       animation,
       play,
       pause,
@@ -446,14 +421,6 @@ function InferProviderInner({ children }: { children: ReactNode }) {
       hazardZones: mockHazards,
       selectedIssueId,
       setSelectedIssueId,
-      panelCollapsed,
-      setPanelCollapsed,
-      railCollapsed,
-      setRailCollapsed,
-      statusExpanded,
-      setStatusExpanded,
-      emergencyMode,
-      setEmergencyMode,
       ingestOpen,
       setIngestOpen,
       pendingIfc,
@@ -484,7 +451,6 @@ function InferProviderInner({ children }: { children: ReactNode }) {
     [
       workMode,
       activeStoreyId,
-      storeyMode,
       layers,
       toggleLayer,
       setAllLayers,
@@ -496,7 +462,6 @@ function InferProviderInner({ children }: { children: ReactNode }) {
       computing,
       computeRoute,
       clearRoute,
-      comparison,
       animation,
       play,
       pause,
@@ -507,10 +472,6 @@ function InferProviderInner({ children }: { children: ReactNode }) {
       removeCondition,
       undoRemove,
       selectedIssueId,
-      panelCollapsed,
-      railCollapsed,
-      statusExpanded,
-      emergencyMode,
       ingestOpen,
       pendingIfc,
       queueIfcFile,
