@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  buildAllStoreyNavmeshes,
   buildStoreyNavmesh,
+  buildVerticalConnectors,
   doorIdFromVizEdge,
+  findMultiStoreyNavmeshPath,
   findNavmeshPath,
   findNearestExitPath,
   regionAtPoint,
@@ -253,6 +256,110 @@ describe("navmesh", () => {
 
       const open = findNavmeshPath(mesh, { x: 1, y: 2 }, { x: 7, y: 2 }, footprints);
       assert.equal(open.found, true);
+    });
+  });
+
+  describe("vertical linking across storeys", () => {
+    const multiStoreyFootprints: FootprintsDocument = {
+      ...footprints,
+      storeys: [
+        { global_id: "S1", name: "L1", elevation: 0 },
+        { global_id: "S2", name: "L2", elevation: 3 },
+      ],
+      spaces: [
+        ...footprints.spaces,
+        {
+          global_id: "C",
+          name: "C",
+          storey_global_id: "S2",
+          polygon: [
+            { x: 0, y: 0 },
+            { x: 4, y: 0 },
+            { x: 4, y: 4 },
+            { x: 0, y: 4 },
+          ],
+          incomplete: false,
+          method: "ifc_placement_bbox",
+        },
+      ],
+    };
+
+    const multiStoreyGraph: ConnectivityGraph = {
+      ...graph,
+      nodes: [
+        ...graph.nodes,
+        { id: "space:C", kind: "space", global_id: "C", name: "C", storey_global_id: "S2" },
+        { id: "stair:ST", kind: "stair", global_id: "ST", name: "Stair", storey_global_id: "S1" },
+      ],
+      edges: [
+        ...graph.edges,
+        {
+          id: "vertical:ST:A:geom",
+          kind: "vertical",
+          source: "space:A",
+          target: "stair:ST",
+          method: "geom_stair_space",
+          inferred: true,
+        },
+        {
+          id: "vertical:ST:C:geom",
+          kind: "vertical",
+          source: "space:C",
+          target: "stair:ST",
+          method: "geom_stair_space",
+          inferred: true,
+        },
+      ],
+    };
+
+    it("groups vertical edges by stair id across storeys", () => {
+      const connectors = buildVerticalConnectors(multiStoreyGraph, multiStoreyFootprints);
+      const stairConnectors = connectors.get("stair:ST");
+      assert.ok(stairConnectors);
+      assert.equal(stairConnectors!.length, 2);
+      assert.deepEqual(stairConnectors!.map((c) => c.storeyId).sort(), ["S1", "S2"]);
+    });
+
+    it("routes across storeys through a shared stair", () => {
+      const meshes = buildAllStoreyNavmeshes(multiStoreyFootprints, multiStoreyGraph);
+      assert.equal(meshes.length, 2);
+      const result = findMultiStoreyNavmeshPath(
+        meshes,
+        multiStoreyGraph,
+        multiStoreyFootprints,
+        { storeyId: "S1", point: { x: 1, y: 1 } },
+        { storeyId: "S2", point: { x: 3, y: 3 } },
+      );
+      assert.equal(result.found, true);
+      assert.equal(result.segments.length, 2);
+      assert.equal(result.segments[0]!.storeyId, "S1");
+      assert.equal(result.segments[1]!.storeyId, "S2");
+    });
+
+    it("fails when the connecting stair landing is blocked", () => {
+      const meshes = buildAllStoreyNavmeshes(multiStoreyFootprints, multiStoreyGraph);
+      const result = findMultiStoreyNavmeshPath(
+        meshes,
+        multiStoreyGraph,
+        multiStoreyFootprints,
+        { storeyId: "S1", point: { x: 1, y: 1 } },
+        { storeyId: "S2", point: { x: 3, y: 3 } },
+        { blockedConnectorIds: new Set(["stair:ST@S1"]) },
+      );
+      assert.equal(result.found, false);
+    });
+
+    it("delegates to findNavmeshPath for a same-storey request", () => {
+      const meshes = buildAllStoreyNavmeshes(footprints, graph);
+      const result = findMultiStoreyNavmeshPath(
+        meshes,
+        graph,
+        footprints,
+        { storeyId: "S1", point: { x: 1, y: 2 } },
+        { storeyId: "S1", point: { x: 7, y: 2 } },
+      );
+      assert.equal(result.found, true);
+      assert.equal(result.segments.length, 1);
     });
   });
 });

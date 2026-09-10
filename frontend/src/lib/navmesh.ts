@@ -1,6 +1,8 @@
 /**
  * Per-storey portal navmesh: walkable space footprints linked by graph portals
- * (doors / space↔space). No vertical linking yet.
+ * (doors / space↔space), plus engine-level cross-storey routing via
+ * {@link findMultiStoreyNavmeshPath} over the same stair/lift "vertical"
+ * connectors the backend heals per floor.
  */
 
 import { toDisplayGraph } from "@/lib/graph-layout";
@@ -604,6 +606,291 @@ export function findNearestExitPath(
     points: stitched.points,
     note: `${stitched.hops} hops to exit`,
     exitPortalId: exitId,
+  };
+}
+
+export type VerticalConnector = {
+  /** Stair/lift graph node id, e.g. "stair:GID" or "lift:GID". */
+  linkId: string;
+  storeyId: string;
+  spaceId: string;
+  point: Point2D;
+};
+
+/**
+ * Groups "vertical" graph edges (stair/lift ↔ space, one per storey the
+ * backend healed it onto — see graph_geometry.py's `heal_storeys` loop) by
+ * stair/lift id, so the same physical stair/lift can bridge storeys in a
+ * cross-floor portal graph.
+ */
+export function buildVerticalConnectors(
+  graph: ConnectivityGraph,
+  footprints: FootprintsDocument,
+): Map<string, VerticalConnector[]> {
+  const out = new Map<string, VerticalConnector[]>();
+  for (const edge of graph.edges) {
+    if (edge.kind !== "vertical") continue;
+    const linkId =
+      edge.source.startsWith("stair:") || edge.source.startsWith("lift:")
+        ? edge.source
+        : edge.target.startsWith("stair:") || edge.target.startsWith("lift:")
+          ? edge.target
+          : null;
+    const spaceId = edge.source.startsWith("space:")
+      ? edge.source
+      : edge.target.startsWith("space:")
+        ? edge.target
+        : null;
+    if (!linkId || !spaceId) continue;
+
+    const gid = spaceId.slice("space:".length);
+    const space = footprints.spaces.find((s) => s.global_id === gid);
+    if (!space || space.incomplete || space.polygon.length < 3 || !space.storey_global_id) continue;
+
+    const list = out.get(linkId) ?? [];
+    if (list.some((c) => c.storeyId === space.storey_global_id)) continue;
+    list.push({
+      linkId,
+      storeyId: space.storey_global_id,
+      spaceId,
+      point: polygonCentroid(space.polygon),
+    });
+    out.set(linkId, list);
+  }
+  return out;
+}
+
+/** Fallback vertical-hop cost (plan-distance units) when storey elevation data is missing. */
+const VERTICAL_HOP_FALLBACK_COST = 4;
+
+function verticalHopCost(
+  footprints: FootprintsDocument | null | undefined,
+  storeyA: string,
+  storeyB: string,
+): number {
+  const elevA = footprints?.storeys?.find((s) => s.global_id === storeyA)?.elevation;
+  const elevB = footprints?.storeys?.find((s) => s.global_id === storeyB)?.elevation;
+  if (elevA == null || elevB == null || !Number.isFinite(elevA) || !Number.isFinite(elevB)) {
+    return VERTICAL_HOP_FALLBACK_COST;
+  }
+  return Math.max(Math.abs(elevA - elevB), 1);
+}
+
+/**
+ * Cross-storey Dijkstra: routes between two storeys' meshes through
+ * whichever stair/lift {@link VerticalConnector}s bridge them. Engine-level
+ * only — not wired into the click-to-click floorplan UI, which stays
+ * per-storey (see {@link findNavmeshPath}); a caller wanting multi-floor
+ * evacuation routing (e.g. "nearest exit, any floor") composes this with its
+ * own storey-selection UI.
+ *
+ * `blockedConnectorIds` keys are `${linkId}@${storeyId}` (one entry per
+ * storey a stair/lift touches, since a hazard can block one landing without
+ * blocking the whole stair).
+ */
+export function findMultiStoreyNavmeshPath(
+  meshes: StoreyNavmesh[],
+  graph: ConnectivityGraph,
+  footprints: FootprintsDocument,
+  start: { storeyId: string; point: Point2D },
+  end: { storeyId: string; point: Point2D },
+  opts: { blockedPortalIds?: ReadonlySet<string>; blockedConnectorIds?: ReadonlySet<string> } = {},
+): { found: boolean; note: string; segments: { storeyId: string; points: Point2D[] }[] } {
+  const meshById = new Map(meshes.map((m) => [m.storeyId, m]));
+  const startMesh = meshById.get(start.storeyId);
+  const endMesh = meshById.get(end.storeyId);
+  if (!startMesh || !endMesh) {
+    return { found: false, note: "Unknown storey", segments: [] };
+  }
+  const startRegion = regionAtPoint(startMesh, start.point);
+  const endRegion = regionAtPoint(endMesh, end.point);
+  if (!startRegion || !endRegion) {
+    return { found: false, note: "Pick points inside walkable regions", segments: [] };
+  }
+
+  if (start.storeyId === end.storeyId) {
+    const sameStoreyOpts = opts.blockedPortalIds ? { blockedPortalIds: opts.blockedPortalIds } : {};
+    const result = findNavmeshPath(startMesh, start.point, end.point, footprints, sameStoreyOpts);
+    return {
+      found: result.found,
+      note: result.note,
+      segments: result.found ? [{ storeyId: start.storeyId, points: result.points }] : [],
+    };
+  }
+
+  const regionByIdPerStorey = new Map<string, Map<string, NavmeshRegion>>();
+  for (const mesh of meshes) {
+    regionByIdPerStorey.set(mesh.storeyId, new Map(mesh.regions.map((r) => [r.spaceId, r])));
+  }
+
+  type MultiNode = { id: string; storeyId: string; point: Point2D; regions: string[] };
+  const nodes = new Map<string, MultiNode>();
+  nodes.set("__start", {
+    id: "__start",
+    storeyId: start.storeyId,
+    point: start.point,
+    regions: [startRegion.spaceId],
+  });
+  nodes.set("__end", {
+    id: "__end",
+    storeyId: end.storeyId,
+    point: end.point,
+    regions: [endRegion.spaceId],
+  });
+  for (const mesh of meshes) {
+    for (const p of mesh.portals) {
+      if (opts.blockedPortalIds?.has(p.id)) continue;
+      nodes.set(p.id, {
+        id: p.id,
+        storeyId: mesh.storeyId,
+        point: p.point,
+        regions: p.spaceB ? [p.spaceA, p.spaceB] : [p.spaceA],
+      });
+    }
+  }
+
+  // One node per (stair/lift, storey) landing; grouped so every pair on the
+  // same stair/lift can be linked below (a lift may bridge more than two
+  // storeys, not just consecutive ones).
+  const connectorsByLink = buildVerticalConnectors(graph, footprints);
+  const connectorNodeIdsByLink = new Map<string, string[]>();
+  for (const [linkId, connectors] of connectorsByLink) {
+    for (const c of connectors) {
+      if (!meshById.has(c.storeyId)) continue;
+      if (!regionByIdPerStorey.get(c.storeyId)?.has(c.spaceId)) continue;
+      const connectorKey = `${linkId}@${c.storeyId}`;
+      if (opts.blockedConnectorIds?.has(connectorKey)) continue;
+
+      const id = `vlink:${connectorKey}`;
+      nodes.set(id, { id, storeyId: c.storeyId, point: c.point, regions: [c.spaceId] });
+      const list = connectorNodeIdsByLink.get(linkId) ?? [];
+      list.push(id);
+      connectorNodeIdsByLink.set(linkId, list);
+    }
+  }
+
+  // Same-storey adjacency: bucket nodes by region id (space ids are globally
+  // unique, so no need to also key by storey) — same O(V) approach as
+  // {@link buildPortalGraph}. `viaRegion: null` marks a cross-storey hop,
+  // stitched below as a discrete vertical transition rather than a local walk.
+  const nodesByRegion = new Map<string, MultiNode[]>();
+  for (const node of nodes.values()) {
+    for (const regionId of node.regions) {
+      const list = nodesByRegion.get(regionId) ?? [];
+      list.push(node);
+      nodesByRegion.set(regionId, list);
+    }
+  }
+  const adjacency = new Map<string, { id: string; viaRegion: string | null; cost: number }[]>();
+  for (const node of nodes.values()) {
+    const out: { id: string; viaRegion: string | null; cost: number }[] = [];
+    const linked = new Set<string>();
+    for (const regionId of node.regions) {
+      for (const other of nodesByRegion.get(regionId) ?? []) {
+        if (other.id === node.id || linked.has(other.id)) continue;
+        linked.add(other.id);
+        out.push({ id: other.id, viaRegion: regionId, cost: dist(node.point, other.point) });
+      }
+    }
+    adjacency.set(node.id, out);
+  }
+  for (const nodeIds of connectorNodeIdsByLink.values()) {
+    for (let i = 0; i < nodeIds.length; i++) {
+      for (let j = i + 1; j < nodeIds.length; j++) {
+        const a = nodes.get(nodeIds[i]!)!;
+        const b = nodes.get(nodeIds[j]!)!;
+        const cost = verticalHopCost(footprints, a.storeyId, b.storeyId);
+        adjacency.get(a.id)!.push({ id: b.id, viaRegion: null, cost });
+        adjacency.get(b.id)!.push({ id: a.id, viaRegion: null, cost });
+      }
+    }
+  }
+
+  // Plain Dijkstra — there's no admissible heuristic once elevation enters
+  // the cost (plan-distance and floor-height aren't the same units).
+  const cameFrom = new Map<string, { prev: string; viaRegion: string | null }>();
+  const gScore = new Map<string, number>([["__start", 0]]);
+  const open = new MinHeap<{ id: string; g: number }>((a, b) => a.g < b.g);
+  open.push({ id: "__start", g: 0 });
+  const closed = new Set<string>();
+
+  let foundEnd = false;
+  while (open.size) {
+    const current = open.pop()!;
+    if (closed.has(current.id)) continue;
+    closed.add(current.id);
+    if (current.id === "__end") {
+      foundEnd = true;
+      break;
+    }
+    const gCur = gScore.get(current.id) ?? Infinity;
+    for (const n of adjacency.get(current.id) ?? []) {
+      const tentative = gCur + n.cost;
+      if (tentative >= (gScore.get(n.id) ?? Infinity)) continue;
+      cameFrom.set(n.id, { prev: current.id, viaRegion: n.viaRegion });
+      gScore.set(n.id, tentative);
+      open.push({ id: n.id, g: tentative });
+    }
+  }
+
+  if (!foundEnd) {
+    return { found: false, note: "No multi-storey path found", segments: [] };
+  }
+
+  const chain: { id: string; viaRegion: string | null }[] = [];
+  let cur = "__end";
+  while (cur !== "__start") {
+    const step = cameFrom.get(cur);
+    if (!step) {
+      return { found: false, note: "Path reconstruction failed", segments: [] };
+    }
+    chain.push({ id: cur, viaRegion: step.viaRegion });
+    cur = step.prev;
+  }
+  chain.reverse();
+
+  const segments: { storeyId: string; points: Point2D[] }[] = [];
+  let currentStoreyId = start.storeyId;
+  let currentPoints: Point2D[] = [];
+  let fromPt = start.point;
+  for (const step of chain) {
+    const toNode = nodes.get(step.id)!;
+    if (step.viaRegion == null) {
+      // Vertical hop through a stair/lift: close out this storey's segment
+      // and start a fresh one on the far side rather than local-walking
+      // (there's no walkable path between two different floor plans).
+      if (currentPoints.length) {
+        segments.push({ storeyId: currentStoreyId, points: currentPoints });
+      }
+      currentStoreyId = toNode.storeyId;
+      currentPoints = [toNode.point];
+      fromPt = toNode.point;
+      continue;
+    }
+    const region = regionByIdPerStorey.get(toNode.storeyId)?.get(step.viaRegion);
+    if (!region) {
+      return { found: false, note: "Missing region on path", segments: [] };
+    }
+    const seg = localWalk(fromPt, toNode.point, region, footprints);
+    if (!seg.length) {
+      return { found: false, note: `No walk in ${region.name}`, segments: [] };
+    }
+    if (currentPoints.length) {
+      currentPoints.push(...seg.slice(1));
+    } else {
+      currentPoints.push(...seg);
+    }
+    fromPt = toNode.point;
+  }
+  if (currentPoints.length) {
+    segments.push({ storeyId: currentStoreyId, points: currentPoints });
+  }
+
+  const storeyCount = new Set(segments.map((s) => s.storeyId)).size;
+  return {
+    found: segments.length > 0,
+    note: `${chain.length} hops across ${storeyCount} storeys`,
+    segments,
   };
 }
 
