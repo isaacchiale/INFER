@@ -649,37 +649,40 @@ def _space_footprint(ifc, space) -> SpaceFootprint:
     )
 
 
-def _opening_host(ifc, opening):
-    """Building element this opening voids via IfcRelVoidsElement, if any."""
+def _index_opening_hosts(ifc) -> dict:
+    """
+    Map each IfcOpeningElement to its host via IfcRelVoidsElement, built in one
+    pass. Openings and their voids relationships can each number in the
+    thousands on a real export, so this trades an O(openings * relationships)
+    scan (one per opening) for a single O(relationships) index build.
+    """
+    hosts: dict = {}
     for rel in ifc.by_type("IfcRelVoidsElement"):
-        related = getattr(rel, "RelatedOpeningElement", None)
-        if related != opening:
-            continue
+        opening = getattr(rel, "RelatedOpeningElement", None)
         host = getattr(rel, "RelatingBuildingElement", None)
-        if host is not None:
-            return host
-    return None
+        if opening is not None and host is not None and opening not in hosts:
+            hosts[opening] = host
+    return hosts
 
 
-def _opening_fill_gids(ifc, opening) -> tuple[str | None, str | None]:
-    """Return (door_gid, window_gid) filling this opening, if any."""
-    door_gid: str | None = None
-    window_gid: str | None = None
+def _index_opening_fills(ifc) -> dict:
+    """Map each IfcOpeningElement to (door_gid, window_gid) filling it, if any."""
+    fills: dict = {}
     for rel in ifc.by_type("IfcRelFillsElement"):
-        relating = getattr(rel, "RelatingOpeningElement", None)
-        if relating != opening:
-            continue
+        opening = getattr(rel, "RelatingOpeningElement", None)
         filling = getattr(rel, "RelatedBuildingElement", None)
-        if filling is None:
+        if opening is None or filling is None:
             continue
         gid = _gid(filling)
         if not gid:
             continue
+        door_gid, window_gid = fills.get(opening, (None, None))
         if filling.is_a("IfcDoor"):
             door_gid = gid
         elif filling.is_a("IfcWindow"):
             window_gid = gid
-    return door_gid, window_gid
+        fills[opening] = (door_gid, window_gid)
+    return fills
 
 
 def _opening_extent(opening) -> tuple[list[Point2D], float | None, float | None]:
@@ -699,9 +702,11 @@ def _opening_extent(opening) -> tuple[list[Point2D], float | None, float | None]
     return polygon, min(zs), max(zs)
 
 
-def _opening_portal(ifc, opening) -> OpeningPortal:
-    host = _opening_host(ifc, opening)
-    door_gid, window_gid = _opening_fill_gids(ifc, opening)
+def _opening_portal(
+    ifc, opening, host_by_opening: dict, fills_by_opening: dict
+) -> OpeningPortal:
+    host = host_by_opening.get(opening)
+    door_gid, window_gid = fills_by_opening.get(opening, (None, None))
     polygon, sill_z, head_z = _opening_extent(opening)
     common = {
         "global_id": _gid(opening),
@@ -746,32 +751,36 @@ def _opening_portal(ifc, opening) -> OpeningPortal:
     )
 
 
-def _aggregated_parts(ifc, parent) -> list:
-    """Child products aggregated under parent (e.g. IfcStairFlight under IfcStair)."""
-    parts: list = []
+def _index_aggregated_parts(ifc) -> dict:
+    """
+    Map each parent product to its aggregated children (e.g. IfcStairFlight
+    under IfcStair) via IfcRelAggregates, built in one pass rather than
+    rescanning every relationship per stair.
+    """
+    parts_by_parent: dict = defaultdict(list)
     for rel in ifc.by_type("IfcRelAggregates"):
         relating = getattr(rel, "RelatingObject", None)
-        if relating != parent:
+        if relating is None:
             continue
-        parts.extend(list(getattr(rel, "RelatedObjects", None) or ()))
-    return parts
+        parts_by_parent[relating].extend(list(getattr(rel, "RelatedObjects", None) or ()))
+    return parts_by_parent
 
 
-def _stair_xy_points(ifc, stair) -> list[tuple[float, float]]:
+def _stair_xy_points(ifc, stair, aggregated_parts: dict) -> list[tuple[float, float]]:
     """Collect XY verts from the stair and its flights/parts."""
     points = list(_mesh_xy_points(stair))
-    for part in _aggregated_parts(ifc, stair):
+    for part in aggregated_parts.get(stair, ()):
         points.extend(_mesh_xy_points(part))
     return _unique_xy(points)
 
 
-def _stair_footprint(ifc, stair) -> StairFootprint:
+def _stair_footprint(ifc, stair, aggregated_parts: dict) -> StairFootprint:
     """Stairs stay on hull/bbox for v1 overlay (not full outline)."""
     gid = _gid(stair)
     storey = _storey_gid(ifc, stair)
     name = _name(stair)
 
-    xy = _stair_xy_points(ifc, stair)
+    xy = _stair_xy_points(ifc, stair, aggregated_parts)
     if len(xy) >= 3:
         hull = _convex_hull(xy)
         if len(hull) >= 3:
@@ -877,16 +886,19 @@ def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
         doors.append(_door_portal(ifc, door))
 
     openings: list[OpeningPortal] = []
+    host_by_opening = _index_opening_hosts(ifc)
+    fills_by_opening = _index_opening_fills(ifc)
     for opening in ifc.by_type("IfcOpeningElement"):
         if not _gid(opening):
             continue
-        openings.append(_opening_portal(ifc, opening))
+        openings.append(_opening_portal(ifc, opening, host_by_opening, fills_by_opening))
 
     stairs: list[StairFootprint] = []
+    aggregated_parts = _index_aggregated_parts(ifc)
     for stair in ifc.by_type("IfcStair"):
         if not _gid(stair):
             continue
-        stairs.append(_stair_footprint(ifc, stair))
+        stairs.append(_stair_footprint(ifc, stair, aggregated_parts))
 
     walls: list[WallFootprint] = []
     seen_wall: set[str] = set()

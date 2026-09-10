@@ -78,6 +78,25 @@ def _dist_point_to_polygon(x: float, y: float, polygon: list[Point2D]) -> float:
     return best
 
 
+def _polygon_bbox(polygon: list[Point2D]) -> tuple[float, float, float, float] | None:
+    if not polygon:
+        return None
+    xs = [p.x for p in polygon]
+    ys = [p.y for p in polygon]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _bboxes_overlap(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+    pad: float,
+) -> bool:
+    """True if bbox ``a`` padded by ``pad`` on every side overlaps bbox ``b``."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return ax0 - pad <= bx1 and bx0 - pad <= ax1 and ay0 - pad <= by1 and by0 - pad <= ay1
+
+
 def _segments_cross(
     a1: Point2D, a2: Point2D, b1: Point2D, b2: Point2D
 ) -> bool:
@@ -523,6 +542,58 @@ def _point_hits_wall(
     return False
 
 
+# Grid cell for the wall spatial index used by strip healing. Far larger than
+# any tolerance this module checks against a wall (WALL_HIT_TOL_M etc.), so a
+# point's own cell plus its 8 neighbours always covers every wall that could
+# be within tolerance — no false negatives vs. scanning every wall.
+_WALL_GRID_CELL_M = 2.0
+
+
+def _wall_grid_cell(x: float, y: float, cell: float = _WALL_GRID_CELL_M) -> tuple[int, int]:
+    return (math.floor(x / cell), math.floor(y / cell))
+
+
+def _build_wall_grid(
+    walls: list[WallFootprint], cell: float = _WALL_GRID_CELL_M
+) -> dict[tuple[int, int], list[WallFootprint]]:
+    """
+    Bucket walls by the grid cells their bbox touches, built once per storey so
+    strip healing doesn't rescan every wall on the storey for every sample
+    point of every space pair (see ``_walls_near_point``).
+    """
+    grid: dict[tuple[int, int], list[WallFootprint]] = {}
+    for wall in walls:
+        bbox = _polygon_bbox(wall.polygon)
+        if bbox is None:
+            continue
+        minx, miny, maxx, maxy = bbox
+        gx0, gy0 = _wall_grid_cell(minx, miny, cell)
+        gx1, gy1 = _wall_grid_cell(maxx, maxy, cell)
+        for gx in range(gx0, gx1 + 1):
+            for gy in range(gy0, gy1 + 1):
+                grid.setdefault((gx, gy), []).append(wall)
+    return grid
+
+
+def _walls_near_point(
+    grid: dict[tuple[int, int], list[WallFootprint]],
+    x: float,
+    y: float,
+    cell: float = _WALL_GRID_CELL_M,
+) -> list[WallFootprint]:
+    gx, gy = _wall_grid_cell(x, y, cell)
+    seen: set[int] = set()
+    out: list[WallFootprint] = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for wall in grid.get((gx + dx, gy + dy), ()):
+                if id(wall) in seen:
+                    continue
+                seen.add(id(wall))
+                out.append(wall)
+    return out
+
+
 def _max_clear_span_m(
     samples: list[tuple[float, Point2D]],
     blocked: list[bool],
@@ -664,19 +735,27 @@ def _carve_voids(
 def _strip_clear_portal(
     a: SpaceFootprint,
     b: SpaceFootprint,
-    walls: list[WallFootprint],
+    wall_grid: dict[tuple[int, int], list[WallFootprint]],
     void_portals: list[VoidPortal],
 ) -> Point2D | None:
     """
     If the facing strip has a clear span ≥ MIN_CLEAR_SPAN_M after wall hits and
     void carving, return the centre of that clear opening (door-like portal).
     Otherwise None.
+
+    ``wall_grid`` is the storey's walls spatially indexed via
+    ``_build_wall_grid`` — built once per storey by the caller, since this
+    runs per space pair and a per-call flat scan of every storey wall doesn't
+    scale on a real building.
     """
     samples, perimeter = _frontage_strip_samples(a, b)
     if len(samples) < 2:
         return None
 
-    blocked = [_point_hits_wall(mid, walls) for _t, mid in samples]
+    blocked = [
+        _point_hits_wall(mid, _walls_near_point(wall_grid, mid.x, mid.y))
+        for _t, mid in samples
+    ]
     _carve_voids(samples, blocked, void_portals)
     portal = _clear_span_portal(samples, blocked, perimeter)
     if portal is None:
@@ -693,7 +772,7 @@ def _strip_is_walkable(
     void_portals: list[VoidPortal],
 ) -> bool:
     """True when the facing strip has a clear span ≥ MIN_CLEAR_SPAN_M."""
-    return _strip_clear_portal(a, b, walls, void_portals) is not None
+    return _strip_clear_portal(a, b, _build_wall_grid(walls), void_portals) is not None
 
 
 def _spaces_already_door_linked(
@@ -1087,23 +1166,6 @@ def _pick_best_space_for_stair(
     return best
 
 
-def _spaces_for_storey(
-    footprints: FootprintsDocument,
-    storey: str | None,
-    excluded_node_ids: set[str] | None = None,
-) -> list[SpaceFootprint]:
-    excluded = excluded_node_ids or set()
-    out: list[SpaceFootprint] = []
-    for s in footprints.spaces:
-        if s.incomplete or len(s.polygon) < 3:
-            continue
-        if f"space:{s.global_id}" in excluded:
-            continue
-        if storey is None or s.storey_global_id is None or s.storey_global_id == storey:
-            out.append(s)
-    return out
-
-
 def _all_complete_spaces(
     footprints: FootprintsDocument,
     excluded_node_ids: set[str] | None = None,
@@ -1366,6 +1428,28 @@ def build_geometry_graph(
     space_fp_by_gid = {
         s.global_id: s for s in _all_complete_spaces(footprints, excluded)
     }
+    # Pre-index spaces by storey once instead of rescanning every space in the
+    # model for every door — _spaces_for_storey did a full linear scan per
+    # call, and this loop runs once per door.
+    _spaces_by_storey: dict[str, list[SpaceFootprint]] = {}
+    _storey_less_spaces: list[SpaceFootprint] = []
+    _all_usable_spaces: list[SpaceFootprint] = []
+    for s in space_fp_by_gid.values():
+        if f"space:{s.global_id}" not in node_by_id:
+            continue
+        _all_usable_spaces.append(s)
+        if s.storey_global_id is None:
+            _storey_less_spaces.append(s)
+        else:
+            _spaces_by_storey.setdefault(s.storey_global_id, []).append(s)
+
+    def _storey_spaces_cached(storey: str | None) -> list[SpaceFootprint]:
+        # Matches _spaces_for_storey's semantics: a None query storey matches
+        # every space; a storey-less space matches every query storey.
+        if storey is None:
+            return _all_usable_spaces
+        return _spaces_by_storey.get(storey, []) + _storey_less_spaces
+
     for door in footprints.doors:
         door_id = f"door:{door.global_id}"
         if door_id not in node_by_id:
@@ -1385,12 +1469,7 @@ def build_geometry_graph(
 
         px, py = door.point.x, door.point.y
         door_pt = Point2D(x=px, y=py)
-        storey_spaces = _spaces_for_storey(
-            footprints, door.storey_global_id, excluded
-        )
-        storey_spaces = [
-            s for s in storey_spaces if f"space:{s.global_id}" in node_by_id
-        ]
+        storey_spaces = _storey_spaces_cached(door.storey_global_id)
 
         to_add: list[SpaceFootprint] = []
         if door.normal is not None:
@@ -1661,14 +1740,25 @@ def _heal_space_space_interfaces(
     for w in walls:
         walls_by_storey.setdefault(w.storey_global_id, []).append(w)
 
+    # Bounding boxes let the O(spaces^2) pair loop below skip the expensive
+    # boundary-sampling test (_interface_length_and_gap) for pairs nowhere
+    # near each other — the common case on a large floor.
+    bbox_by_space: dict[str, tuple[float, float, float, float]] = {}
+    for s in spaces:
+        bbox = _polygon_bbox(s.polygon)
+        if bbox is not None:
+            bbox_by_space[s.global_id] = bbox
+
     for storey_gid, group in by_storey.items():
         if only_storeys is not None and storey_gid not in only_storeys:
             continue
         storey_walls = list(walls_by_storey.get(storey_gid, []))
         storey_walls.extend(walls_by_storey.get(None, []))
+        storey_wall_grid = _build_wall_grid(storey_walls)
         void_portals = _void_portals_on_storey(footprints, storey_gid)
 
         for i, a in enumerate(group):
+            a_bbox = bbox_by_space.get(a.global_id)
             for b in group[i + 1 :]:
                 a_id = f"space:{a.global_id}"
                 b_id = f"space:{b.global_id}"
@@ -1676,6 +1766,14 @@ def _heal_space_space_interfaces(
                 if (lo, hi) in linked_space_pairs:
                     continue
                 if _spaces_already_door_linked(a_id, b_id, linked_door_spaces):
+                    continue
+
+                b_bbox = bbox_by_space.get(b.global_id)
+                if (
+                    a_bbox is not None
+                    and b_bbox is not None
+                    and not _bboxes_overlap(a_bbox, b_bbox, INTERFACE_GAP_MAX_M)
+                ):
                     continue
 
                 length, _mean_gap = _interface_length_and_gap(a, b)
@@ -1691,7 +1789,7 @@ def _heal_space_space_interfaces(
                     if da <= limit and db <= limit:
                         local_voids.append(portal)
 
-                strip_portal = _strip_clear_portal(a, b, storey_walls, local_voids)
+                strip_portal = _strip_clear_portal(a, b, storey_wall_grid, local_voids)
                 if strip_portal is None:
                     continue
 
