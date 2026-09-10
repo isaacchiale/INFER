@@ -11,9 +11,14 @@ import {
   elevationsForVerticalRemap,
   normalizeElevationsToMetres,
 } from "@/lib/storey-elevations";
-import { ifcPlanToThree, liftPlanPolylineToThree } from "@/lib/viewer-camera-pose";
+import {
+  ifcPlanToThree,
+  liftPlanPolylineToThree,
+  type Mat4Elements,
+  type ThreeAabb,
+} from "@/lib/viewer-camera-pose";
 import type { HazardZone, Route } from "@/types/infer";
-import { useInfer, useViewerPose } from "@/state/infer-store";
+import { useInfer, useViewerPose, type NavmeshRoute } from "@/state/infer-store";
 import {
   createThatOpenRuntime,
   type GeometryDisplayMode,
@@ -33,6 +38,45 @@ const GLASS =
 
 /** Navmesh slabs sit just above each storey elevation. */
 const NAVMESH_HEIGHT_OFFSET_M = 0.05;
+
+type TubeLiftArgs = Parameters<typeof buildPlanRouteTubePolylines>[0];
+
+/**
+ * Lifts a click-to-click navmesh route into the blue tube. A cross-storey
+ * route (`segments`) gets one tube per storey it crosses — the same
+ * "separate per-storey tubes, no ramp" convention buildRouteTubePolylines
+ * already uses for the backend-computed multi-floor route, since there's no
+ * real stair/ramp geometry to trace between floors. A same-storey route
+ * falls back to a single lift.
+ */
+function buildNavmeshRouteTube(
+  route: NavmeshRoute | null | undefined,
+  footprints: TubeLiftArgs["footprints"],
+  modelBounds: ThreeAabb | null,
+  coordInverse: Mat4Elements | null,
+): ReturnType<typeof buildPlanRouteTubePolylines> {
+  if (!route) return null;
+  if (route.segments?.length) {
+    const polylines = route.segments.flatMap(
+      (seg) =>
+        buildPlanRouteTubePolylines({
+          points: seg.points,
+          storeyId: seg.storeyId,
+          footprints,
+          modelBounds,
+          coordInverse,
+        }) ?? [],
+    );
+    return polylines.length ? polylines : null;
+  }
+  return buildPlanRouteTubePolylines({
+    points: route.points,
+    storeyId: route.storeyId,
+    footprints,
+    modelBounds,
+    coordInverse,
+  });
+}
 
 /**
  * INFER ⇄ BIM viewer integration boundary.
@@ -348,14 +392,12 @@ function InferModelViewportImpl({
         const rt = runtimeRef.current;
         if (!rt) return;
         const input = tubeInputRef.current;
-        const navTube = buildPlanRouteTubePolylines({
-          points: input.navmeshRoute?.points,
-          storeyId: input.navmeshRoute?.storeyId,
-          footprints: input.footprintsDocument,
-          modelBounds: rt.getModelBounds(),
-          coordInverse:
-            rt.getCoordinationInverse() ?? input.viewerCoordInverse,
-        });
+        const navTube = buildNavmeshRouteTube(
+          input.navmeshRoute,
+          input.footprintsDocument,
+          rt.getModelBounds(),
+          rt.getCoordinationInverse() ?? input.viewerCoordInverse,
+        );
         const polylines =
           navTube ??
           buildRouteTubePolylines({
@@ -389,13 +431,7 @@ function InferModelViewportImpl({
     const bounds = runtime.getModelBounds() ?? viewerModelBounds;
     const coordInverse =
       runtime.getCoordinationInverse() ?? viewerCoordInverse;
-    const navTube = buildPlanRouteTubePolylines({
-      points: navmeshRoute?.points,
-      storeyId: navmeshRoute?.storeyId,
-      footprints: footprintsDocument,
-      modelBounds: bounds,
-      coordInverse,
-    });
+    const navTube = buildNavmeshRouteTube(navmeshRoute, footprintsDocument, bounds, coordInverse);
     const polylines =
       navTube ??
       buildRouteTubePolylines({
