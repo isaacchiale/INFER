@@ -47,6 +47,9 @@ class DoorPortal(BaseModel):
     polygon: list[Point2D] = Field(default_factory=list)
     """Unit XY vector through the wall (door facing). Used for ± ray heal."""
     normal: Point2D | None = None
+    """Raw IfcDoorTypeOperationEnum value (e.g. SINGLE_SWING_LEFT, SLIDING_TO_RIGHT),
+    when the source IFC sets it. None when absent/NOTDEFINED — never guessed."""
+    operation_type: str | None = None
     incomplete: bool = False
     method: Literal[
         "ifc_mesh_xy_centroid",

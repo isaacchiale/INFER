@@ -23,6 +23,7 @@ import math
 
 import ifcopenshell
 import ifcopenshell.geom
+import ifcopenshell.util.element
 import ifcopenshell.util.placement
 
 from app.schemas.footprints import (
@@ -511,10 +512,43 @@ def _orientation_from_placement(door) -> tuple[Point2D, list[Point2D], Point2D, 
     return Point2D(x=ox, y=oy), poly, Point2D(x=through[0], y=through[1]), segment
 
 
+def _door_operation_type(door) -> str | None:
+    """
+    Raw IfcDoorTypeOperationEnum / IfcDoorStyleOperationEnum value (swing vs
+    sliding vs folding vs ...), when the source IFC actually sets it.
+
+    IFC2X3 carries this directly on IfcDoor; IFC4 moved it onto the door's
+    IfcDoorType (accessed via the RelatingType relationship) but many IFC4
+    exporters still also populate the deprecated attribute on IfcDoor itself
+    — so we check both, direct attribute first.
+    """
+    # ifcopenshell raises (rather than AttributeError) for a schema-valid
+    # attribute the entity's own IFC-file instance was written without slots
+    # for (e.g. an older/sparse IFC2X3 write) — getattr's default can't catch
+    # that, so guard each read explicitly.
+    try:
+        value = getattr(door, "OperationType", None)
+    except Exception:  # noqa: BLE001
+        value = None
+    if value is None:
+        try:
+            door_type = ifcopenshell.util.element.get_type(door)
+            value = getattr(door_type, "OperationType", None) if door_type is not None else None
+        except Exception:  # noqa: BLE001
+            value = None
+    if value is None:
+        return None
+    text = str(value)
+    if text in ("NOTDEFINED", "USERDEFINED", ""):
+        return None
+    return text
+
+
 def _door_portal(ifc, door) -> DoorPortal:
     gid = _gid(door)
     storey = _storey_gid(ifc, door)
     name = _name(door)
+    operation_type = _door_operation_type(door)
 
     xy = _mesh_xy_points(door)
     oriented = _orientation_from_hull(xy) if xy else None
@@ -532,6 +566,7 @@ def _door_portal(ifc, door) -> DoorPortal:
             segment=segment,
             polygon=polygon,
             normal=normal,
+            operation_type=operation_type,
             incomplete=False,
             method=method,
         )
@@ -545,6 +580,7 @@ def _door_portal(ifc, door) -> DoorPortal:
             name=name,
             storey_global_id=storey,
             point=Point2D(x=cx, y=cy),
+            operation_type=operation_type,
             incomplete=False,
             method="ifc_mesh_xy_centroid",
         )
@@ -556,6 +592,7 @@ def _door_portal(ifc, door) -> DoorPortal:
             name=name,
             storey_global_id=storey,
             point=Point2D(x=origin[0], y=origin[1]),
+            operation_type=operation_type,
             incomplete=False,
             method="ifc_object_placement",
         )
@@ -565,6 +602,7 @@ def _door_portal(ifc, door) -> DoorPortal:
         name=name,
         storey_global_id=storey,
         point=None,
+        operation_type=operation_type,
         incomplete=True,
         method="unavailable",
     )

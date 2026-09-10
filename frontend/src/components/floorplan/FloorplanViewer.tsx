@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { Box, Check, ChevronDown, LogOut, Maximize2, Network, Route as RouteIcon } from "lucide-react";
 import { useInfer, useViewerPose } from "@/state/infer-store";
 import { continuousPolylineForStorey } from "@/lib/geometric-path";
+import { buildDoorGlyph } from "@/lib/door-symbol";
 import {
   buildAllStoreyNavmeshes,
   buildStoreyNavmesh,
@@ -893,6 +894,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const routeHalo = markerBase * 0.008;
   const doorR = markerBase * 0.008;
   const doorStroke = markerBase * 0.0015;
+  const doorGlyphStroke = markerBase * 0.0025;
   const portalR = markerBase * 0.01;
   const cameraR = markerBase * 0.018;
   // Pin bulb ≈ 1.3× portal diameter — tip-to-top ~2× that.
@@ -1034,6 +1036,39 @@ export function FloorplanViewer({ className }: { className?: string }) {
               : null}
             {layers.doors
               ? doors.map((d) => {
+                  const glyph =
+                    d.segment.length === 2 && d.normal
+                      ? buildDoorGlyph([d.segment[0]!, d.segment[1]!], d.normal, d.operation_type)
+                      : null;
+                  if (glyph) {
+                    return (
+                      <g key={d.global_id}>
+                        {glyph.arcs.map((arc, i) => (
+                          <path
+                            key={`arc:${i}`}
+                            d={arc}
+                            fill="none"
+                            stroke="#f59e0b"
+                            strokeWidth={doorGlyphStroke}
+                            strokeDasharray={`${markerBase * 0.0025} ${markerBase * 0.002}`}
+                          />
+                        ))}
+                        {glyph.leaves.map((leaf, i) => (
+                          <path
+                            key={`leaf:${i}`}
+                            d={leaf}
+                            fill="none"
+                            stroke="#f59e0b"
+                            strokeWidth={doorGlyphStroke}
+                            strokeLinecap="round"
+                          />
+                        ))}
+                        <title>
+                          {(d.name || d.global_id) + ` (${glyph.kind.replace("_", " ")})`}
+                        </title>
+                      </g>
+                    );
+                  }
                   const poly = d.polygon && d.polygon.length >= 3 ? d.polygon : null;
                   if (poly) {
                     const dPath =
@@ -1215,6 +1250,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
       markerBase,
       doorR,
       doorStroke,
+      doorGlyphStroke,
       portalR,
       pinScale,
       routeHalo,

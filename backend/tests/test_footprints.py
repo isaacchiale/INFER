@@ -186,6 +186,56 @@ def test_footprints_placement_bbox_happy_path(tmp_path):
     assert door_fp.point.y == pytest.approx(3.0)
 
 
+def test_door_operation_type_extracted_when_set(tmp_path):
+    """IfcDoor.OperationType passes through untouched; unset/NOTDEFINED stays None."""
+    ifc_path = tmp_path / "door_ops.ifc"
+    f = ifcopenshell.file(schema="IFC4")
+    project = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="T")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    site = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcSite", name="S")
+    building = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcBuilding", name="B")
+    storey = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingStorey", name="L1"
+    )
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=project, products=[site])
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=site, products=[building])
+    ifcopenshell.api.run(
+        "aggregate.assign_object", f, relating_object=building, products=[storey]
+    )
+
+    swing = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcDoor", name="Swing")
+    sliding = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcDoor", name="Sliding")
+    unset = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcDoor", name="Unset")
+    notdefined = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcDoor", name="NotDefined"
+    )
+    swing.OperationType = "SINGLE_SWING_LEFT"
+    sliding.OperationType = "SLIDING_TO_RIGHT"
+    notdefined.OperationType = "NOTDEFINED"
+    ifcopenshell.api.run(
+        "spatial.assign_container",
+        f,
+        relating_structure=storey,
+        products=[swing, sliding, unset, notdefined],
+    )
+    for i, door in enumerate([swing, sliding, unset, notdefined]):
+        ifcopenshell.api.run(
+            "geometry.edit_object_placement",
+            f,
+            product=door,
+            matrix=[[1, 0, 0, float(i)], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+            is_si=True,
+        )
+
+    f.write(str(ifc_path))
+    doc = footprints_service.build_footprints("door-ops-model", str(ifc_path))
+    by_name = {d.name: d for d in doc.doors}
+    assert by_name["Swing"].operation_type == "SINGLE_SWING_LEFT"
+    assert by_name["Sliding"].operation_type == "SLIDING_TO_RIGHT"
+    assert by_name["Unset"].operation_type is None
+    assert by_name["NotDefined"].operation_type is None
+
+
 def test_storey_elevation_millimetres_converted_to_metres(tmp_path):
     """IfcBuildingStorey.Elevation in mm must become metres in footprints."""
     ifc_path = tmp_path / "mm_units.ifc"

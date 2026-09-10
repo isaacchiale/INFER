@@ -29,6 +29,13 @@ export type DoorPortal = {
   polygon?: Point2D[];
   /** Unit XY through the wall (door facing). */
   normal?: Point2D | null;
+  /**
+   * Raw IfcDoorTypeOperationEnum value (e.g. "SINGLE_SWING_LEFT",
+   * "SLIDING_TO_RIGHT"), when the source IFC sets it. Null/omitted when
+   * absent or NOTDEFINED — never guessed, so treat null as "unknown", not
+   * "swing".
+   */
+  operation_type?: string | null;
   incomplete: boolean;
   method: "ifc_mesh_xy_centroid" | "ifc_object_placement" | "unavailable";
 };
