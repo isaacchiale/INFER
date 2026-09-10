@@ -903,22 +903,27 @@ export function FloorplanViewer({ className }: { className?: string }) {
                 cy={p.point.y}
                 r={portalR}
                 fill={
-                  p.kind === "space"
-                    ? "#22c55e"
-                    : p.inferred
-                      ? "#eab308"
-                      : "#f97316"
+                  p.kind === "exit"
+                    ? "#ef4444"
+                    : p.kind === "space"
+                      ? "#22c55e"
+                      : p.inferred
+                        ? "#eab308"
+                        : "#f97316"
                 }
                 stroke="#0f172a"
                 strokeWidth={doorStroke * 0.4}
               >
                 <title>
-                  {p.kind === "space"
-                    ? "Space portal"
-                    : p.inferred
-                      ? "Door heal"
-                      : "IFC door"}
-                  : {p.spaceA} ↔ {p.spaceB}
+                  {p.kind === "exit"
+                    ? "Exit"
+                    : p.kind === "space"
+                      ? "Space portal"
+                      : p.inferred
+                        ? "Door heal"
+                        : "IFC door"}
+                  : {p.spaceA}
+                  {p.spaceB ? ` ↔ ${p.spaceB}` : ""}
                 </title>
               </circle>
             ))}

@@ -24,14 +24,20 @@ export type NavmeshRegion = {
 
 export type NavmeshPortal = {
   id: string;
-  kind: "door" | "space";
+  kind: "door" | "space" | "exit";
   /**
    * For door portals: false = IFC relation door, true = geometry door heal.
    * Space portals are typically inferred openers; unused for colouring today.
    */
   inferred: boolean;
   spaceA: string;
-  spaceB: string;
+  /**
+   * Null for "exit" portals: a door with exactly one linked space (typically
+   * an exterior door — the far side isn't a modelled IfcSpace). These are
+   * boundary/terminal nodes in the portal graph, not a link between two
+   * regions.
+   */
+  spaceB: string | null;
   /** Plan XY (metres), typically door centre or clear-span portal. */
   point: Point2D;
 };
@@ -194,6 +200,69 @@ export function buildStoreyNavmesh(
     });
   }
 
+  // Doors with exactly one linked space (typically exterior doors — the far
+  // side isn't a modelled IfcSpace) become boundary "exit" portals: terminal
+  // nodes in the portal graph rather than a link between two regions. These
+  // never appear in `display.edges` above (its door-collapsing loop only
+  // pushes an edge when a door links >= 2 spaces), which is the gap this
+  // closes.
+  const spacesByDoor = new Map<string, string[]>();
+  const doorInferredBySpace = new Map<string, Map<string, boolean>>();
+  for (const edge of graph.edges) {
+    if (edge.kind !== "space_door") continue;
+    const doorId = edge.source.startsWith("door:")
+      ? edge.source
+      : edge.target.startsWith("door:")
+        ? edge.target
+        : null;
+    const spaceId = edge.source.startsWith("space:")
+      ? edge.source
+      : edge.target.startsWith("space:")
+        ? edge.target
+        : null;
+    if (!doorId || !spaceId) continue;
+    const list = spacesByDoor.get(doorId) ?? [];
+    if (!list.includes(spaceId)) list.push(spaceId);
+    spacesByDoor.set(doorId, list);
+
+    const inferred =
+      Boolean(edge.inferred) ||
+      edge.method === "geom_door_space" ||
+      edge.method !== "ifc_rel_space_boundary";
+    const bySpace = doorInferredBySpace.get(doorId) ?? new Map<string, boolean>();
+    bySpace.set(spaceId, Boolean(bySpace.get(spaceId)) || inferred);
+    doorInferredBySpace.set(doorId, bySpace);
+  }
+
+  for (const [doorId, spaces] of spacesByDoor) {
+    if (spaces.length !== 1) continue;
+    const spaceId = spaces[0]!;
+    if (!regionIds.has(spaceId)) continue;
+    if (excludedNodes.has(doorId) || excludedNodes.has(spaceId)) continue;
+    if (!spaceOnStorey(footprints, spaceId, storeyId)) continue;
+
+    const id = `viz-exit:${doorId}:${spaceId}`;
+    if (excludedEdges.has(id)) continue;
+
+    const gid = doorId.slice("door:".length);
+    const door = footprints.doors.find((d) => d.global_id === gid);
+    let point: Point2D | null = null;
+    if (door?.point) point = { x: door.point.x, y: door.point.y };
+    else if (door?.segment && door.segment.length >= 2) {
+      point = midpoint(door.segment[0]!, door.segment[1]!);
+    }
+    if (!point) continue;
+
+    portals.push({
+      id,
+      kind: "exit",
+      inferred: Boolean(doorInferredBySpace.get(doorId)?.get(spaceId)),
+      spaceA: spaceId,
+      spaceB: null,
+      point,
+    });
+  }
+
   return { storeyId, regions, portals };
 }
 
@@ -267,7 +336,101 @@ function localWalk(
   return localPathInPolygon(start, goal, region.polygon, region.holes);
 }
 
-type PortalGraphNode = { id: string; point: Point2D; regions: string[] };
+type PortalGraphNode = { id: string; point: Point2D; regions: string[]; isExit?: boolean };
+
+type PortalGraph = {
+  nodes: Map<string, PortalGraphNode>;
+  adjacency: Map<string, { id: string; viaRegion: string; cost: number }[]>;
+};
+
+/**
+ * Shared portal-graph builder for `findNavmeshPath` and `findNearestExitPath`:
+ * one node per extra point (click targets) plus every non-blocked portal,
+ * bucketed by region so adjacency is built once in O(V) rather than an O(V^2)
+ * per-node rescan (a portal-dense storey can have hundreds of doors).
+ */
+function buildPortalGraph(
+  mesh: StoreyNavmesh,
+  extraNodes: PortalGraphNode[],
+  blockedPortalIds?: ReadonlySet<string>,
+): PortalGraph {
+  const nodes = new Map<string, PortalGraphNode>();
+  for (const n of extraNodes) nodes.set(n.id, n);
+  for (const p of mesh.portals) {
+    if (blockedPortalIds?.has(p.id)) continue;
+    nodes.set(p.id, {
+      id: p.id,
+      point: p.point,
+      regions: p.spaceB ? [p.spaceA, p.spaceB] : [p.spaceA],
+      isExit: p.kind === "exit",
+    });
+  }
+
+  const nodesByRegion = new Map<string, PortalGraphNode[]>();
+  for (const node of nodes.values()) {
+    for (const regionId of node.regions) {
+      const list = nodesByRegion.get(regionId) ?? [];
+      list.push(node);
+      nodesByRegion.set(regionId, list);
+    }
+  }
+  const adjacency = new Map<string, { id: string; viaRegion: string; cost: number }[]>();
+  for (const node of nodes.values()) {
+    const out: { id: string; viaRegion: string; cost: number }[] = [];
+    const linked = new Set<string>();
+    // First of this node's own regions (in order) that the other node also
+    // belongs to — stable tie-break, independent of Map iteration order.
+    for (const regionId of node.regions) {
+      for (const other of nodesByRegion.get(regionId) ?? []) {
+        if (other.id === node.id || linked.has(other.id)) continue;
+        linked.add(other.id);
+        out.push({ id: other.id, viaRegion: regionId, cost: dist(node.point, other.point) });
+      }
+    }
+    adjacency.set(node.id, out);
+  }
+
+  return { nodes, adjacency };
+}
+
+/** Reconstructs the walkable point sequence for a portal-graph path via `cameFrom`. */
+function stitchPortalPath(
+  graph: PortalGraph,
+  regionById: Map<string, NavmeshRegion>,
+  cameFrom: Map<string, { prev: string; viaRegion: string }>,
+  start: Point2D,
+  startId: string,
+  endId: string,
+  footprints: FootprintsDocument | null | undefined,
+): { points: Point2D[]; hops: number } | null {
+  const chain: { id: string; viaRegion: string }[] = [];
+  let cur = endId;
+  while (cur !== startId) {
+    const step = cameFrom.get(cur);
+    if (!step) return null;
+    chain.push({ id: cur, viaRegion: step.viaRegion });
+    cur = step.prev;
+  }
+  chain.reverse();
+
+  const points: Point2D[] = [];
+  let fromPt = start;
+  for (const step of chain) {
+    const toNode = graph.nodes.get(step.id)!;
+    const region = regionById.get(step.viaRegion);
+    if (!region) return null;
+    const seg = localWalk(fromPt, toNode.point, region, footprints);
+    if (!seg.length) return null;
+    if (points.length) {
+      // Avoid duplicating the shared portal vertex.
+      points.push(...seg.slice(1));
+    } else {
+      points.push(...seg);
+    }
+    fromPt = toNode.point;
+  }
+  return { points, hops: chain.length };
+}
 
 /**
  * Click-to-click A* on a portal navmesh.
@@ -279,6 +442,7 @@ export function findNavmeshPath(
   start: Point2D,
   end: Point2D,
   footprints?: FootprintsDocument | null,
+  opts: { blockedPortalIds?: ReadonlySet<string> } = {},
 ): { found: boolean; points: Point2D[]; note: string } {
   const startRegion = regionAtPoint(mesh, start);
   const endRegion = regionAtPoint(mesh, end);
@@ -296,58 +460,14 @@ export function findNavmeshPath(
   }
 
   const regionById = new Map(mesh.regions.map((r) => [r.spaceId, r]));
-
-  // Graph nodes: start, end, and every portal.
-  const nodes = new Map<string, PortalGraphNode>();
-  nodes.set("__start", {
-    id: "__start",
-    point: start,
-    regions: [startRegion.spaceId],
-  });
-  nodes.set("__end", {
-    id: "__end",
-    point: end,
-    regions: [endRegion.spaceId],
-  });
-  for (const p of mesh.portals) {
-    nodes.set(p.id, {
-      id: p.id,
-      point: p.point,
-      regions: [p.spaceA, p.spaceB],
-    });
-  }
-
-  // Adjacency (nodes sharing a region can walk between each other) built once
-  // by bucketing nodes per region, instead of the O(V) "scan every node"
-  // neighbour lookup this used to do on every single node expansion during
-  // the search below — O(V^2) on a portal-dense storey (a large
-  // hospital/institutional floor with hundreds of doors).
-  const nodesByRegion = new Map<string, PortalGraphNode[]>();
-  for (const node of nodes.values()) {
-    for (const regionId of node.regions) {
-      const list = nodesByRegion.get(regionId) ?? [];
-      list.push(node);
-      nodesByRegion.set(regionId, list);
-    }
-  }
-  const adjacency = new Map<
-    string,
-    { id: string; viaRegion: string; cost: number }[]
-  >();
-  for (const node of nodes.values()) {
-    const out: { id: string; viaRegion: string; cost: number }[] = [];
-    const linked = new Set<string>();
-    // Mirrors the old per-pair lookup's tie-break: the first of this node's
-    // own regions (in order) that the other node also belongs to.
-    for (const regionId of node.regions) {
-      for (const other of nodesByRegion.get(regionId) ?? []) {
-        if (other.id === node.id || linked.has(other.id)) continue;
-        linked.add(other.id);
-        out.push({ id: other.id, viaRegion: regionId, cost: dist(node.point, other.point) });
-      }
-    }
-    adjacency.set(node.id, out);
-  }
+  const graph = buildPortalGraph(
+    mesh,
+    [
+      { id: "__start", point: start, regions: [startRegion.spaceId] },
+      { id: "__end", point: end, regions: [endRegion.spaceId] },
+    ],
+    opts.blockedPortalIds,
+  );
 
   // A* over the portal graph (euclidean edge costs), binary-heap open set —
   // re-pushes a cheaper route instead of mutating an open entry, so stale
@@ -368,12 +488,12 @@ export function findNavmeshPath(
       break;
     }
     const gCur = gScore.get(current.id) ?? Infinity;
-    for (const n of adjacency.get(current.id) ?? []) {
+    for (const n of graph.adjacency.get(current.id) ?? []) {
       const tentative = gCur + n.cost;
       if (tentative >= (gScore.get(n.id) ?? Infinity)) continue;
       cameFrom.set(n.id, { prev: current.id, viaRegion: n.viaRegion });
       gScore.set(n.id, tentative);
-      const nb = nodes.get(n.id)!;
+      const nb = graph.nodes.get(n.id)!;
       open.push({ id: n.id, f: tentative + dist(nb.point, end) });
     }
   }
@@ -382,49 +502,108 @@ export function findNavmeshPath(
     return { found: false, points: [], note: "No portal path between regions" };
   }
 
-  // Reconstruct portal sequence: start → p0 → p1 → … → end
-  const chain: { id: string; viaRegion: string | null }[] = [];
-  let cur = "__end";
-  while (cur !== "__start") {
-    const step = cameFrom.get(cur);
-    if (!step) {
-      return { found: false, points: [], note: "Path reconstruction failed" };
-    }
-    chain.push({ id: cur, viaRegion: step.viaRegion });
-    cur = step.prev;
+  const stitched = stitchPortalPath(
+    graph,
+    regionById,
+    cameFrom,
+    start,
+    "__start",
+    "__end",
+    footprints,
+  );
+  if (!stitched) {
+    return { found: false, points: [], note: "Path reconstruction failed" };
   }
-  chain.reverse();
-
-  // Stitch local A* segments through each viaRegion.
-  const points: Point2D[] = [];
-  let fromPt = start;
-  let fromId = "__start";
-  for (const step of chain) {
-    const toNode = nodes.get(step.id)!;
-    const regionId = step.viaRegion!;
-    const region = regionById.get(regionId);
-    if (!region) {
-      return { found: false, points: [], note: "Missing region on path" };
-    }
-    const seg = localWalk(fromPt, toNode.point, region, footprints);
-    if (!seg.length) {
-      return { found: false, points: [], note: `No walk in ${region.name}` };
-    }
-    if (points.length) {
-      // Avoid duplicating the shared portal vertex.
-      points.push(...seg.slice(1));
-    } else {
-      points.push(...seg);
-    }
-    fromPt = toNode.point;
-    fromId = step.id;
-  }
-  void fromId;
 
   return {
-    found: points.length >= 2,
-    points,
-    note: foundEnd ? `${chain.length} hops` : "No path",
+    found: stitched.points.length >= 2,
+    points: stitched.points,
+    note: `${stitched.hops} hops`,
+  };
+}
+
+/**
+ * Multi-target Dijkstra from `start` to the nearest reachable "exit" portal
+ * (a boundary door with no modelled space on the far side — see
+ * {@link NavmeshPortal}). Used for emergency "nearest way out" routing rather
+ * than a specific click-to-click destination.
+ */
+export function findNearestExitPath(
+  mesh: StoreyNavmesh,
+  start: Point2D,
+  footprints?: FootprintsDocument | null,
+  opts: { blockedPortalIds?: ReadonlySet<string> } = {},
+): { found: boolean; points: Point2D[]; note: string; exitPortalId?: string } {
+  const startRegion = regionAtPoint(mesh, start);
+  if (!startRegion) {
+    return { found: false, points: [], note: "Pick a point inside a walkable region" };
+  }
+
+  const hasExit = mesh.portals.some((p) => p.kind === "exit" && !opts.blockedPortalIds?.has(p.id));
+  if (!hasExit) {
+    return { found: false, points: [], note: "No exit portal on this storey" };
+  }
+
+  const regionById = new Map(mesh.regions.map((r) => [r.spaceId, r]));
+  const graph = buildPortalGraph(
+    mesh,
+    [{ id: "__start", point: start, regions: [startRegion.spaceId] }],
+    opts.blockedPortalIds,
+  );
+
+  // Plain Dijkstra (no heuristic — there's no single fixed goal point).
+  const cameFrom = new Map<string, { prev: string; viaRegion: string }>();
+  const gScore = new Map<string, number>([["__start", 0]]);
+  const open = new MinHeap<{ id: string; g: number }>((a, b) => a.g < b.g);
+  open.push({ id: "__start", g: 0 });
+  const closed = new Set<string>();
+
+  let exitId: string | null = null;
+  while (open.size) {
+    const current = open.pop()!;
+    if (closed.has(current.id)) continue;
+    closed.add(current.id);
+    const node = graph.nodes.get(current.id)!;
+    if (node.isExit) {
+      exitId = current.id;
+      break;
+    }
+    const gCur = gScore.get(current.id) ?? Infinity;
+    for (const n of graph.adjacency.get(current.id) ?? []) {
+      const tentative = gCur + n.cost;
+      if (tentative >= (gScore.get(n.id) ?? Infinity)) continue;
+      cameFrom.set(n.id, { prev: current.id, viaRegion: n.viaRegion });
+      gScore.set(n.id, tentative);
+      open.push({ id: n.id, g: tentative });
+    }
+  }
+
+  if (!exitId) {
+    return { found: false, points: [], note: "No reachable exit" };
+  }
+
+  if (exitId === "__start") {
+    return { found: true, points: [start], note: "Already at an exit", exitPortalId: exitId };
+  }
+
+  const stitched = stitchPortalPath(
+    graph,
+    regionById,
+    cameFrom,
+    start,
+    "__start",
+    exitId,
+    footprints,
+  );
+  if (!stitched) {
+    return { found: false, points: [], note: "Path reconstruction failed" };
+  }
+
+  return {
+    found: stitched.points.length >= 2,
+    points: stitched.points,
+    note: `${stitched.hops} hops to exit`,
+    exitPortalId: exitId,
   };
 }
 

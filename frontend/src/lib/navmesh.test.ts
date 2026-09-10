@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildStoreyNavmesh, doorIdFromVizEdge, findNavmeshPath, regionAtPoint } from "./navmesh.ts";
+import {
+  buildStoreyNavmesh,
+  doorIdFromVizEdge,
+  findNavmeshPath,
+  findNearestExitPath,
+  regionAtPoint,
+} from "./navmesh.ts";
 import type { ConnectivityGraph } from "../types/graph.ts";
 import type { FootprintsDocument } from "../types/footprints.ts";
 
@@ -161,5 +167,92 @@ describe("navmesh", () => {
     });
     const path = findNavmeshPath(mesh, { x: 1, y: 2 }, { x: 7, y: 2 }, footprints);
     assert.equal(path.found, false);
+  });
+
+  describe("exit portals", () => {
+    const footprintsWithExit: FootprintsDocument = {
+      ...footprints,
+      doors: [
+        ...footprints.doors,
+        {
+          global_id: "E",
+          name: "E",
+          storey_global_id: "S1",
+          point: { x: 0, y: 2 },
+          segment: [
+            { x: 0, y: 1.5 },
+            { x: 0, y: 2.5 },
+          ],
+          incomplete: false,
+          method: "ifc_object_placement",
+        },
+      ],
+    };
+
+    const graphWithExit: ConnectivityGraph = {
+      ...graph,
+      nodes: [
+        ...graph.nodes,
+        { id: "door:E", kind: "door", global_id: "E", name: "E", storey_global_id: "S1" },
+      ],
+      edges: [
+        ...graph.edges,
+        {
+          id: "space_door:A:E:ifc",
+          kind: "space_door",
+          source: "space:A",
+          target: "door:E",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+      ],
+    };
+
+    it("builds an exit portal for a door with exactly one linked space", () => {
+      const mesh = buildStoreyNavmesh(footprintsWithExit, graphWithExit, "S1");
+      const exits = mesh.portals.filter((p) => p.kind === "exit");
+      assert.equal(exits.length, 1);
+      assert.equal(exits[0]!.spaceA, "space:A");
+      assert.equal(exits[0]!.spaceB, null);
+      assert.deepEqual(exits[0]!.point, { x: 0, y: 2 });
+      // Two-sided door D is still a regular door portal, not an exit.
+      assert.equal(mesh.portals.filter((p) => p.kind === "door").length, 1);
+    });
+
+    it("routes to the nearest exit from inside a region", () => {
+      const mesh = buildStoreyNavmesh(footprintsWithExit, graphWithExit, "S1");
+      const result = findNearestExitPath(mesh, { x: 3, y: 2 }, footprintsWithExit);
+      assert.equal(result.found, true);
+      assert.equal(result.exitPortalId, "viz-exit:door:E:space:A");
+      const last = result.points[result.points.length - 1]!;
+      assert.ok(
+        Math.hypot(last.x - 0, last.y - 2) < 0.5,
+        "expected path to end near the exit door",
+      );
+    });
+
+    it("reports no reachable exit from a region with none", () => {
+      const mesh = buildStoreyNavmesh(footprintsWithExit, graphWithExit, "S1");
+      const doorPortalId = mesh.portals.find((p) => p.kind === "door")!.id;
+      // Blocking the only door between B and A isolates B from the exit on A.
+      const result = findNearestExitPath(mesh, { x: 6, y: 2 }, footprintsWithExit, {
+        blockedPortalIds: new Set([doorPortalId]),
+      });
+      assert.equal(result.found, false);
+    });
+  });
+
+  describe("blocked portals", () => {
+    it("routes around a blocked portal via findNavmeshPath", () => {
+      const mesh = buildStoreyNavmesh(footprints, graph, "S1");
+      const blocked = findNavmeshPath(mesh, { x: 1, y: 2 }, { x: 7, y: 2 }, footprints, {
+        blockedPortalIds: new Set([mesh.portals[0]!.id]),
+      });
+      assert.equal(blocked.found, false);
+      assert.equal(blocked.note, "No portal path between regions");
+
+      const open = findNavmeshPath(mesh, { x: 1, y: 2 }, { x: 7, y: 2 }, footprints);
+      assert.equal(open.found, true);
+    });
   });
 });
