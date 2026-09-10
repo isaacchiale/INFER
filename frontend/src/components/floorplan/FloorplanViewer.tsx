@@ -26,6 +26,7 @@ import {
   threeToIfcPlanResolved,
 } from "@/lib/viewer-camera-pose";
 import { cn } from "@/lib/utils";
+import { useAppTheme, type AppTheme } from "@/hooks/use-app-theme";
 import type { FootprintsDocument, Point2D } from "@/types/footprints";
 import {
   DropdownMenu,
@@ -36,9 +37,22 @@ import {
 
 /** Same canvas colours as Graph Viewer (`graphPalette`). */
 const PLAN_CANVAS = "bg-[#F8FAFC] dark:bg-[#0F1117]";
+const PLAN_CANVAS_HEX: Record<AppTheme, string> = { light: "#F8FAFC", dark: "#0F1117" };
 
 const GLASS =
   "rounded-[6px] border border-border bg-background/90 shadow-sm backdrop-blur-[2px]";
+
+/**
+ * Wall poché inverts light/dark rather than reusing one hex — the whole
+ * point of solid architectural wall fill is maximum contrast against the
+ * canvas, and a fixed color would go invisible (near-black walls on the
+ * near-black dark canvas) or muddy the moment the theme flips.
+ */
+function floorplanPalette(theme: AppTheme) {
+  return theme === "dark"
+    ? { wall: "#cbd5e1", wallStroke: "#e2e8f0", label: "#e2e8f0", canvasBg: PLAN_CANVAS_HEX.dark }
+    : { wall: "#1e293b", wallStroke: "#0f172a", label: "#1e293b", canvasBg: PLAN_CANVAS_HEX.light };
+}
 
 type PlanDisplayMode = "ifc" | "navmesh";
 
@@ -235,6 +249,27 @@ function polygonPathD(polygon: Point2[]): string {
   return polygon.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ") + " Z";
 }
 
+function polygonCentroid(polygon: Point2[]): Point2 {
+  let x = 0;
+  let y = 0;
+  for (const p of polygon) {
+    x += p.x;
+    y += p.y;
+  }
+  const n = Math.max(polygon.length, 1);
+  return { x: x / n, y: y / n };
+}
+
+/** Scale a polygon about its own centroid — used to pad a door's thin hull
+ * so it fully erases the wall stroke it's meant to punch a gap through. */
+function scalePolygon(polygon: Point2[], factor: number): Point2[] {
+  const c = polygonCentroid(polygon);
+  return polygon.map((p) => ({
+    x: c.x + (p.x - c.x) * factor,
+    y: c.y + (p.y - c.y) * factor,
+  }));
+}
+
 /** Exterior + holes as one SVG path (evenodd voids). */
 function spacePathD(exterior: Point2[], holes?: Point2[][]): string {
   let d = polygonPathD(exterior);
@@ -297,6 +332,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
     selectElement,
   } = useInfer();
   const { viewerCameraPose, viewerModelBounds, viewerCoordInverse } = useViewerPose();
+  const theme = useAppTheme();
+  const palette = useMemo(() => floorplanPalette(theme), [theme]);
 
   const [planDisplayMode, setPlanDisplayMode] = useState<PlanDisplayMode>("ifc");
   const [navmeshPathNote, setNavmeshPathNote] = useState<string | null>(null);
@@ -1001,27 +1038,61 @@ export function FloorplanViewer({ className }: { className?: string }) {
                   <path
                     key={`wall:${w.global_id}`}
                     d={polygonPathD(w.polygon)}
-                    fill="rgba(236,72,153,0.45)"
-                    stroke="#db2777"
+                    fill={palette.wall}
+                    stroke={palette.wallStroke}
                     strokeWidth={roomStroke}
                   >
                     <title>{w.name ? `Wall: ${w.name}` : "Wall"}</title>
                   </path>
                 ))
               : null}
-            {layers.spaces
-              ? spaces.map((s) => {
+            {layers.walls && layers.doors
+              ? doors.map((d) => {
+                  // Punches a visual gap in the wall poché at each door
+                  // opening — walls are a convex hull with no real
+                  // subtraction, so this just paints the canvas colour back
+                  // over the wall line where the doorway actually is.
+                  if (!d.polygon || d.polygon.length < 3) return null;
                   return (
                     <path
-                      key={s.global_id}
-                      d={spacePathD(s.polygon, s.holes)}
-                      fill="rgba(148,163,184,0.35)"
-                      fillRule="evenodd"
-                      stroke="#64748b"
-                      strokeWidth={roomStroke}
-                    >
-                      <title>{s.name || s.global_id}</title>
-                    </path>
+                      key={`wallgap:${d.global_id}`}
+                      d={polygonPathD(scalePolygon(d.polygon, 1.6))}
+                      fill={palette.canvasBg}
+                      stroke="none"
+                    />
+                  );
+                })
+              : null}
+            {layers.spaces
+              ? spaces.map((s) => {
+                  const c = polygonCentroid(s.polygon);
+                  return (
+                    <g key={s.global_id}>
+                      <path
+                        d={spacePathD(s.polygon, s.holes)}
+                        fill="rgba(148,163,184,0.35)"
+                        fillRule="evenodd"
+                        stroke="#64748b"
+                        strokeWidth={roomStroke}
+                      >
+                        <title>{s.name || s.global_id}</title>
+                      </path>
+                      {s.name ? (
+                        <g transform={`translate(${c.x} ${c.y})`}>
+                          <text
+                            transform="scale(1,-1)"
+                            textAnchor="middle"
+                            dominantBaseline="middle"
+                            fontSize={markerBase * 0.013}
+                            fill={palette.label}
+                            opacity={0.85}
+                            className="pointer-events-none select-none"
+                          >
+                            {s.name}
+                          </text>
+                        </g>
+                      ) : null}
+                    </g>
                   );
                 })
               : null}
@@ -1112,18 +1183,37 @@ export function FloorplanViewer({ className }: { className?: string }) {
           </>
         ) : (
           <>
-            {storeyNavmesh?.regions.map((r) => (
-              <path
-                key={r.spaceId}
-                d={spacePathD(r.polygon, r.holes)}
-                fill="rgba(148,163,184,0.35)"
-                fillRule="evenodd"
-                stroke="#64748b"
-                strokeWidth={roomStroke}
-              >
-                <title>{r.name}</title>
-              </path>
-            ))}
+            {storeyNavmesh?.regions.map((r) => {
+              const c = polygonCentroid(r.polygon);
+              return (
+                <g key={r.spaceId}>
+                  <path
+                    d={spacePathD(r.polygon, r.holes)}
+                    fill="rgba(148,163,184,0.35)"
+                    fillRule="evenodd"
+                    stroke="#64748b"
+                    strokeWidth={roomStroke}
+                  >
+                    <title>{r.name}</title>
+                  </path>
+                  {r.name ? (
+                    <g transform={`translate(${c.x} ${c.y})`}>
+                      <text
+                        transform="scale(1,-1)"
+                        textAnchor="middle"
+                        dominantBaseline="middle"
+                        fontSize={markerBase * 0.013}
+                        fill={palette.label}
+                        opacity={0.85}
+                        className="pointer-events-none select-none"
+                      >
+                        {r.name}
+                      </text>
+                    </g>
+                  ) : null}
+                </g>
+              );
+            })}
             {storeyNavmesh?.portals.map((p) => {
               const blocked = blockedPortalIds.has(p.id);
               const door = p.doorGlobalId ? doorsByGlobalId.get(p.doorGlobalId) : null;
@@ -1285,6 +1375,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
       isExitRoute,
       blockedPortalIds,
       doorsByGlobalId,
+      palette,
       selectedSpaces,
       roomStroke,
       markerBase,
@@ -1864,8 +1955,11 @@ export function FloorplanViewer({ className }: { className?: string }) {
                           label: "Wall",
                           swatch: (
                             <span
-                              className="inline-block size-2.5 border border-[#db2777]"
-                              style={{ background: "rgba(236,72,153,0.45)" }}
+                              className="inline-block size-2.5 border"
+                              style={{
+                                background: palette.wall,
+                                borderColor: palette.wallStroke,
+                              }}
                             />
                           ),
                         },
