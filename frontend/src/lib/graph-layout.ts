@@ -174,6 +174,8 @@ export function toDisplayGraph(graph: ConnectivityGraph): DisplayGraph {
  * - every direct graph edge between the display endpoints
  * - both legs of every door that links those two spaces
  */
+const pairKey = (a: string, b: string): string => (a < b ? `${a}|${b}` : `${b}|${a}`);
+
 export function blockedEdgeIdsFromExclusions(
   graph: ConnectivityGraph,
   excludedEdgeIds: ReadonlySet<string>,
@@ -183,7 +185,12 @@ export function blockedEdgeIdsFromExclusions(
   const display = toDisplayGraph(graph);
   const displayById = new Map(display.edges.map((e) => [e.id, e]));
 
+  // Indexed once so blockPair below doesn't rescan every graph edge (and
+  // every door) per excluded edge — on a real building this used to be
+  // O(excludedEdges * doors * totalEdges), compounding fast the moment a
+  // user excludes even a handful of edges in a what-if session.
   const spacesByDoor = new Map<string, Set<string>>();
+  const edgesByNode = new Map<string, GraphEdge[]>();
   for (const edge of graph.edges) {
     const doorId = edge.source.startsWith("door:")
       ? edge.source
@@ -195,16 +202,37 @@ export function blockedEdgeIdsFromExclusions(
       : edge.target.startsWith("space:")
         ? edge.target
         : null;
-    if (!doorId || !spaceId) continue;
-    const set = spacesByDoor.get(doorId) ?? new Set<string>();
-    set.add(spaceId);
-    spacesByDoor.set(doorId, set);
+    if (doorId && spaceId) {
+      const set = spacesByDoor.get(doorId) ?? new Set<string>();
+      set.add(spaceId);
+      spacesByDoor.set(doorId, set);
+    }
+    for (const nodeId of [edge.source, edge.target]) {
+      const list = edgesByNode.get(nodeId) ?? [];
+      list.push(edge);
+      edgesByNode.set(nodeId, list);
+    }
+  }
+
+  // doorId(s) linking a given pair of spaces, so blockPair only visits doors
+  // actually relevant to that pair instead of every door in the model.
+  const doorsByPair = new Map<string, string[]>();
+  for (const [doorId, spaces] of spacesByDoor) {
+    const spaceList = [...spaces];
+    for (let i = 0; i < spaceList.length; i++) {
+      for (let j = i + 1; j < spaceList.length; j++) {
+        const key = pairKey(spaceList[i]!, spaceList[j]!);
+        const list = doorsByPair.get(key) ?? [];
+        list.push(doorId);
+        doorsByPair.set(key, list);
+      }
+    }
   }
 
   const blocked = new Set<string>();
 
   const blockPair = (a: string, b: string) => {
-    for (const edge of graph.edges) {
+    for (const edge of edgesByNode.get(a) ?? []) {
       if (
         (edge.source === a && edge.target === b) ||
         (edge.source === b && edge.target === a)
@@ -212,9 +240,8 @@ export function blockedEdgeIdsFromExclusions(
         blocked.add(edge.id);
       }
     }
-    for (const [doorId, spaces] of spacesByDoor) {
-      if (!spaces.has(a) || !spaces.has(b)) continue;
-      for (const edge of graph.edges) {
+    for (const doorId of doorsByPair.get(pairKey(a, b)) ?? []) {
+      for (const edge of edgesByNode.get(doorId) ?? []) {
         const ends = new Set([edge.source, edge.target]);
         if (ends.has(doorId) && (ends.has(a) || ends.has(b))) {
           blocked.add(edge.id);
@@ -433,9 +460,9 @@ function forceLayoutComponent(
       const i = index.get(e.source);
       const j = index.get(e.target);
       if (i == null || j == null || i === j) continue;
-      let dx = pos[j]!.x - pos[i]!.x;
-      let dy = pos[j]!.y - pos[i]!.y;
-      let dist = Math.hypot(dx, dy) || 0.01;
+      const dx = pos[j]!.x - pos[i]!.x;
+      const dy = pos[j]!.y - pos[i]!.y;
+      const dist = Math.hypot(dx, dy) || 0.01;
       // Do not pull springs tighter than the hard min gap.
       const springTarget = Math.max(ideal, minSep);
       const f = ((dist - springTarget) / springTarget) * 0.75;
