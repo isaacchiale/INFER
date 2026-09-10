@@ -212,6 +212,24 @@ function cameraTransform(bounds: PlanView, cam: Camera): string {
   return `translate(${cam.panX} ${cam.panY}) translate(${cx} ${cy}) scale(${cam.zoom}) translate(${-cx} ${-cy})`;
 }
 
+/** Nearest of `portals` to `point` within `maxDist` (world units), for click hit-testing. */
+function nearestPortalWithin<T extends { point: Point2 }>(
+  portals: readonly T[],
+  point: Point2,
+  maxDist: number,
+): T | null {
+  let best: T | null = null;
+  let bestDist = maxDist;
+  for (const p of portals) {
+    const d = Math.hypot(p.point.x - point.x, p.point.y - point.y);
+    if (d <= bestDist) {
+      bestDist = d;
+      best = p;
+    }
+  }
+  return best;
+}
+
 function polygonPathD(polygon: Point2[]): string {
   return polygon.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ") + " Z";
 }
@@ -293,6 +311,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
     setMissPick(point);
     missPickTimerRef.current = setTimeout(() => setMissPick(null), 500);
   }, []);
+  /** Hazard/what-if: portals excluded from routing without removing them from the graph. */
+  const [blockedPortalIds, setBlockedPortalIds] = useState<Set<string>>(() => new Set());
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
@@ -710,7 +730,9 @@ export function FloorplanViewer({ className }: { className?: string }) {
         setNavmeshPathNote("Storey mesh unavailable");
         return;
       }
-      const result = findNearestExitPath(mesh, navmeshRoute.start, footprintsDocument);
+      const result = findNearestExitPath(mesh, navmeshRoute.start, footprintsDocument, {
+        blockedPortalIds,
+      });
       setNavmeshPathNote(result.found ? null : result.note);
       const nextEnd = result.found ? result.points[result.points.length - 1]! : null;
       const nextPoints = result.found ? result.points : null;
@@ -762,6 +784,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
         navmeshRoute.start,
         navmeshRoute.end,
         footprintsDocument,
+        { blockedPortalIds },
       );
       setNavmeshPathNote(result.found ? null : result.note);
       const nextPoints = result.found ? result.points : null;
@@ -785,6 +808,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
       footprintsDocument,
       { storeyId: navmeshRoute.storeyId, point: navmeshRoute.start },
       { storeyId: navmeshRoute.endStoreyId, point: navmeshRoute.end },
+      { blockedPortalIds },
     );
     setNavmeshPathNote(result.found ? null : result.note);
     const nextSegments = result.found ? result.segments : null;
@@ -807,6 +831,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     }
   }, [
     allStoreyNavmeshes,
+    blockedPortalIds,
     connectivityGraph,
     footprintsDocument,
     isExitRoute,
@@ -828,6 +853,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     setNavmeshRoute(null);
     setNavmeshPathNote(null);
     setIsExitRoute(false);
+    setBlockedPortalIds(new Set());
   }, [footprintsId, setNavmeshRoute]);
 
   const clearNavmeshRoute = useCallback(() => {
@@ -872,6 +898,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
   // Pin bulb ≈ 1.3× portal diameter — tip-to-top ~2× that.
   const pinScale = portalR * 2.5;
   const pinHitR = Math.max(pinScale * 1.4, portalR * 2.2);
+  const portalHitR = portalR * 2.5;
 
   const navmeshPickRef = useRef({
     enabled: false as boolean,
@@ -886,6 +913,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     hasEnd: false as boolean,
     hasRoute: false as boolean,
     pinHitR: 1,
+    portalHitR: 1,
     storeyId: "" as string,
   });
   navmeshPickRef.current = {
@@ -898,6 +926,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     hasEnd: navmeshRoute?.end != null,
     hasRoute: navmeshRoute != null,
     pinHitR,
+    portalHitR,
     storeyId: typeof activeStoreyId === "string" ? activeStoreyId : "",
   };
 
@@ -1053,37 +1082,58 @@ export function FloorplanViewer({ className }: { className?: string }) {
                 <title>{r.name}</title>
               </path>
             ))}
-            {storeyNavmesh?.portals.map((p) => (
-              <circle
-                key={p.id}
-                cx={p.point.x}
-                cy={p.point.y}
-                r={portalR}
-                fill={
-                  p.kind === "exit"
-                    ? "#ef4444"
-                    : p.kind === "space"
-                      ? "#22c55e"
-                      : p.inferred
-                        ? "#eab308"
-                        : "#f97316"
-                }
-                stroke="#0f172a"
-                strokeWidth={doorStroke * 0.4}
-              >
-                <title>
-                  {p.kind === "exit"
-                    ? "Exit"
-                    : p.kind === "space"
-                      ? "Space portal"
-                      : p.inferred
-                        ? "Door heal"
-                        : "IFC door"}
-                  : {p.spaceA}
-                  {p.spaceB ? ` ↔ ${p.spaceB}` : ""}
-                </title>
-              </circle>
-            ))}
+            {storeyNavmesh?.portals.map((p) => {
+              const blocked = blockedPortalIds.has(p.id);
+              return (
+                <g key={p.id}>
+                  <circle
+                    cx={p.point.x}
+                    cy={p.point.y}
+                    r={portalR}
+                    fill={
+                      blocked
+                        ? "#94a3b8"
+                        : p.kind === "exit"
+                          ? "#ef4444"
+                          : p.kind === "space"
+                            ? "#22c55e"
+                            : p.inferred
+                              ? "#eab308"
+                              : "#f97316"
+                    }
+                    stroke="#0f172a"
+                    strokeWidth={doorStroke * 0.4}
+                  >
+                    <title>
+                      {blocked
+                        ? "Blocked — click to unblock"
+                        : `${
+                            p.kind === "exit"
+                              ? "Exit"
+                              : p.kind === "space"
+                                ? "Space portal"
+                                : p.inferred
+                                  ? "Door heal"
+                                  : "IFC door"
+                          } — click to block`}
+                      : {p.spaceA}
+                      {p.spaceB ? ` ↔ ${p.spaceB}` : ""}
+                    </title>
+                  </circle>
+                  {blocked ? (
+                    <line
+                      x1={p.point.x - portalR * 0.7}
+                      y1={p.point.y - portalR * 0.7}
+                      x2={p.point.x + portalR * 0.7}
+                      y2={p.point.y + portalR * 0.7}
+                      stroke="#0f172a"
+                      strokeWidth={doorStroke * 0.6}
+                      strokeLinecap="round"
+                    />
+                  ) : null}
+                </g>
+              );
+            })}
           </>
         )}
 
@@ -1159,6 +1209,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
       navmeshStart,
       navmeshEnd,
       isExitRoute,
+      blockedPortalIds,
       selectedSpaces,
       roomStroke,
       markerBase,
@@ -1398,7 +1449,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
       }
       applyCameraDom();
 
-      // Left-click (not pan) on a navmesh region → toggle graph/floorplan selection.
+      // Left-click (not pan): a portal toggles blocked (hazard what-if);
+      // otherwise a region toggles graph/floorplan selection.
       if (!drag || drag.moved) return;
       const pick = navmeshPickRef.current;
       if (!pick.enabled || !pick.mesh) return;
@@ -1406,6 +1458,16 @@ export function FloorplanViewer({ className }: { className?: string }) {
       const svg = svgRef.current;
       if (!bounds || !svg) return;
       const world = clientToView(e.clientX, e.clientY, svg, bounds, cameraRef.current);
+      const portal = nearestPortalWithin(pick.mesh.portals, world, pick.portalHitR);
+      if (portal) {
+        setBlockedPortalIds((prev) => {
+          const next = new Set(prev);
+          if (next.has(portal.id)) next.delete(portal.id);
+          else next.add(portal.id);
+          return next;
+        });
+        return;
+      }
       const region = regionAtPoint(pick.mesh, world);
       if (!region) return;
       selectElementRef.current(region.spaceId);
@@ -1440,6 +1502,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     clearNavmeshRoute,
     setNavmeshRoute,
     flashMissPick,
+    setBlockedPortalIds,
   ]);
 
   return (
@@ -1660,7 +1723,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
               aria-label="Floorplan pan and zoom surface"
               title={
                 planDisplayMode === "navmesh"
-                  ? "Left-click region: select/deselect space. Right-click: set start then end. Long right-click: clear pins and path. Drag to pan."
+                  ? "Left-click region: select/deselect space. Left-click a portal: block/unblock it. Right-click: set start then end. Long right-click: clear pins and path. Drag to pan."
                   : undefined
               }
             />
@@ -1792,6 +1855,17 @@ export function FloorplanViewer({ className }: { className?: string }) {
                   </span>
                 ) : null}
               </span>
+              {planDisplayMode === "navmesh" && blockedPortalIds.size > 0 ? (
+                <button
+                  type="button"
+                  className="pointer-events-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground transition-colors hover:bg-muted"
+                  title="Clear all blocked portals"
+                  onClick={() => setBlockedPortalIds(new Set())}
+                >
+                  <span className="inline-block size-2 rounded-full bg-[#94a3b8]" />
+                  {blockedPortalIds.size} blocked · clear
+                </button>
+              ) : null}
               <span className="min-w-0 basis-full px-1" title={navmeshStatusMessage || undefined}>
                 {navmeshStatusMessage}
               </span>
