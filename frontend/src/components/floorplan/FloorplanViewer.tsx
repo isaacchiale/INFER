@@ -789,6 +789,225 @@ export function FloorplanViewer({ className }: { className?: string }) {
       ? pathPoints.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ")
       : "";
 
+  /**
+   * Everything except the camera dot, memoized separately from it.
+   * `viewerCameraPose` (and therefore `cameraDot`) updates up to 20 Hz during
+   * Fly navigation, which re-renders this component — without this memo,
+   * every one of those ticks would re-run every wall/space/door/stair/
+   * navmesh-region/portal/selection `.map()` just to move the dot.
+   */
+  const staticPlanLayers = useMemo(
+    () => (
+      <>
+        {planDisplayMode === "ifc" ? (
+          <>
+            {layers.walls
+              ? walls.map((w) => (
+                  <path
+                    key={`wall:${w.global_id}`}
+                    d={polygonPathD(w.polygon)}
+                    fill="rgba(236,72,153,0.45)"
+                    stroke="#db2777"
+                    strokeWidth={roomStroke}
+                  >
+                    <title>{w.name ? `Wall: ${w.name}` : "Wall"}</title>
+                  </path>
+                ))
+              : null}
+            {layers.spaces
+              ? spaces.map((s) => {
+                  return (
+                    <path
+                      key={s.global_id}
+                      d={spacePathD(s.polygon, s.holes)}
+                      fill="rgba(148,163,184,0.35)"
+                      fillRule="evenodd"
+                      stroke="#64748b"
+                      strokeWidth={roomStroke}
+                    >
+                      <title>{s.name || s.global_id}</title>
+                    </path>
+                  );
+                })
+              : null}
+            {layers.stairs
+              ? stairs.map((s) => {
+                  return (
+                    <path
+                      key={`stair:${s.global_id}`}
+                      d={polygonPathD(s.polygon)}
+                      fill="none"
+                      stroke="#7c3aed"
+                      strokeWidth={roomStroke * 1.4}
+                      strokeDasharray={`${markerBase * 0.006} ${markerBase * 0.004}`}
+                    >
+                      <title>{s.name ? `Stair: ${s.name}` : "Stair"}</title>
+                    </path>
+                  );
+                })
+              : null}
+            {layers.doors
+              ? doors.map((d) => {
+                  const poly = d.polygon && d.polygon.length >= 3 ? d.polygon : null;
+                  if (poly) {
+                    const dPath =
+                      poly
+                        .map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`)
+                        .join(" ") + " Z";
+                    return (
+                      <path
+                        key={d.global_id}
+                        d={dPath}
+                        fill="#f59e0b"
+                        fillOpacity={0.85}
+                        stroke="none"
+                      >
+                        <title>{d.name || d.global_id}</title>
+                      </path>
+                    );
+                  }
+                  if (!d.point) return null;
+                  return (
+                    <circle
+                      key={d.global_id}
+                      cx={d.point.x}
+                      cy={d.point.y}
+                      r={doorR}
+                      fill="#f59e0b"
+                      stroke="none"
+                    >
+                      <title>{d.name || d.global_id}</title>
+                    </circle>
+                  );
+                })
+              : null}
+          </>
+        ) : (
+          <>
+            {storeyNavmesh?.regions.map((r) => (
+              <path
+                key={r.spaceId}
+                d={spacePathD(r.polygon, r.holes)}
+                fill="rgba(148,163,184,0.35)"
+                fillRule="evenodd"
+                stroke="#64748b"
+                strokeWidth={roomStroke}
+              >
+                <title>{r.name}</title>
+              </path>
+            ))}
+            {storeyNavmesh?.portals.map((p) => (
+              <circle
+                key={p.id}
+                cx={p.point.x}
+                cy={p.point.y}
+                r={portalR}
+                fill={
+                  p.kind === "space"
+                    ? "#22c55e"
+                    : p.inferred
+                      ? "#eab308"
+                      : "#f97316"
+                }
+                stroke="#0f172a"
+                strokeWidth={doorStroke * 0.4}
+              >
+                <title>
+                  {p.kind === "space"
+                    ? "Space portal"
+                    : p.inferred
+                      ? "Door heal"
+                      : "IFC door"}
+                  : {p.spaceA} ↔ {p.spaceB}
+                </title>
+              </circle>
+            ))}
+          </>
+        )}
+
+        {layers.route && pathD ? (
+          <path
+            d={pathD}
+            fill="none"
+            stroke="#93c5fd"
+            strokeWidth={routeHalo}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            opacity={0.85}
+          />
+        ) : null}
+        {layers.route && pathD ? (
+          <path
+            d={pathD}
+            fill="none"
+            stroke="#1d4ed8"
+            strokeWidth={routeStroke}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        ) : null}
+
+        {navmeshStart ? (
+          <MapPin
+            x={navmeshStart.x}
+            y={navmeshStart.y}
+            scale={pinScale}
+            strokeW={doorStroke * 0.45}
+            label="Start"
+          />
+        ) : null}
+        {navmeshEnd ? (
+          <MapPin
+            x={navmeshEnd.x}
+            y={navmeshEnd.y}
+            scale={pinScale}
+            strokeW={doorStroke * 0.45}
+            label="End"
+          />
+        ) : null}
+
+        {selectedSpaces.map((space) => (
+          <path
+            key={`sel:${space.global_id}`}
+            d={spacePathD(space.polygon, space.holes)}
+            fill="rgba(37,99,235,0.28)"
+            fillRule="evenodd"
+            stroke="#2563eb"
+            strokeWidth={selectedStroke}
+          >
+            <title>Selected: {space.name || space.global_id}</title>
+          </path>
+        ))}
+      </>
+    ),
+    [
+      planDisplayMode,
+      layers.walls,
+      layers.spaces,
+      layers.stairs,
+      layers.doors,
+      layers.route,
+      walls,
+      spaces,
+      stairs,
+      doors,
+      storeyNavmesh,
+      pathD,
+      navmeshStart,
+      navmeshEnd,
+      selectedSpaces,
+      roomStroke,
+      markerBase,
+      doorR,
+      doorStroke,
+      portalR,
+      pinScale,
+      routeHalo,
+      routeStroke,
+      selectedStroke,
+    ],
+  );
+
   // Restore camera transform after React commits geometry (do not put transform in JSX —
   // React re-renders were wiping pan/zoom). Skip while dragging so layout can't fight the gesture.
   // Also re-apply screen-fixed marker scales when pins / camera dot mount.
@@ -1122,185 +1341,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
             >
               <g transform="scale(1,-1)">
                 <g ref={cameraGroupRef}>
-                  {planDisplayMode === "ifc" ? (
-                    <>
-                      {layers.walls
-                        ? walls.map((w) => (
-                            <path
-                              key={`wall:${w.global_id}`}
-                              d={polygonPathD(w.polygon)}
-                              fill="rgba(236,72,153,0.45)"
-                              stroke="#db2777"
-                              strokeWidth={roomStroke}
-                            >
-                              <title>{w.name ? `Wall: ${w.name}` : "Wall"}</title>
-                            </path>
-                          ))
-                        : null}
-                      {layers.spaces
-                        ? spaces.map((s) => {
-                            return (
-                              <path
-                                key={s.global_id}
-                                d={spacePathD(s.polygon, s.holes)}
-                                fill="rgba(148,163,184,0.35)"
-                                fillRule="evenodd"
-                                stroke="#64748b"
-                                strokeWidth={roomStroke}
-                              >
-                                <title>{s.name || s.global_id}</title>
-                              </path>
-                            );
-                          })
-                        : null}
-                      {layers.stairs
-                        ? stairs.map((s) => {
-                            return (
-                              <path
-                                key={`stair:${s.global_id}`}
-                                d={polygonPathD(s.polygon)}
-                                fill="none"
-                                stroke="#7c3aed"
-                                strokeWidth={roomStroke * 1.4}
-                                strokeDasharray={`${markerBase * 0.006} ${markerBase * 0.004}`}
-                              >
-                                <title>{s.name ? `Stair: ${s.name}` : "Stair"}</title>
-                              </path>
-                            );
-                          })
-                        : null}
-                      {layers.doors
-                        ? doors.map((d) => {
-                            const poly = d.polygon && d.polygon.length >= 3 ? d.polygon : null;
-                            if (poly) {
-                              const dPath =
-                                poly
-                                  .map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`)
-                                  .join(" ") + " Z";
-                              return (
-                                <path
-                                  key={d.global_id}
-                                  d={dPath}
-                                  fill="#f59e0b"
-                                  fillOpacity={0.85}
-                                  stroke="none"
-                                >
-                                  <title>{d.name || d.global_id}</title>
-                                </path>
-                              );
-                            }
-                            if (!d.point) return null;
-                            return (
-                              <circle
-                                key={d.global_id}
-                                cx={d.point.x}
-                                cy={d.point.y}
-                                r={doorR}
-                                fill="#f59e0b"
-                                stroke="none"
-                              >
-                                <title>{d.name || d.global_id}</title>
-                              </circle>
-                            );
-                          })
-                        : null}
-                    </>
-                  ) : (
-                    <>
-                      {storeyNavmesh?.regions.map((r) => (
-                        <path
-                          key={r.spaceId}
-                          d={spacePathD(r.polygon, r.holes)}
-                          fill="rgba(148,163,184,0.35)"
-                          fillRule="evenodd"
-                          stroke="#64748b"
-                          strokeWidth={roomStroke}
-                        >
-                          <title>{r.name}</title>
-                        </path>
-                      ))}
-                      {storeyNavmesh?.portals.map((p) => (
-                        <circle
-                          key={p.id}
-                          cx={p.point.x}
-                          cy={p.point.y}
-                          r={portalR}
-                          fill={
-                            p.kind === "space"
-                              ? "#22c55e"
-                              : p.inferred
-                                ? "#eab308"
-                                : "#f97316"
-                          }
-                          stroke="#0f172a"
-                          strokeWidth={doorStroke * 0.4}
-                        >
-                          <title>
-                            {p.kind === "space"
-                              ? "Space portal"
-                              : p.inferred
-                                ? "Door heal"
-                                : "IFC door"}
-                            : {p.spaceA} ↔ {p.spaceB}
-                          </title>
-                        </circle>
-                      ))}
-                    </>
-                  )}
-
-                  {layers.route && pathD ? (
-                    <path
-                      d={pathD}
-                      fill="none"
-                      stroke="#93c5fd"
-                      strokeWidth={routeHalo}
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      opacity={0.85}
-                    />
-                  ) : null}
-                  {layers.route && pathD ? (
-                    <path
-                      d={pathD}
-                      fill="none"
-                      stroke="#1d4ed8"
-                      strokeWidth={routeStroke}
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  ) : null}
-
-                  {navmeshStart ? (
-                    <MapPin
-                      x={navmeshStart.x}
-                      y={navmeshStart.y}
-                      scale={pinScale}
-                      strokeW={doorStroke * 0.45}
-                      label="Start"
-                    />
-                  ) : null}
-                  {navmeshEnd ? (
-                    <MapPin
-                      x={navmeshEnd.x}
-                      y={navmeshEnd.y}
-                      scale={pinScale}
-                      strokeW={doorStroke * 0.45}
-                      label="End"
-                    />
-                  ) : null}
-
-                  {selectedSpaces.map((space) => (
-                    <path
-                      key={`sel:${space.global_id}`}
-                      d={spacePathD(space.polygon, space.holes)}
-                      fill="rgba(37,99,235,0.28)"
-                      fillRule="evenodd"
-                      stroke="#2563eb"
-                      strokeWidth={selectedStroke}
-                    >
-                      <title>Selected: {space.name || space.global_id}</title>
-                    </path>
-                  ))}
+                  {staticPlanLayers}
 
                   {cameraDot ? (
                     <g
