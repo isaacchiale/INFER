@@ -25,13 +25,22 @@ export type WorkMode = "model" | "navigate" | "layers" | "validate" | "scenario"
 
 export type StoreyDisplayMode = "all" | "isolate" | "ghost" | "explode";
 
-/** Floorplan click-to-click route (pins + A* polyline). Survives IFC/navmesh mode toggles. */
+/**
+ * Floorplan click-to-click route (pins + A* polyline). Survives IFC/navmesh
+ * mode toggles and storey switches — the end pin may land on a different
+ * storey than the start, producing a cross-storey path via stairs/lifts.
+ */
 export type NavmeshRoute = {
+  /** Storey the start pin was placed on. */
   storeyId: string;
   start: Point2D;
   end: Point2D | null;
-  /** Set when both pins exist and A* succeeded. */
+  /** Storey the end pin was placed on; differs from `storeyId` for a cross-storey route. */
+  endStoreyId: string | null;
+  /** Set when both pins are on the same storey and A* succeeded. */
   points: Point2D[] | null;
+  /** Set when the pins are on different storeys and a path was found — one entry per storey it crosses. */
+  segments: { storeyId: string; points: Point2D[] }[] | null;
 };
 
 export interface RouteRequest {

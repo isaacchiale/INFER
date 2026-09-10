@@ -3,7 +3,9 @@ import { Box, Check, ChevronDown, Maximize2, Network } from "lucide-react";
 import { useInfer, useViewerPose } from "@/state/infer-store";
 import { continuousPolylineForStorey } from "@/lib/geometric-path";
 import {
+  buildAllStoreyNavmeshes,
   buildStoreyNavmesh,
+  findMultiStoreyNavmeshPath,
   findNavmeshPath,
   regionAtPoint,
 } from "@/lib/navmesh";
@@ -658,67 +660,113 @@ export function FloorplanViewer({ className }: { className?: string }) {
     excludedEdgeIds,
   ]);
 
+  // Every storey's mesh — needed once the end pin can land on a different
+  // floor than the start (stairs/lifts bridge them via findMultiStoreyNavmeshPath).
+  const allStoreyNavmeshes = useMemo(() => {
+    if (!footprintsDocument || !connectivityGraph) return [];
+    return buildAllStoreyNavmeshes(footprintsDocument, connectivityGraph, {
+      excludedNodeIds,
+      excludedEdgeIds,
+    });
+  }, [footprintsDocument, connectivityGraph, excludedNodeIds, excludedEdgeIds]);
+
   const navmeshStart =
     navmeshRoute && navmeshRoute.storeyId === activeStoreyId ? navmeshRoute.start : null;
   const navmeshEnd =
-    navmeshRoute && navmeshRoute.storeyId === activeStoreyId ? navmeshRoute.end : null;
+    navmeshRoute && navmeshRoute.end && navmeshRoute.endStoreyId === activeStoreyId
+      ? navmeshRoute.end
+      : null;
 
-  // Recompute A* whenever pins + mesh change (persists across IFC/navmesh toggle).
+  // Recompute A* whenever pins + mesh change (persists across IFC/navmesh
+  // toggle and storey switches — the end pin may be on a different storey).
   useEffect(() => {
-    if (!navmeshRoute || navmeshRoute.storeyId !== activeStoreyId) {
-      setNavmeshPathNote(null);
-      return;
-    }
-    if (!navmeshRoute.end || !storeyNavmesh || !footprintsDocument) {
-      if (navmeshRoute.points) {
-        setNavmeshRoute({ ...navmeshRoute, points: null });
+    if (!navmeshRoute || !navmeshRoute.end || navmeshRoute.endStoreyId == null) {
+      if (navmeshRoute?.points || navmeshRoute?.segments) {
+        setNavmeshRoute({ ...navmeshRoute, points: null, segments: null });
       }
       setNavmeshPathNote(null);
       return;
     }
-    const result = findNavmeshPath(
-      storeyNavmesh,
-      navmeshRoute.start,
-      navmeshRoute.end,
+    if (!footprintsDocument || !connectivityGraph) return;
+
+    const startMesh = allStoreyNavmeshes.find((m) => m.storeyId === navmeshRoute.storeyId);
+    const endMesh = allStoreyNavmeshes.find((m) => m.storeyId === navmeshRoute.endStoreyId);
+    if (!startMesh || !endMesh) {
+      setNavmeshPathNote("Storey mesh unavailable");
+      return;
+    }
+
+    if (navmeshRoute.storeyId === navmeshRoute.endStoreyId) {
+      const result = findNavmeshPath(
+        startMesh,
+        navmeshRoute.start,
+        navmeshRoute.end,
+        footprintsDocument,
+      );
+      setNavmeshPathNote(result.found ? null : result.note);
+      const nextPoints = result.found ? result.points : null;
+      const same =
+        (navmeshRoute.points == null && nextPoints == null) ||
+        (navmeshRoute.points != null &&
+          nextPoints != null &&
+          navmeshRoute.points.length === nextPoints.length &&
+          navmeshRoute.points.every(
+            (p, i) => p.x === nextPoints[i]!.x && p.y === nextPoints[i]!.y,
+          ));
+      if (!same || navmeshRoute.segments) {
+        setNavmeshRoute({ ...navmeshRoute, points: nextPoints, segments: null });
+      }
+      return;
+    }
+
+    const result = findMultiStoreyNavmeshPath(
+      allStoreyNavmeshes,
+      connectivityGraph,
       footprintsDocument,
+      { storeyId: navmeshRoute.storeyId, point: navmeshRoute.start },
+      { storeyId: navmeshRoute.endStoreyId, point: navmeshRoute.end },
     );
     setNavmeshPathNote(result.found ? null : result.note);
-    const nextPoints = result.found ? result.points : null;
-    const same =
-      (navmeshRoute.points == null && nextPoints == null) ||
-      (navmeshRoute.points != null &&
-        nextPoints != null &&
-        navmeshRoute.points.length === nextPoints.length &&
-        navmeshRoute.points.every(
-          (p, i) => p.x === nextPoints[i]!.x && p.y === nextPoints[i]!.y,
+    const nextSegments = result.found ? result.segments : null;
+    const sameSegments =
+      (navmeshRoute.segments == null && nextSegments == null) ||
+      (navmeshRoute.segments != null &&
+        nextSegments != null &&
+        navmeshRoute.segments.length === nextSegments.length &&
+        navmeshRoute.segments.every(
+          (s, i) =>
+            s.storeyId === nextSegments[i]!.storeyId &&
+            s.points.length === nextSegments[i]!.points.length &&
+            s.points.every(
+              (p, j) =>
+                p.x === nextSegments[i]!.points[j]!.x && p.y === nextSegments[i]!.points[j]!.y,
+            ),
         ));
-    if (!same) {
-      setNavmeshRoute({ ...navmeshRoute, points: nextPoints });
+    if (!sameSegments || navmeshRoute.points) {
+      setNavmeshRoute({ ...navmeshRoute, points: null, segments: nextSegments });
     }
   }, [
-    storeyNavmesh,
+    allStoreyNavmeshes,
+    connectivityGraph,
     footprintsDocument,
-    activeStoreyId,
     navmeshRoute?.storeyId,
+    navmeshRoute?.endStoreyId,
     navmeshRoute?.start.x,
     navmeshRoute?.start.y,
     navmeshRoute?.end?.x,
     navmeshRoute?.end?.y,
-    // Re-run when exclusions change mesh portals.
-    excludedNodeIds,
-    excludedEdgeIds,
     setNavmeshRoute,
   ]);
 
-  // Storey / model change → clear pins and path (IFC↔navmesh toggle keeps them).
-  const routeScopeRef = useRef(`${footprintsId}:${activeStoreyId}`);
+  // Model change → clear pins and path (storey switches and IFC↔navmesh
+  // toggles now preserve an in-progress or cross-storey route).
+  const routeScopeRef = useRef(footprintsId);
   useEffect(() => {
-    const key = `${footprintsId}:${activeStoreyId}`;
-    if (routeScopeRef.current === key) return;
-    routeScopeRef.current = key;
+    if (routeScopeRef.current === footprintsId) return;
+    routeScopeRef.current = footprintsId;
     setNavmeshRoute(null);
     setNavmeshPathNote(null);
-  }, [activeStoreyId, footprintsId, setNavmeshRoute]);
+  }, [footprintsId, setNavmeshRoute]);
 
   const clearNavmeshRoute = useCallback(() => {
     setNavmeshRoute(null);
@@ -735,10 +783,13 @@ export function FloorplanViewer({ className }: { className?: string }) {
     );
   }, [storeys, activeStoreyId]);
 
-  const pathPoints: Point2D[] =
+  const activeRouteSegmentPoints: Point2D[] | undefined =
     navmeshRoute?.storeyId === activeStoreyId && navmeshRoute.points?.length
       ? navmeshRoute.points
-      : (overlay?.points ?? []);
+      : navmeshRoute?.segments?.find((s) => s.storeyId === activeStoreyId)?.points;
+  const pathPoints: Point2D[] = activeRouteSegmentPoints?.length
+    ? activeRouteSegmentPoints
+    : (overlay?.points ?? []);
   const viewBox = buildingBounds ? toViewBox(buildingBounds) : "0 0 10 10";
 
   // Stroke widths in world metres (fraction of building size). Avoid
@@ -762,18 +813,23 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const navmeshPickRef = useRef({
     enabled: false as boolean,
     mesh: null as ReturnType<typeof buildStoreyNavmesh> | null,
-    start: null as NavmeshPin | null,
-    end: null as NavmeshPin | null,
-    path: [] as Point2D[],
+    // Raw start pin + its storey, ungated by which floor is currently shown —
+    // the end pin can be placed on a different floor, so "is a pin pending"
+    // must not depend on `activeStoreyId`.
+    startPoint: null as NavmeshPin | null,
+    startStoreyId: null as string | null,
+    hasEnd: false as boolean,
+    hasRoute: false as boolean,
     pinHitR: 1,
     storeyId: "" as string,
   });
   navmeshPickRef.current = {
     enabled: planDisplayMode === "navmesh" && storeyNavmesh != null,
     mesh: storeyNavmesh,
-    start: navmeshStart,
-    end: navmeshEnd,
-    path: pathPoints,
+    startPoint: navmeshRoute?.start ?? null,
+    startStoreyId: navmeshRoute?.storeyId ?? null,
+    hasEnd: navmeshRoute?.end != null,
+    hasRoute: navmeshRoute != null,
     pinHitR,
     storeyId: typeof activeStoreyId === "string" ? activeStoreyId : "",
   };
@@ -1072,26 +1128,33 @@ export function FloorplanViewer({ className }: { className?: string }) {
     const placeNavmeshPin = (clientX: number, clientY: number) => {
       const pick = navmeshPickRef.current;
       if (!pick.enabled || !pick.mesh || !pick.storeyId) return;
-      if (pick.start && pick.end) return;
+      if (pick.startPoint && pick.hasEnd) return;
       const bounds = boundsRef.current;
       const svg = svgRef.current;
       if (!bounds || !svg) return;
       const world = clientToView(clientX, clientY, svg, bounds, cameraRef.current);
       if (!regionAtPoint(pick.mesh, world)) return;
-      if (!pick.start) {
+      if (!pick.startPoint) {
         setNavmeshRoute({
           storeyId: pick.storeyId,
           start: { x: world.x, y: world.y },
           end: null,
+          endStoreyId: null,
           points: null,
+          segments: null,
         });
         return;
       }
+      // End pin may land on a different storey than the start (the user
+      // switched floors after placing it) — findMultiStoreyNavmeshPath picks
+      // that up via the effect above.
       setNavmeshRoute({
-        storeyId: pick.storeyId,
-        start: pick.start,
+        storeyId: pick.startStoreyId!,
+        start: pick.startPoint,
         end: { x: world.x, y: world.y },
+        endStoreyId: pick.storeyId,
         points: null,
+        segments: null,
       });
     };
 
@@ -1118,8 +1181,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
         const rp = rightPressRef.current;
         if (!rp || rp.pointerId !== e.pointerId) return;
         rp.longFired = true;
-        // Long right-press clears pins + path (anywhere on the plan).
-        if (navmeshPickRef.current.start || navmeshPickRef.current.end || navmeshPickRef.current.path.length >= 2) {
+        // Long right-press clears pins + path (anywhere on the plan, any storey).
+        if (navmeshPickRef.current.hasRoute) {
           clearNavmeshRoute();
         }
       }, LONG_RIGHT_MS);
@@ -1529,14 +1592,14 @@ export function FloorplanViewer({ className }: { className?: string }) {
                 {planDisplayMode === "navmesh" && storeyNavmesh
                   ? `${storeyNavmesh.regions.length} regions · ${storeyNavmesh.portals.length} portals`
                   : null}
-                {planDisplayMode === "navmesh" && navmeshStart && !navmeshEnd
-                  ? " · right-click end point"
+                {planDisplayMode === "navmesh" && navmeshRoute && !navmeshRoute.end
+                  ? navmeshRoute.storeyId === activeStoreyId
+                    ? " · right-click end point"
+                    : " · right-click end point (start pin is on another floor)"
                   : null}
                 {navmeshPathNote ? ` · ${navmeshPathNote}` : null}
-                {navmeshRoute?.points && navmeshRoute.points.length >= 2
-                  ? " · long right-click to clear"
-                  : null}
-                {!navmeshRoute?.points && connectivityRoute?.found
+                {navmeshRoute?.end ? " · long right-click to clear" : null}
+                {!navmeshRoute?.points && !navmeshRoute?.segments && connectivityRoute?.found
                   ? pathPoints.length >= 2
                     ? overlay?.note
                     : overlay?.note || "Route has no drawable points on this storey"
