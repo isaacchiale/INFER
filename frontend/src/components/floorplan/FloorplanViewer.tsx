@@ -455,14 +455,26 @@ export function FloorplanViewer({ className }: { className?: string }) {
     }));
   }, [footprintsDocument, entitiesExtract]);
 
+  // Drop a stale storey id (e.g. after switching models) — but never "correct"
+  // away from "all": that's a legitimate selection the 3D viewer also shares
+  // this state with. Only genuinely invalid ids get normalized here.
   useEffect(() => {
     if (!storeys.length) return;
-    if (activeStoreyId !== "all" && storeys.some((s) => s.global_id === activeStoreyId)) {
-      return;
-    }
+    if (activeStoreyId === "all") return;
+    if (storeys.some((s) => s.global_id === activeStoreyId)) return;
     const first = storeys[0];
     if (first) setActiveStoreyId(first.global_id);
   }, [storeys, activeStoreyId, setActiveStoreyId]);
+
+  // Floorplan can only ever render one storey at a time — when the shared
+  // selection is "all" (a valid, 3D-only concept), fall back to the first
+  // storey for THIS pane's own display without touching the shared state.
+  const displayStoreyId = useMemo(() => {
+    if (activeStoreyId !== "all" && storeys.some((s) => s.global_id === activeStoreyId)) {
+      return activeStoreyId;
+    }
+    return storeys[0]?.global_id ?? null;
+  }, [activeStoreyId, storeys]);
 
   const buildingPoints = useMemo(() => {
     if (!footprintsDocument) return [] as Point2[];
@@ -626,9 +638,9 @@ export function FloorplanViewer({ className }: { className?: string }) {
         reason: "outside building — fly inside to see the camera dot",
       };
     }
-    if (activeStoreyId !== "all" && storeysMetres.length) {
+    if (storeysMetres.length) {
       const poseStorey = storeyIdForElevation(storeysMetres, plan.elevation);
-      if (!poseStorey || poseStorey !== activeStoreyId) {
+      if (!poseStorey || poseStorey !== displayStoreyId) {
         const name =
           storeys.find((s) => s.global_id === poseStorey)?.name ?? poseStorey ?? "?";
         return {
@@ -656,7 +668,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     remapElevationsM,
     coordAxisFrame,
     useMeshElevation,
-    activeStoreyId,
+    displayStoreyId,
     storeys,
   ]);
   const cameraDot = cameraDotInfo.dot;
@@ -691,23 +703,17 @@ export function FloorplanViewer({ className }: { className?: string }) {
       !s.incomplete &&
       s.polygon.length >= 3 &&
       !excludedNodeIds.has(`space:${s.global_id}`);
-    if (activeStoreyId === "all") {
-      return footprintsDocument.spaces.filter(keep);
-    }
     return footprintsDocument.spaces.filter(
-      (s) => s.storey_global_id === activeStoreyId && keep(s),
+      (s) => s.storey_global_id === displayStoreyId && keep(s),
     );
-  }, [footprintsDocument, activeStoreyId, excludedNodeIds]);
+  }, [footprintsDocument, displayStoreyId, excludedNodeIds]);
 
   const doors = useMemo(() => {
     if (!footprintsDocument) return [];
-    if (activeStoreyId === "all") {
-      return footprintsDocument.doors.filter((d) => d.point && !d.incomplete);
-    }
     return footprintsDocument.doors.filter(
-      (d) => d.storey_global_id === activeStoreyId && d.point && !d.incomplete,
+      (d) => d.storey_global_id === displayStoreyId && d.point && !d.incomplete,
     );
-  }, [footprintsDocument, activeStoreyId]);
+  }, [footprintsDocument, displayStoreyId]);
 
   /** For the Navmesh view's faint supplementary swing glyph under each door portal dot. */
   const doorsByGlobalId = useMemo(() => {
@@ -725,35 +731,33 @@ export function FloorplanViewer({ className }: { className?: string }) {
     return list.filter((s) => {
       if (s.incomplete || s.polygon.length < 3) return false;
       if (excludedNodeIds.has(`stair:${s.global_id}`)) return false;
-      if (activeStoreyId === "all") return true;
       if (s.storey_global_id == null) return true;
-      return s.storey_global_id === activeStoreyId;
+      return s.storey_global_id === displayStoreyId;
     });
-  }, [footprintsDocument, activeStoreyId, excludedNodeIds]);
+  }, [footprintsDocument, displayStoreyId, excludedNodeIds]);
 
   /** Walls: match storey when known; unassigned walls show on every storey. */
   const walls = useMemo(() => {
     const list = footprintsDocument?.walls ?? [];
     return list.filter((w) => {
       if (w.incomplete || w.polygon.length < 3) return false;
-      if (activeStoreyId === "all") return true;
       if (w.storey_global_id == null) return true;
-      return w.storey_global_id === activeStoreyId;
+      return w.storey_global_id === displayStoreyId;
     });
-  }, [footprintsDocument, activeStoreyId]);
+  }, [footprintsDocument, displayStoreyId]);
 
   const overlay = useMemo(() => {
-    if (!footprintsDocument || !connectivityRoute?.found) return null;
+    if (!footprintsDocument || !connectivityRoute?.found || !displayStoreyId) return null;
     return continuousPolylineForStorey(
       connectivityRoute.node_ids,
       footprintsDocument,
-      activeStoreyId,
+      displayStoreyId,
       connectivityGraph,
     );
   }, [
     footprintsDocument,
     connectivityRoute,
-    activeStoreyId,
+    displayStoreyId,
     connectivityGraph,
   ]);
 
@@ -768,31 +772,24 @@ export function FloorplanViewer({ className }: { className?: string }) {
       const space = footprintsDocument.spaces.find((s) => s.global_id === gid);
       if (!space || space.incomplete || space.polygon.length < 3) continue;
       const onStorey =
-        activeStoreyId === "all" ||
-        space.storey_global_id == null ||
-        space.storey_global_id === activeStoreyId;
+        space.storey_global_id == null || space.storey_global_id === displayStoreyId;
       if (onStorey) out.push(space);
     }
     return out;
-  }, [footprintsDocument, selectedElementIds, activeStoreyId, excludedNodeIds]);
+  }, [footprintsDocument, selectedElementIds, displayStoreyId, excludedNodeIds]);
 
   const storeyNavmesh = useMemo(() => {
-    if (
-      !footprintsDocument ||
-      !connectivityGraph ||
-      !activeStoreyId ||
-      activeStoreyId === "all"
-    ) {
+    if (!footprintsDocument || !connectivityGraph || !displayStoreyId) {
       return null;
     }
-    return buildStoreyNavmesh(footprintsDocument, connectivityGraph, activeStoreyId, {
+    return buildStoreyNavmesh(footprintsDocument, connectivityGraph, displayStoreyId, {
       excludedNodeIds,
       excludedEdgeIds,
     });
   }, [
     footprintsDocument,
     connectivityGraph,
-    activeStoreyId,
+    displayStoreyId,
     excludedNodeIds,
     excludedEdgeIds,
   ]);
@@ -808,9 +805,9 @@ export function FloorplanViewer({ className }: { className?: string }) {
   }, [footprintsDocument, connectivityGraph, excludedNodeIds, excludedEdgeIds]);
 
   const navmeshStart =
-    navmeshRoute && navmeshRoute.storeyId === activeStoreyId ? navmeshRoute.start : null;
+    navmeshRoute && navmeshRoute.storeyId === displayStoreyId ? navmeshRoute.start : null;
   const navmeshEnd =
-    navmeshRoute && navmeshRoute.end && navmeshRoute.endStoreyId === activeStoreyId
+    navmeshRoute && navmeshRoute.end && navmeshRoute.endStoreyId === displayStoreyId
       ? navmeshRoute.end
       : null;
 
@@ -966,18 +963,21 @@ export function FloorplanViewer({ className }: { className?: string }) {
 
   const activeStoreyLabel = useMemo(() => {
     if (!storeys.length) return "No storeys";
-    const match = storeys.find((s) => s.global_id === activeStoreyId);
+    const match = storeys.find((s) => s.global_id === displayStoreyId);
     if (!match) return "Select storey";
-    return (
+    const name =
       match.name?.trim() ||
-      (match.elevation != null ? `E${match.elevation}` : match.global_id.slice(0, 8))
-    );
-  }, [storeys, activeStoreyId]);
+      (match.elevation != null ? `E${match.elevation}` : match.global_id.slice(0, 8));
+    // The 3D viewer can show "All levels" while Floorplan can only ever
+    // display one storey at a time — say which one so it's clear this is a
+    // fallback, not the actual shared selection.
+    return activeStoreyId === "all" ? `${name} (of all levels)` : name;
+  }, [storeys, activeStoreyId, displayStoreyId]);
 
   const activeRouteSegmentPoints: Point2D[] | undefined =
-    navmeshRoute?.storeyId === activeStoreyId && navmeshRoute.points?.length
+    navmeshRoute?.storeyId === displayStoreyId && navmeshRoute.points?.length
       ? navmeshRoute.points
-      : navmeshRoute?.segments?.find((s) => s.storeyId === activeStoreyId)?.points;
+      : navmeshRoute?.segments?.find((s) => s.storeyId === displayStoreyId)?.points;
   const pathPoints: Point2D[] = activeRouteSegmentPoints?.length
     ? activeRouteSegmentPoints
     : (overlay?.points ?? []);
@@ -1030,7 +1030,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     hasRoute: navmeshRoute != null,
     pinHitR,
     portalHitR,
-    storeyId: typeof activeStoreyId === "string" ? activeStoreyId : "",
+    storeyId: displayStoreyId ?? "",
   };
 
   const selectElementRef = useRef(selectElement);
@@ -1055,7 +1055,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
       navmeshStatusParts.push("right-click a point to route to the nearest exit");
     } else {
       navmeshStatusParts.push(
-        navmeshRoute.storeyId === activeStoreyId
+        navmeshRoute.storeyId === displayStoreyId
           ? "right-click end point"
           : "right-click end point (start pin is on another floor)",
       );
@@ -1461,7 +1461,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
   }, [
     applyCameraDom,
     buildingBounds,
-    activeStoreyId,
+    displayStoreyId,
     footprintsId,
     navmeshStart?.x,
     navmeshStart?.y,
@@ -1790,7 +1790,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                   const label =
                     s.name?.trim() ||
                     (s.elevation != null ? `E${s.elevation}` : s.global_id.slice(0, 8));
-                  const active = activeStoreyId === s.global_id;
+                  const active = displayStoreyId === s.global_id;
                   return (
                     <DropdownMenuItem
                       key={s.global_id}

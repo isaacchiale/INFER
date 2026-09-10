@@ -688,7 +688,7 @@ function InferModelViewportImpl({
                   GLASS,
                   "flex h-8 max-w-[220px] items-center gap-1.5 px-2.5 text-[12px] text-foreground transition-colors hover:bg-muted disabled:opacity-40",
                 )}
-                title="3D storey filter — isolates IFC geometry and navmesh (independent of floorplan)"
+                title="Storey — shared with the Floorplan pane; pick All levels to see every floor in 3D"
               >
                 <span className="min-w-0 truncate">{viewerStoreyLabel}</span>
                 <ChevronDown aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
