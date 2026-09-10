@@ -9,7 +9,8 @@
     "build:dev": "vite build --mode development",
     "preview": "vite preview",
     "lint": "eslint .",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "test": "node --import ./scripts/register-path-alias.mjs --test src/lib/*.test.ts"
   },
   "dependencies": {
     "@radix-ui/react-checkbox": "^1.3.3",

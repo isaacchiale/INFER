@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,17 +160,3 @@ def read_footprints(settings: Settings, model_id: str) -> FootprintsDocument:
     if not path.is_file():
         raise ModelNotFoundError(f"footprints for {model_id}")
     return FootprintsDocument.model_validate_json(path.read_text(encoding="utf-8"))
-
-
-def file_sha256(path: Path) -> str:
-    import hashlib
-
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def copy_model_bytes(settings: Settings, model_id: str, destination: Path) -> None:
-    shutil.copy2(ifc_path(settings, model_id), destination)

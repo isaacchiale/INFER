@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ifcopenshell
-import ifcopenshell.util.element
 
 from app.schemas.entities import (
     DoorEntity,
@@ -12,26 +11,12 @@ from app.schemas.entities import (
     StairEntity,
     StoreyEntity,
 )
+from app.services.graph import _gid as _global_id
+from app.services.graph import _name as _name_of
+from app.services.graph import _storey_gid
 from app.services.ifc_units import length_to_metres
 
 EXIT_MARKERS = ("exit", "evac", "fire escape", "emergency")
-
-
-def _name_of(element) -> str:
-    return (getattr(element, "Name", None) or getattr(element, "ObjectType", None) or "").strip()
-
-
-def _global_id(element) -> str:
-    return getattr(element, "GlobalId", None) or ""
-
-
-def _storey_global_id(element) -> str | None:
-    container = ifcopenshell.util.element.get_container(element)
-    if container is None:
-        return None
-    if container.is_a("IfcBuildingStorey"):
-        return _global_id(container)
-    return None
 
 
 def _exit_reason(name: str, object_type: str) -> str | None:
@@ -64,7 +49,7 @@ def extract_entities(model_id: str, ifc_file_path: str) -> EntitiesExtract:
             SpaceEntity(
                 global_id=_global_id(space),
                 name=_name_of(space),
-                storey_global_id=_storey_global_id(space),
+                storey_global_id=_storey_gid(ifc, space),
             )
         )
 
@@ -77,7 +62,7 @@ def extract_entities(model_id: str, ifc_file_path: str) -> EntitiesExtract:
             DoorEntity(
                 global_id=_global_id(door),
                 name=name,
-                storey_global_id=_storey_global_id(door),
+                storey_global_id=_storey_gid(ifc, door),
             )
         )
         reason = _exit_reason(name, object_type)

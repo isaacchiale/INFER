@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import weakref
+
 import ifcopenshell
 import ifcopenshell.util.element
 
@@ -14,29 +16,50 @@ def _name(element) -> str:
     return (getattr(element, "Name", None) or getattr(element, "ObjectType", None) or "").strip()
 
 
+# Per-ifc-file index of "element -> storey" via IfcRelAggregates /
+# IfcRelContainedInSpatialStructure, built once instead of rescanning every
+# relationship in the model on every _storey_gid call (this is called once
+# per space/door/stair/lift/wall/opening across graph.py and ingest/ifc.py).
+# Keyed by the ifc file object itself via a weak-key map so it's naturally
+# evicted once that file is garbage collected — no manual cache lifecycle.
+_storey_relations_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _storey_relations(ifc) -> tuple[dict, dict]:
+    cached = _storey_relations_cache.get(ifc)
+    if cached is not None:
+        return cached
+
+    # Spaces are often aggregated under storeys rather than "contained".
+    aggregates: dict = {}
+    for rel in ifc.by_type("IfcRelAggregates"):
+        relating = getattr(rel, "RelatingObject", None)
+        if relating is None or not relating.is_a("IfcBuildingStorey"):
+            continue
+        for related in getattr(rel, "RelatedObjects", None) or ():
+            aggregates.setdefault(related, relating)
+
+    contained: dict = {}
+    for rel in ifc.by_type("IfcRelContainedInSpatialStructure"):
+        structure = getattr(rel, "RelatingStructure", None)
+        if structure is None or not structure.is_a("IfcBuildingStorey"):
+            continue
+        for related in getattr(rel, "RelatedElements", None) or ():
+            contained.setdefault(related, structure)
+
+    result = (aggregates, contained)
+    _storey_relations_cache[ifc] = result
+    return result
+
+
 def _storey_gid(ifc, element) -> str | None:
     container = ifcopenshell.util.element.get_container(element)
     if container is not None and container.is_a("IfcBuildingStorey"):
         return _gid(container)
 
-    # Spaces are often aggregated under storeys rather than "contained".
-    for rel in ifc.by_type("IfcRelAggregates"):
-        relating = getattr(rel, "RelatingObject", None)
-        related = getattr(rel, "RelatedObjects", None) or ()
-        if relating is None or not relating.is_a("IfcBuildingStorey"):
-            continue
-        if element in related:
-            return _gid(relating)
-
-    for rel in ifc.by_type("IfcRelContainedInSpatialStructure"):
-        structure = getattr(rel, "RelatingStructure", None)
-        related = getattr(rel, "RelatedElements", None) or ()
-        if structure is None or not structure.is_a("IfcBuildingStorey"):
-            continue
-        if element in related:
-            return _gid(structure)
-
-    return None
+    aggregates, contained = _storey_relations(ifc)
+    storey = aggregates.get(element) or contained.get(element)
+    return _gid(storey) if storey is not None else None
 
 
 def _node_id(kind: str, global_id: str) -> str:
