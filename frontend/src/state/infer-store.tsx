@@ -107,18 +107,6 @@ interface InferState {
   viewerStatus: string;
   setViewerStatus: (message: string, kind?: "info" | "error" | "loading") => void;
   viewerStatusKind: "info" | "error" | "loading";
-  /** Live 3D camera in plan metres + elevation; null when unknown / cleared. */
-  viewerCameraPose: ViewerCameraPose | null;
-  setViewerCameraPose: (pose: ViewerCameraPose | null) => void;
-  /** Loaded 3D model AABB (Three Y-up); used to lock plan-dot axis frame. */
-  viewerModelBounds: ThreeAabb | null;
-  setViewerModelBounds: (bounds: ThreeAabb | null) => void;
-  /**
-   * Inverse of Fragments/web-ifc coordination matrix (column-major 16).
-   * Undoes COORDINATE_TO_ORIGIN so the plan-dot matches footprint IFC XY.
-   */
-  viewerCoordInverse: Mat4Elements | null;
-  setViewerCoordInverse: (m: Mat4Elements | null) => void;
 
   // Backend model + connectivity graph (null graph ⇒ demo fallback in viewer)
   backendModelId: string | null;
@@ -152,7 +140,66 @@ interface InferState {
 
 const Ctx = createContext<InferState | null>(null);
 
+/**
+ * Split out of InferState: viewerCameraPose publishes at up to 20Hz during
+ * Fly navigation (see that-open-runtime.ts). Bundled into the main context
+ * value, every tick re-rendered every useInfer() consumer in the app —
+ * GraphViewer, panels, TopBar, everything — whether or not they read pose at
+ * all. Only FloorplanViewer (the camera dot) and InferModelViewport (the
+ * runtime bridge that publishes it) actually need this.
+ */
+interface ViewerPoseState {
+  /** Live 3D camera in plan metres + elevation; null when unknown / cleared. */
+  viewerCameraPose: ViewerCameraPose | null;
+  setViewerCameraPose: (pose: ViewerCameraPose | null) => void;
+  /** Loaded 3D model AABB (Three Y-up); used to lock plan-dot axis frame. */
+  viewerModelBounds: ThreeAabb | null;
+  setViewerModelBounds: (bounds: ThreeAabb | null) => void;
+  /**
+   * Inverse of Fragments/web-ifc coordination matrix (column-major 16).
+   * Undoes COORDINATE_TO_ORIGIN so the plan-dot matches footprint IFC XY.
+   */
+  viewerCoordInverse: Mat4Elements | null;
+  setViewerCoordInverse: (m: Mat4Elements | null) => void;
+}
+
+const ViewerPoseCtx = createContext<ViewerPoseState | null>(null);
+
+function ViewerPoseProvider({ children }: { children: ReactNode }) {
+  const [viewerCameraPose, setViewerCameraPose] = useState<ViewerCameraPose | null>(null);
+  const [viewerModelBounds, setViewerModelBounds] = useState<ThreeAabb | null>(null);
+  const [viewerCoordInverse, setViewerCoordInverse] = useState<Mat4Elements | null>(null);
+
+  const value = useMemo<ViewerPoseState>(
+    () => ({
+      viewerCameraPose,
+      setViewerCameraPose,
+      viewerModelBounds,
+      setViewerModelBounds,
+      viewerCoordInverse,
+      setViewerCoordInverse,
+    }),
+    [viewerCameraPose, viewerModelBounds, viewerCoordInverse],
+  );
+
+  return <ViewerPoseCtx.Provider value={value}>{children}</ViewerPoseCtx.Provider>;
+}
+
+export function useViewerPose(): ViewerPoseState {
+  const ctx = useContext(ViewerPoseCtx);
+  if (!ctx) throw new Error("useViewerPose must be used inside InferProvider");
+  return ctx;
+}
+
 export function InferProvider({ children }: { children: ReactNode }) {
+  return (
+    <ViewerPoseProvider>
+      <InferProviderInner>{children}</InferProviderInner>
+    </ViewerPoseProvider>
+  );
+}
+
+function InferProviderInner({ children }: { children: ReactNode }) {
   const [workMode, setWorkMode] = useState<WorkMode>("model");
   const [activeStoreyId, setActiveStoreyId] = useState<string | "all">("all");
   const [storeyMode, setStoreyMode] = useState<StoreyDisplayMode>("all");
@@ -183,9 +230,8 @@ export function InferProvider({ children }: { children: ReactNode }) {
   const [viewerStatusKind, setViewerStatusKind] = useState<"info" | "error" | "loading">(
     "info",
   );
-  const [viewerCameraPose, setViewerCameraPose] = useState<ViewerCameraPose | null>(null);
-  const [viewerModelBounds, setViewerModelBounds] = useState<ThreeAabb | null>(null);
-  const [viewerCoordInverse, setViewerCoordInverse] = useState<Mat4Elements | null>(null);
+  const { setViewerCameraPose, setViewerModelBounds, setViewerCoordInverse } =
+    useViewerPose();
   const [backendModelId, setBackendModelId] = useState<string | null>(null);
   const [connectivityGraph, setConnectivityGraph] = useState<ConnectivityGraph | null>(null);
   const [entitiesExtract, setEntitiesExtract] = useState<EntitiesExtract | null>(null);
@@ -273,7 +319,7 @@ export function InferProvider({ children }: { children: ReactNode }) {
     setViewerCameraPose(null);
     setViewerModelBounds(null);
     setViewerCoordInverse(null);
-  }, []);
+  }, [setViewerCameraPose, setViewerModelBounds, setViewerCoordInverse]);
 
   const setConnectivityGraphOnly = useCallback((graph: ConnectivityGraph) => {
     setConnectivityGraph(graph);
@@ -407,12 +453,6 @@ export function InferProvider({ children }: { children: ReactNode }) {
       viewerStatus,
       setViewerStatus,
       viewerStatusKind,
-      viewerCameraPose,
-      setViewerCameraPose,
-      viewerModelBounds,
-      setViewerModelBounds,
-      viewerCoordInverse,
-      setViewerCoordInverse,
       backendModelId,
       connectivityGraph,
       entitiesExtract,
@@ -469,9 +509,6 @@ export function InferProvider({ children }: { children: ReactNode }) {
       viewerStatus,
       setViewerStatus,
       viewerStatusKind,
-      viewerCameraPose,
-      viewerModelBounds,
-      viewerCoordInverse,
       backendModelId,
       connectivityGraph,
       entitiesExtract,

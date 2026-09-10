@@ -13,7 +13,7 @@ import {
 } from "@/lib/storey-elevations";
 import { ifcPlanToThree, liftPlanPolylineToThree } from "@/lib/viewer-camera-pose";
 import type { HazardZone, Route } from "@/types/infer";
-import { useInfer } from "@/state/infer-store";
+import { useInfer, useViewerPose } from "@/state/infer-store";
 import {
   createThatOpenRuntime,
   type GeometryDisplayMode,
@@ -84,19 +84,21 @@ function InferModelViewportImpl({
   const {
     pendingIfc,
     setViewerStatus,
-    setViewerCameraPose,
-    setViewerModelBounds,
-    setViewerCoordInverse,
     connectivityRoute,
     navmeshRoute,
     footprintsDocument,
     connectivityGraph,
-    viewerCoordInverse,
-    viewerModelBounds,
     excludedNodeIds,
     excludedEdgeIds,
     entitiesExtract,
   } = useInfer();
+  const {
+    setViewerCameraPose,
+    setViewerModelBounds,
+    setViewerCoordInverse,
+    viewerCoordInverse,
+    viewerModelBounds,
+  } = useViewerPose();
 
   // Latest route inputs for post-load tube restore (avoid reloading IFC on route change).
   const tubeInputRef = useRef({

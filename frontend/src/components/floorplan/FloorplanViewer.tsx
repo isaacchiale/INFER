@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Check, ChevronDown, Maximize2, Network } from "lucide-react";
-import { useInfer } from "@/state/infer-store";
+import { useInfer, useViewerPose } from "@/state/infer-store";
 import { continuousPolylineForStorey } from "@/lib/geometric-path";
 import {
   buildStoreyNavmesh,
@@ -271,10 +271,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
     excludedEdgeIds,
     selectedElementIds,
     selectElement,
-    viewerCameraPose,
-    viewerModelBounds,
-    viewerCoordInverse,
   } = useInfer();
+  const { viewerCameraPose, viewerModelBounds, viewerCoordInverse } = useViewerPose();
 
   const [planDisplayMode, setPlanDisplayMode] = useState<PlanDisplayMode>("ifc");
   const [navmeshPathNote, setNavmeshPathNote] = useState<string | null>(null);
