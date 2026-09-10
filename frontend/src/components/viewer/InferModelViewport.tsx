@@ -89,7 +89,6 @@ export interface InferModelViewportProps {
   modelId: string;
   selectedElementIds?: string[];
   highlightedRoute?: Route | null;
-  activeStoreyId?: string | "all";
   hiddenStoreyIds?: string[];
   hazardZones?: HazardZone[];
   navigationStart?: string | null;
@@ -107,7 +106,6 @@ function InferModelViewportImpl({
   modelId,
   selectedElementIds = [],
   highlightedRoute = null,
-  activeStoreyId = "all",
   hiddenStoreyIds = [],
   hazardZones = [],
   navigationStart = null,
@@ -122,8 +120,6 @@ function InferModelViewportImpl({
   const [engineError, setEngineError] = useState<string | null>(null);
   const [navMode, setNavMode] = useState<NavMode>("orbit");
   const [geometryMode, setGeometryMode] = useState<GeometryDisplayMode>("ifc");
-  /** Independent of floorplan `activeStoreyId`. */
-  const [viewerStoreyId, setViewerStoreyId] = useState<string | "all">("all");
 
   const {
     pendingIfc,
@@ -135,6 +131,10 @@ function InferModelViewportImpl({
     excludedNodeIds,
     excludedEdgeIds,
     entitiesExtract,
+    // Shared with FloorplanViewer — picking a storey in either pane now
+    // isolates the same floor in both, instead of two independent filters.
+    activeStoreyId: viewerStoreyId,
+    setActiveStoreyId: setViewerStoreyId,
   } = useInfer();
   const {
     setViewerCameraPose,
@@ -601,7 +601,7 @@ function InferModelViewportImpl({
     <div
       className={cn("relative isolate h-full w-full overflow-hidden bg-viewport", className)}
       data-model-id={modelId}
-      data-active-storey={activeStoreyId}
+      data-active-storey={viewerStoreyId}
       data-hidden-storeys={hiddenStoreyIds.join(",")}
       data-selected={selectedElementIds.join(",")}
       data-navigation-start={navigationStart ?? ""}

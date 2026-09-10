@@ -36,7 +36,6 @@ function WorkspaceScreen() {
     selectedElementIds,
     selectElement,
     route,
-    activeStoreyId,
     hazardZones,
     animation,
   } = useInfer();
@@ -49,7 +48,6 @@ function WorkspaceScreen() {
             modelId={building.id}
             selectedElementIds={selectedElementIds}
             highlightedRoute={route}
-            activeStoreyId={activeStoreyId}
             hazardZones={hazardZones}
             animationStepIndex={animation.stepIndex}
             animationPlaying={animation.playing}

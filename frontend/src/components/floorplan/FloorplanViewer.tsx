@@ -54,6 +54,24 @@ function floorplanPalette(theme: AppTheme) {
     : { wall: "#1e293b", wallStroke: "#0f172a", label: "#1e293b", canvasBg: PLAN_CANVAS_HEX.light };
 }
 
+/**
+ * Navmesh portal kind colours — picked from the Okabe–Ito colorblind-safe
+ * set. The old palette (orange door / yellow heal / green space / red exit)
+ * put both a red↔green pair and an orange↔yellow pair in the same legend,
+ * the two classic confusable pairs under red-green color blindness. Blocked
+ * stays gray with its own slash mark, which doesn't rely on hue at all.
+ */
+const PORTAL_COLORS = {
+  door: "#0072B2", // blue
+  doorHeal: "#eab308", // yellow
+  spacePortal: "#CC79A7", // reddish purple
+  exit: "#ef4444", // red — safe on its own once nothing else in the set is green
+  blocked: "#94a3b8", // gray
+} as const;
+
+/** Typical tread depth (metres) — world-space, same units as the footprint geometry. */
+const STAIR_TREAD_SPACING_M = 0.28;
+
 type PlanDisplayMode = "ifc" | "navmesh";
 
 type PlanLayer = "spaces" | "walls" | "doors" | "stairs" | "route";
@@ -247,6 +265,45 @@ function nearestPortalWithin<T extends { point: Point2 }>(
 
 function polygonPathD(polygon: Point2[]): string {
   return polygon.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ") + " Z";
+}
+
+/**
+ * Evenly-spaced tread lines across a stair's plan footprint, perpendicular
+ * to its longer (run) axis — the standard plan symbol, approximated from
+ * the footprint's own bounding box since there's no per-tread geometry to
+ * draw from. No up/down arrow: which way a given stair actually goes isn't
+ * derivable from this footprint alone, so this doesn't claim a direction.
+ */
+function stairTreadLinesD(polygon: Point2[], treadSpacing: number): string {
+  if (polygon.length < 3) return "";
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const p of polygon) {
+    minX = Math.min(minX, p.x);
+    maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y);
+    maxY = Math.max(maxY, p.y);
+  }
+  const w = maxX - minX;
+  const h = maxY - minY;
+  if (w < 1e-6 || h < 1e-6) return "";
+  const segments: string[] = [];
+  if (w >= h) {
+    const count = Math.max(2, Math.round(w / treadSpacing));
+    for (let i = 1; i < count; i++) {
+      const x = minX + (w * i) / count;
+      segments.push(`M${x} ${minY} L${x} ${maxY}`);
+    }
+  } else {
+    const count = Math.max(2, Math.round(h / treadSpacing));
+    for (let i = 1; i < count; i++) {
+      const y = minY + (h * i) / count;
+      segments.push(`M${minX} ${y} L${maxX} ${y}`);
+    }
+  }
+  return segments.join(" ");
 }
 
 function polygonCentroid(polygon: Point2[]): Point2 {
@@ -1097,20 +1154,25 @@ export function FloorplanViewer({ className }: { className?: string }) {
                 })
               : null}
             {layers.stairs
-              ? stairs.map((s) => {
-                  return (
+              ? stairs.map((s) => (
+                  <g key={`stair:${s.global_id}`}>
                     <path
-                      key={`stair:${s.global_id}`}
                       d={polygonPathD(s.polygon)}
                       fill="none"
                       stroke="#7c3aed"
                       strokeWidth={roomStroke * 1.4}
-                      strokeDasharray={`${markerBase * 0.006} ${markerBase * 0.004}`}
                     >
                       <title>{s.name ? `Stair: ${s.name}` : "Stair"}</title>
                     </path>
-                  );
-                })
+                    <path
+                      d={stairTreadLinesD(s.polygon, STAIR_TREAD_SPACING_M)}
+                      fill="none"
+                      stroke="#7c3aed"
+                      strokeWidth={roomStroke * 0.8}
+                      className="pointer-events-none"
+                    />
+                  </g>
+                ))
               : null}
             {layers.doors
               ? doors.map((d) => {
@@ -1228,14 +1290,14 @@ export function FloorplanViewer({ className }: { className?: string }) {
               return (
                 <g key={p.id}>
                   {glyph ? (
-                    <g className="pointer-events-none" opacity={0.4}>
+                    <g className="pointer-events-none">
                       {glyph.arcs.map((arc, i) => (
                         <path
                           key={`arc:${i}`}
                           d={arc}
                           fill="none"
-                          stroke="#0f172a"
-                          strokeWidth={doorStroke * 0.7}
+                          stroke={palette.wallStroke}
+                          strokeWidth={doorStroke}
                         />
                       ))}
                       {glyph.leaves.map((leaf, i) => (
@@ -1243,8 +1305,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
                           key={`leaf:${i}`}
                           d={leaf}
                           fill="none"
-                          stroke="#0f172a"
-                          strokeWidth={doorStroke * 0.7}
+                          stroke={palette.wallStroke}
+                          strokeWidth={doorStroke}
                           strokeLinecap="round"
                         />
                       ))}
@@ -1256,14 +1318,14 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     r={portalR}
                     fill={
                       blocked
-                        ? "#94a3b8"
+                        ? PORTAL_COLORS.blocked
                         : p.kind === "exit"
-                          ? "#ef4444"
+                          ? PORTAL_COLORS.exit
                           : p.kind === "space"
-                            ? "#22c55e"
+                            ? PORTAL_COLORS.spacePortal
                             : p.inferred
-                              ? "#eab308"
-                              : "#f97316"
+                              ? PORTAL_COLORS.doorHeal
+                              : PORTAL_COLORS.door
                     }
                     stroke="#0f172a"
                     strokeWidth={doorStroke * 0.4}
@@ -1914,19 +1976,31 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     Region
                   </span>
                   <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground">
-                    <span className="inline-block size-2 rounded-full bg-[#f97316]" />
+                    <span
+                      className="inline-block size-2 rounded-full"
+                      style={{ background: PORTAL_COLORS.door }}
+                    />
                     IFC door
                   </span>
                   <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground">
-                    <span className="inline-block size-2 rounded-full bg-[#eab308]" />
+                    <span
+                      className="inline-block size-2 rounded-full"
+                      style={{ background: PORTAL_COLORS.doorHeal }}
+                    />
                     Door heal
                   </span>
                   <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground">
-                    <span className="inline-block size-2 rounded-full bg-[#22c55e]" />
+                    <span
+                      className="inline-block size-2 rounded-full"
+                      style={{ background: PORTAL_COLORS.spacePortal }}
+                    />
                     Space portal
                   </span>
                   <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground">
-                    <span className="inline-block size-2 rounded-full bg-[#ef4444]" />
+                    <span
+                      className="inline-block size-2 rounded-full"
+                      style={{ background: PORTAL_COLORS.exit }}
+                    />
                     Exit
                   </span>
                 </>
