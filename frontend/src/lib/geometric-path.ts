@@ -396,6 +396,60 @@ export function localPathInPolygon(
     .points;
 }
 
+/**
+ * Binary min-heap keyed by `less`. Exported since navmesh.ts's portal A*
+ * needs the same thing. Callers that re-push a cheaper route to an
+ * already-open item instead of mutating it in place (skipping stale entries
+ * via a `closed`/visited check on pop) don't need decrease-key support.
+ */
+export class MinHeap<T> {
+  private readonly items: T[] = [];
+  private readonly less: (a: T, b: T) => boolean;
+
+  constructor(less: (a: T, b: T) => boolean) {
+    this.less = less;
+  }
+
+  get size(): number {
+    return this.items.length;
+  }
+
+  push(item: T): void {
+    const items = this.items;
+    items.push(item);
+    let i = items.length - 1;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (!this.less(items[i]!, items[parent]!)) break;
+      [items[i], items[parent]] = [items[parent]!, items[i]!];
+      i = parent;
+    }
+  }
+
+  pop(): T | undefined {
+    const items = this.items;
+    if (items.length === 0) return undefined;
+    const top = items[0]!;
+    const last = items.pop()!;
+    if (items.length > 0) {
+      items[0] = last;
+      let i = 0;
+      const n = items.length;
+      for (;;) {
+        const l = 2 * i + 1;
+        const r = 2 * i + 2;
+        let smallest = i;
+        if (l < n && this.less(items[l]!, items[smallest]!)) smallest = l;
+        if (r < n && this.less(items[r]!, items[smallest]!)) smallest = r;
+        if (smallest === i) break;
+        [items[i], items[smallest]] = [items[smallest]!, items[i]!];
+        i = smallest;
+      }
+    }
+    return top;
+  }
+}
+
 /** A* worker. `reached` is false when the goal cell was unreachable. */
 function astarInPolygon(
   start: Point2D,
@@ -473,18 +527,9 @@ function astarInPolygon(
   const goalCell = toFreeCell(g);
 
   type Node = { c: number; r: number; g: number; f: number };
-  const open: Node[] = [];
-  const pushOpen = (n: Node) => {
-    open.push(n);
-  };
-  const popOpen = (): Node | undefined => {
-    if (!open.length) return undefined;
-    let bestI = 0;
-    for (let i = 1; i < open.length; i++) {
-      if (open[i]!.f < open[bestI]!.f) bestI = i;
-    }
-    return open.splice(bestI, 1)[0];
-  };
+  const open = new MinHeap<Node>((a, b) => a.f < b.f);
+  const pushOpen = (n: Node) => open.push(n);
+  const popOpen = (): Node | undefined => open.pop();
 
   // Admissible under cost = stepLen/clear: cheapest metre is 1/maxClear.
   const hCost = (c: number, r: number) => {
@@ -512,7 +557,7 @@ function astarInPolygon(
     [-1, -1],
   ];
 
-  while (open.length) {
+  while (open.size) {
     const cur = popOpen()!;
     const ck = key(cur.c, cur.r);
     if (closed.has(ck)) continue;

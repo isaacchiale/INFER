@@ -9,6 +9,7 @@ import {
   pointInSpace,
   wallsOverlappingSpace,
   doorwayVoidsInSpace,
+  MinHeap,
 } from "@/lib/geometric-path";
 import type { FootprintsDocument, Point2D, SpaceFootprint } from "@/types/footprints";
 import type { ConnectivityGraph, GraphEdge } from "@/types/graph";
@@ -294,15 +295,6 @@ export function findNavmeshPath(
     };
   }
 
-  const portalsByRegion = new Map<string, NavmeshPortal[]>();
-  for (const p of mesh.portals) {
-    for (const sid of [p.spaceA, p.spaceB]) {
-      const list = portalsByRegion.get(sid) ?? [];
-      list.push(p);
-      portalsByRegion.set(sid, list);
-    }
-  }
-
   const regionById = new Map(mesh.regions.map((r) => [r.spaceId, r]));
 
   // Graph nodes: start, end, and every portal.
@@ -325,52 +317,64 @@ export function findNavmeshPath(
     });
   }
 
-  /** Neighbours that share a region (can walk between without leaving the mesh). */
-  function neighbours(id: string): { id: string; viaRegion: string; cost: number }[] {
-    const a = nodes.get(id);
-    if (!a) return [];
-    const out: { id: string; viaRegion: string; cost: number }[] = [];
-    for (const [otherId, b] of nodes) {
-      if (otherId === id) continue;
-      const shared = a.regions.find((r) => b.regions.includes(r));
-      if (!shared) continue;
-      out.push({ id: otherId, viaRegion: shared, cost: dist(a.point, b.point) });
+  // Adjacency (nodes sharing a region can walk between each other) built once
+  // by bucketing nodes per region, instead of the O(V) "scan every node"
+  // neighbour lookup this used to do on every single node expansion during
+  // the search below — O(V^2) on a portal-dense storey (a large
+  // hospital/institutional floor with hundreds of doors).
+  const nodesByRegion = new Map<string, PortalGraphNode[]>();
+  for (const node of nodes.values()) {
+    for (const regionId of node.regions) {
+      const list = nodesByRegion.get(regionId) ?? [];
+      list.push(node);
+      nodesByRegion.set(regionId, list);
     }
-    return out;
+  }
+  const adjacency = new Map<
+    string,
+    { id: string; viaRegion: string; cost: number }[]
+  >();
+  for (const node of nodes.values()) {
+    const out: { id: string; viaRegion: string; cost: number }[] = [];
+    const linked = new Set<string>();
+    // Mirrors the old per-pair lookup's tie-break: the first of this node's
+    // own regions (in order) that the other node also belongs to.
+    for (const regionId of node.regions) {
+      for (const other of nodesByRegion.get(regionId) ?? []) {
+        if (other.id === node.id || linked.has(other.id)) continue;
+        linked.add(other.id);
+        out.push({ id: other.id, viaRegion: regionId, cost: dist(node.point, other.point) });
+      }
+    }
+    adjacency.set(node.id, out);
   }
 
-  // A* over portal graph (euclidean edge costs).
-  const open = new Set<string>(["__start"]);
+  // A* over the portal graph (euclidean edge costs), binary-heap open set —
+  // re-pushes a cheaper route instead of mutating an open entry, so stale
+  // entries are skipped via `closed` on pop (no decrease-key needed).
   const cameFrom = new Map<string, { prev: string; viaRegion: string }>();
   const gScore = new Map<string, number>([["__start", 0]]);
-  const fScore = new Map<string, number>([["__start", dist(start, end)]]);
+  const open = new MinHeap<{ id: string; f: number }>((a, b) => a.f < b.f);
+  open.push({ id: "__start", f: dist(start, end) });
+  const closed = new Set<string>();
 
   let foundEnd = false;
   while (open.size) {
-    let current: string | null = null;
-    let bestF = Infinity;
-    for (const id of open) {
-      const f = fScore.get(id) ?? Infinity;
-      if (f < bestF) {
-        bestF = f;
-        current = id;
-      }
-    }
-    if (!current) break;
-    if (current === "__end") {
+    const current = open.pop()!;
+    if (closed.has(current.id)) continue;
+    closed.add(current.id);
+    if (current.id === "__end") {
       foundEnd = true;
       break;
     }
-    open.delete(current);
-    const gCur = gScore.get(current) ?? Infinity;
-    for (const n of neighbours(current)) {
+    const gCur = gScore.get(current.id) ?? Infinity;
+    for (const n of adjacency.get(current.id) ?? []) {
       const tentative = gCur + n.cost;
       if (tentative >= (gScore.get(n.id) ?? Infinity)) continue;
-      cameFrom.set(n.id, { prev: current, viaRegion: n.viaRegion });
+      cameFrom.set(n.id, { prev: current.id, viaRegion: n.viaRegion });
       gScore.set(n.id, tentative);
       const nb = nodes.get(n.id)!;
-      fScore.set(n.id, tentative + dist(nb.point, end));
-      open.add(n.id);
+      open.push({ id: n.id, f: tentative + dist(nb.point, end) });
     }
   }
 
