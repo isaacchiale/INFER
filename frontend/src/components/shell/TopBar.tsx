@@ -15,11 +15,10 @@ import { useInfer } from "@/state/infer-store";
 import { CommandPalette } from "./CommandPalette";
 import { ThemeToggle } from "./ThemeToggle";
 
-const shortName = building.name.split("—")[0]?.trim() ?? building.name;
-
 export function TopBar() {
-  const { setIngestOpen, viewerStatus, viewerStatusKind } = useInfer();
+  const { setIngestOpen, viewerStatus, viewerStatusKind, pendingIfc } = useInfer();
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const modelName = pendingIfc?.name.replace(/\.ifc$/i, "") || "No model loaded";
 
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background px-3">
@@ -28,13 +27,13 @@ export function TopBar() {
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <button className="flex items-center gap-1 rounded-[5px] px-1.5 py-1 text-[13px] text-foreground transition-colors hover:bg-muted">
-            {shortName}
+            {modelName}
             <ChevronDown aria-hidden className="size-3.5 text-muted-foreground" />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="w-56">
           <DropdownMenuItem className="text-[13px]">
-            <Check className="size-3.5" /> {shortName}
+            <Check className="size-3.5" /> {modelName}
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem className="text-[13px]" onSelect={() => setIngestOpen(true)}>

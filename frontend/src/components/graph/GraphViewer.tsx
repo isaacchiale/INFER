@@ -32,7 +32,6 @@ const EMPTY_LAYOUT: GraphLayout = { nodes: [], edges: [], width: 1, height: 1, c
 const VARIANT_OPTIONS: { id: GraphVariant; label: string }[] = [
   { id: "ifc", label: "IFC relations" },
   { id: "geometry", label: "Geometry rules" },
-  { id: "topologic", label: "TopologicPy" },
 ];
 
 const GLASS =
@@ -321,7 +320,7 @@ export function GraphViewer({ className }: { className?: string }) {
               })}
             </DropdownMenuContent>
           </DropdownMenu>
-          {(variant === "geometry" || variant === "topologic") && (
+          {variant === "geometry" && (
             <div className="pointer-events-none flex flex-wrap gap-2 rounded-md border border-border/80 bg-background/90 px-2 py-1 text-[10px] text-muted-foreground backdrop-blur-sm">
               <span className="inline-flex items-center gap-1">
                 <span className="inline-block h-0.5 w-3 bg-slate-500" /> IFC
