@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Box, Check, ChevronDown, Maximize2, Network } from "lucide-react";
+import { Box, Check, ChevronDown, LogOut, Maximize2, Network, Route as RouteIcon } from "lucide-react";
 import { useInfer, useViewerPose } from "@/state/infer-store";
 import { continuousPolylineForStorey } from "@/lib/geometric-path";
 import {
@@ -7,6 +7,7 @@ import {
   buildStoreyNavmesh,
   findMultiStoreyNavmeshPath,
   findNavmeshPath,
+  findNearestExitPath,
   regionAtPoint,
 } from "@/lib/navmesh";
 import {
@@ -92,12 +93,14 @@ function MapPin({
   scale,
   strokeW,
   label,
+  color = "#2563eb",
 }: {
   x: number;
   y: number;
   scale: number;
   strokeW: number;
   label: string;
+  color?: string;
 }) {
   const discY = -scale * 1.35;
   const discR = scale * 0.28;
@@ -115,7 +118,7 @@ function MapPin({
         />
         <path
           d={mapPinPath(scale)}
-          fill="#2563eb"
+          fill={color}
           stroke="#ffffff"
           strokeWidth={strokeW}
           strokeLinejoin="round"
@@ -123,7 +126,7 @@ function MapPin({
           <title>{label}</title>
         </path>
         <circle cx={0} cy={discY} r={discR} fill="#ffffff" />
-        <circle cx={0} cy={discY} r={discR * 0.45} fill="#2563eb" />
+        <circle cx={0} cy={discY} r={discR * 0.45} fill={color} />
       </g>
     </g>
   );
@@ -278,6 +281,18 @@ export function FloorplanViewer({ className }: { className?: string }) {
 
   const [planDisplayMode, setPlanDisplayMode] = useState<PlanDisplayMode>("ifc");
   const [navmeshPathNote, setNavmeshPathNote] = useState<string | null>(null);
+  /** "route": click two points. "exit": click one point, auto-route to the nearest exit. */
+  const [navmeshPickMode, setNavmeshPickMode] = useState<"route" | "exit">("route");
+  /** True when the current navmeshRoute came from exit mode (label + recompute differ). */
+  const [isExitRoute, setIsExitRoute] = useState(false);
+  /** Brief feedback for a right-click that missed every region. */
+  const [missPick, setMissPick] = useState<Point2D | null>(null);
+  const missPickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flashMissPick = useCallback((point: Point2D) => {
+    if (missPickTimerRef.current) clearTimeout(missPickTimerRef.current);
+    setMissPick(point);
+    missPickTimerRef.current = setTimeout(() => setMissPick(null), 500);
+  }, []);
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
@@ -680,8 +695,53 @@ export function FloorplanViewer({ className }: { className?: string }) {
   // Recompute A* whenever pins + mesh change (persists across IFC/navmesh
   // toggle and storey switches — the end pin may be on a different storey).
   useEffect(() => {
-    if (!navmeshRoute || !navmeshRoute.end || navmeshRoute.endStoreyId == null) {
-      if (navmeshRoute?.points || navmeshRoute?.segments) {
+    if (!navmeshRoute) {
+      setNavmeshPathNote(null);
+      return;
+    }
+
+    // Exit routes only ever pin a start point — re-find the nearest exit from
+    // scratch each time (an exclusion change could make a different exit the
+    // closest one, not just invalidate the old path to the same exit).
+    if (isExitRoute) {
+      if (!footprintsDocument) return;
+      const mesh = allStoreyNavmeshes.find((m) => m.storeyId === navmeshRoute.storeyId);
+      if (!mesh) {
+        setNavmeshPathNote("Storey mesh unavailable");
+        return;
+      }
+      const result = findNearestExitPath(mesh, navmeshRoute.start, footprintsDocument);
+      setNavmeshPathNote(result.found ? null : result.note);
+      const nextEnd = result.found ? result.points[result.points.length - 1]! : null;
+      const nextPoints = result.found ? result.points : null;
+      const sameEnd =
+        (navmeshRoute.end == null && nextEnd == null) ||
+        (navmeshRoute.end != null &&
+          nextEnd != null &&
+          navmeshRoute.end.x === nextEnd.x &&
+          navmeshRoute.end.y === nextEnd.y);
+      const samePoints =
+        (navmeshRoute.points == null && nextPoints == null) ||
+        (navmeshRoute.points != null &&
+          nextPoints != null &&
+          navmeshRoute.points.length === nextPoints.length &&
+          navmeshRoute.points.every(
+            (p, i) => p.x === nextPoints[i]!.x && p.y === nextPoints[i]!.y,
+          ));
+      if (!sameEnd || !samePoints || navmeshRoute.segments) {
+        setNavmeshRoute({
+          ...navmeshRoute,
+          end: nextEnd,
+          endStoreyId: nextEnd ? navmeshRoute.storeyId : null,
+          points: nextPoints,
+          segments: null,
+        });
+      }
+      return;
+    }
+
+    if (!navmeshRoute.end || navmeshRoute.endStoreyId == null) {
+      if (navmeshRoute.points || navmeshRoute.segments) {
         setNavmeshRoute({ ...navmeshRoute, points: null, segments: null });
       }
       setNavmeshPathNote(null);
@@ -749,6 +809,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     allStoreyNavmeshes,
     connectivityGraph,
     footprintsDocument,
+    isExitRoute,
     navmeshRoute?.storeyId,
     navmeshRoute?.endStoreyId,
     navmeshRoute?.start.x,
@@ -766,11 +827,13 @@ export function FloorplanViewer({ className }: { className?: string }) {
     routeScopeRef.current = footprintsId;
     setNavmeshRoute(null);
     setNavmeshPathNote(null);
+    setIsExitRoute(false);
   }, [footprintsId, setNavmeshRoute]);
 
   const clearNavmeshRoute = useCallback(() => {
     setNavmeshRoute(null);
     setNavmeshPathNote(null);
+    setIsExitRoute(false);
   }, [setNavmeshRoute]);
 
   const activeStoreyLabel = useMemo(() => {
@@ -813,6 +876,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const navmeshPickRef = useRef({
     enabled: false as boolean,
     mesh: null as ReturnType<typeof buildStoreyNavmesh> | null,
+    mode: "route" as "route" | "exit",
+    footprints: null as FootprintsDocument | null,
     // Raw start pin + its storey, ungated by which floor is currently shown —
     // the end pin can be placed on a different floor, so "is a pin pending"
     // must not depend on `activeStoreyId`.
@@ -826,6 +891,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
   navmeshPickRef.current = {
     enabled: planDisplayMode === "navmesh" && storeyNavmesh != null,
     mesh: storeyNavmesh,
+    mode: navmeshPickMode,
+    footprints: footprintsDocument,
     startPoint: navmeshRoute?.start ?? null,
     startStoreyId: navmeshRoute?.storeyId ?? null,
     hasEnd: navmeshRoute?.end != null,
@@ -844,6 +911,40 @@ export function FloorplanViewer({ className }: { className?: string }) {
     pathPoints.length >= 2
       ? pathPoints.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ")
       : "";
+
+  const navmeshStatusParts: string[] = [];
+  if (planDisplayMode === "navmesh" && storeyNavmesh) {
+    navmeshStatusParts.push(
+      `${storeyNavmesh.regions.length} regions · ${storeyNavmesh.portals.length} portals`,
+    );
+  }
+  if (planDisplayMode === "navmesh" && navmeshRoute && !navmeshRoute.end) {
+    if (navmeshPickMode === "exit") {
+      navmeshStatusParts.push("right-click a point to route to the nearest exit");
+    } else {
+      navmeshStatusParts.push(
+        navmeshRoute.storeyId === activeStoreyId
+          ? "right-click end point"
+          : "right-click end point (start pin is on another floor)",
+      );
+    }
+  }
+  if (navmeshPathNote) navmeshStatusParts.push(navmeshPathNote);
+  if (navmeshRoute?.end) {
+    navmeshStatusParts.push(
+      navmeshPickMode === "exit"
+        ? "long right-click to clear · right-click elsewhere for a new exit"
+        : "long right-click to clear",
+    );
+  }
+  if (!navmeshRoute?.points && !navmeshRoute?.segments && connectivityRoute?.found) {
+    const note =
+      pathPoints.length >= 2
+        ? overlay?.note
+        : overlay?.note || "Route has no drawable points on this storey";
+    if (note) navmeshStatusParts.push(note);
+  }
+  const navmeshStatusMessage = navmeshStatusParts.join(" · ");
 
   /**
    * Everything except the camera dot, memoized separately from it.
@@ -1023,7 +1124,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
             y={navmeshEnd.y}
             scale={pinScale}
             strokeW={doorStroke * 0.45}
-            label="End"
+            label={isExitRoute ? "Exit" : "End"}
+            color={isExitRoute ? "#ef4444" : "#2563eb"}
           />
         ) : null}
 
@@ -1056,6 +1158,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
       pathD,
       navmeshStart,
       navmeshEnd,
+      isExitRoute,
       selectedSpaces,
       roomStroke,
       markerBase,
@@ -1087,6 +1190,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
     cameraDot?.x,
     cameraDot?.y,
     cameraDot?.heading,
+    missPick?.x,
+    missPick?.y,
   ]);
 
   // Stable overlay owns pointer/wheel so SVG re-renders never break capture mid-pan.
@@ -1128,13 +1233,35 @@ export function FloorplanViewer({ className }: { className?: string }) {
     const placeNavmeshPin = (clientX: number, clientY: number) => {
       const pick = navmeshPickRef.current;
       if (!pick.enabled || !pick.mesh || !pick.storeyId) return;
-      if (pick.startPoint && pick.hasEnd) return;
+      // Route mode locks after two clicks (clear to restart); exit mode is a
+      // repeatable one-shot tool — every click starts a fresh search.
+      if (pick.mode === "route" && pick.startPoint && pick.hasEnd) return;
       const bounds = boundsRef.current;
       const svg = svgRef.current;
       if (!bounds || !svg) return;
       const world = clientToView(clientX, clientY, svg, bounds, cameraRef.current);
-      if (!regionAtPoint(pick.mesh, world)) return;
+      if (!regionAtPoint(pick.mesh, world)) {
+        flashMissPick(world);
+        return;
+      }
+
+      if (pick.mode === "exit") {
+        // Actual nearest-exit search happens in the recompute effect (single
+        // source of truth for pathfinding), keyed off this start point.
+        setIsExitRoute(true);
+        setNavmeshRoute({
+          storeyId: pick.storeyId,
+          start: { x: world.x, y: world.y },
+          end: null,
+          endStoreyId: null,
+          points: null,
+          segments: null,
+        });
+        return;
+      }
+
       if (!pick.startPoint) {
+        setIsExitRoute(false);
         setNavmeshRoute({
           storeyId: pick.storeyId,
           start: { x: world.x, y: world.y },
@@ -1306,7 +1433,14 @@ export function FloorplanViewer({ className }: { className?: string }) {
       dragRef.current = null;
       draggingRef.current = false;
     };
-  }, [footprintsId, footprintsDocument, applyCameraDom, clearNavmeshRoute, setNavmeshRoute]);
+  }, [
+    footprintsId,
+    footprintsDocument,
+    applyCameraDom,
+    clearNavmeshRoute,
+    setNavmeshRoute,
+    flashMissPick,
+  ]);
 
   return (
     <div className={cn("relative flex h-full min-h-0 flex-col", PLAN_CANVAS, className)}>
@@ -1378,6 +1512,45 @@ export function FloorplanViewer({ className }: { className?: string }) {
                 })}
               </DropdownMenuContent>
             </DropdownMenu>
+
+            {planDisplayMode === "navmesh" ? (
+              <div className={cn(GLASS, "flex overflow-hidden")}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNavmeshPickMode("route");
+                    clearNavmeshRoute();
+                  }}
+                  className={cn(
+                    "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                    navmeshPickMode === "route"
+                      ? "bg-muted text-foreground"
+                      : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                  )}
+                  title="Right-click two points to route between them"
+                >
+                  <RouteIcon className="size-3.5" aria-hidden />
+                  Route
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNavmeshPickMode("exit");
+                    clearNavmeshRoute();
+                  }}
+                  className={cn(
+                    "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                    navmeshPickMode === "exit"
+                      ? "bg-muted text-foreground"
+                      : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                  )}
+                  title="Right-click a point to route to the nearest exit on this level"
+                >
+                  <LogOut className="size-3.5" aria-hidden />
+                  Nearest exit
+                </button>
+              </div>
+            ) : null}
           </div>
 
           <button
@@ -1449,6 +1622,33 @@ export function FloorplanViewer({ className }: { className?: string }) {
                       </g>
                     </g>
                   ) : null}
+
+                  {missPick ? (
+                    <g
+                      className="infer-screen-fixed"
+                      transform={`translate(${missPick.x} ${missPick.y})`}
+                    >
+                      <g className="infer-screen-fixed-scale" transform="scale(1)">
+                        <circle
+                          cx={0}
+                          cy={0}
+                          r={portalR * 1.8}
+                          fill="none"
+                          stroke="#ef4444"
+                          strokeWidth={doorStroke * 0.7}
+                          opacity={0.85}
+                        />
+                        <path
+                          d={`M${-portalR * 0.9} ${-portalR * 0.9} L${portalR * 0.9} ${portalR * 0.9} M${-portalR * 0.9} ${portalR * 0.9} L${portalR * 0.9} ${-portalR * 0.9}`}
+                          stroke="#ef4444"
+                          strokeWidth={doorStroke * 0.9}
+                          strokeLinecap="round"
+                        >
+                          <title>No walkable region here — click inside a room</title>
+                        </path>
+                      </g>
+                    </g>
+                  ) : null}
                 </g>
               </g>
             </svg>
@@ -1494,6 +1694,10 @@ export function FloorplanViewer({ className }: { className?: string }) {
                   <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground">
                     <span className="inline-block size-2 rounded-full bg-[#22c55e]" />
                     Space portal
+                  </span>
+                  <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground">
+                    <span className="inline-block size-2 rounded-full bg-[#ef4444]" />
+                    Exit
                   </span>
                 </>
               ) : null}
@@ -1588,22 +1792,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
                   </span>
                 ) : null}
               </span>
-              <span className="min-w-0 flex-1 truncate px-1">
-                {planDisplayMode === "navmesh" && storeyNavmesh
-                  ? `${storeyNavmesh.regions.length} regions · ${storeyNavmesh.portals.length} portals`
-                  : null}
-                {planDisplayMode === "navmesh" && navmeshRoute && !navmeshRoute.end
-                  ? navmeshRoute.storeyId === activeStoreyId
-                    ? " · right-click end point"
-                    : " · right-click end point (start pin is on another floor)"
-                  : null}
-                {navmeshPathNote ? ` · ${navmeshPathNote}` : null}
-                {navmeshRoute?.end ? " · long right-click to clear" : null}
-                {!navmeshRoute?.points && !navmeshRoute?.segments && connectivityRoute?.found
-                  ? pathPoints.length >= 2
-                    ? overlay?.note
-                    : overlay?.note || "Route has no drawable points on this storey"
-                  : null}
+              <span className="min-w-0 basis-full px-1" title={navmeshStatusMessage || undefined}>
+                {navmeshStatusMessage}
               </span>
             </div>
           </>
