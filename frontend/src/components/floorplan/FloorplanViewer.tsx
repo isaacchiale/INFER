@@ -615,6 +615,13 @@ export function FloorplanViewer({ className }: { className?: string }) {
     );
   }, [footprintsDocument, activeStoreyId]);
 
+  /** For the Navmesh view's faint supplementary swing glyph under each door portal dot. */
+  const doorsByGlobalId = useMemo(() => {
+    const map = new Map<string, (typeof doors)[number]>();
+    for (const d of footprintsDocument?.doors ?? []) map.set(d.global_id, d);
+    return map;
+  }, [footprintsDocument]);
+
   /**
    * Stairs often sit on one containment storey but represent a vertical shaft.
    * Show on matching storey; if unassigned, show on every storey so they aren't lost.
@@ -1119,8 +1126,40 @@ export function FloorplanViewer({ className }: { className?: string }) {
             ))}
             {storeyNavmesh?.portals.map((p) => {
               const blocked = blockedPortalIds.has(p.id);
+              const door = p.doorGlobalId ? doorsByGlobalId.get(p.doorGlobalId) : null;
+              const glyph =
+                door && door.segment.length === 2 && door.normal
+                  ? buildDoorGlyph(
+                      [door.segment[0]!, door.segment[1]!],
+                      door.normal,
+                      door.operation_type,
+                    )
+                  : null;
               return (
                 <g key={p.id}>
+                  {glyph ? (
+                    <g className="pointer-events-none" opacity={0.4}>
+                      {glyph.arcs.map((arc, i) => (
+                        <path
+                          key={`arc:${i}`}
+                          d={arc}
+                          fill="none"
+                          stroke="#0f172a"
+                          strokeWidth={doorStroke * 0.7}
+                        />
+                      ))}
+                      {glyph.leaves.map((leaf, i) => (
+                        <path
+                          key={`leaf:${i}`}
+                          d={leaf}
+                          fill="none"
+                          stroke="#0f172a"
+                          strokeWidth={doorStroke * 0.7}
+                          strokeLinecap="round"
+                        />
+                      ))}
+                    </g>
+                  ) : null}
                   <circle
                     cx={p.point.x}
                     cy={p.point.y}
@@ -1245,6 +1284,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
       navmeshEnd,
       isExitRoute,
       blockedPortalIds,
+      doorsByGlobalId,
       selectedSpaces,
       roomStroke,
       markerBase,
@@ -1556,10 +1596,10 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     ? "bg-muted text-foreground"
                     : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
                 )}
-                title="Show IFC footprint geometry"
+                title="Show floorplan geometry"
               >
                 <Box className="size-3.5" aria-hidden />
-                IFC Geometry
+                Floorplan
               </button>
               <button
                 type="button"

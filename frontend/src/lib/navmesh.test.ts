@@ -106,6 +106,7 @@ describe("navmesh", () => {
     assert.equal(mesh.portals[0]!.kind, "door");
     assert.equal(mesh.portals[0]!.inferred, true);
     assert.deepEqual(mesh.portals[0]!.point, { x: 4, y: 2 });
+    assert.equal(mesh.portals[0]!.doorGlobalId, "D");
   });
 
   it("marks IFC door portals as not inferred", () => {
@@ -218,6 +219,7 @@ describe("navmesh", () => {
       assert.equal(exits[0]!.spaceA, "space:A");
       assert.equal(exits[0]!.spaceB, null);
       assert.deepEqual(exits[0]!.point, { x: 0, y: 2 });
+      assert.equal(exits[0]!.doorGlobalId, "E");
       // Two-sided door D is still a regular door portal, not an exit.
       assert.equal(mesh.portals.filter((p) => p.kind === "door").length, 1);
     });

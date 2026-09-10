@@ -42,6 +42,14 @@ export type NavmeshPortal = {
   spaceB: string | null;
   /** Plan XY (metres), typically door centre or clear-span portal. */
   point: Point2D;
+  /**
+   * global_id of the underlying door (DoorFootprint), for "door"/"exit"
+   * portals that trace back to an actual IfcDoor — lets the UI look up the
+   * door's own segment/normal/operation_type (e.g. for a supplementary swing
+   * glyph) without re-parsing portal ids. Null for "space" portals (no door)
+   * and any portal whose source door id couldn't be resolved.
+   */
+  doorGlobalId: string | null;
 };
 
 export type StoreyNavmesh = {
@@ -199,6 +207,8 @@ export function buildStoreyNavmesh(
       spaceA: a,
       spaceB: b,
       point,
+      doorGlobalId:
+        kind === "door" ? (doorIdFromVizEdge(edge.id)?.slice("door:".length) ?? null) : null,
     });
   }
 
@@ -262,6 +272,7 @@ export function buildStoreyNavmesh(
       spaceA: spaceId,
       spaceB: null,
       point,
+      doorGlobalId: gid,
     });
   }
 
