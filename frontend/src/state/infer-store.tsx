@@ -148,7 +148,7 @@ function ViewportProvider({ children }: { children: ReactNode }) {
   const [pendingIfc, setPendingIfc] = useState<{ name: string; buffer: Uint8Array } | null>(
     null,
   );
-  const [viewerStatus, setViewerStatusMessage] = useState("3D viewer idle");
+  const [viewerStatus, setViewerStatusMessage] = useState("");
   const [viewerStatusKind, setViewerStatusKind] = useState<"info" | "error" | "loading">(
     "info",
   );

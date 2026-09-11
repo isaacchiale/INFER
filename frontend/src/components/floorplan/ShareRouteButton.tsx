@@ -101,11 +101,11 @@ export function ShareRouteButton({
   return (
     <>
       <Button
-        variant="destructive"
         size="sm"
         disabled={!hasRoute}
         onClick={openDialog}
         title="Export the current route as a 3D file, or share a link/QR to open it on another device"
+        className="bg-[#DC143C] text-white shadow hover:bg-[#c01236] focus-visible:ring-[#DC143C]/50"
       >
         <Share2 className="size-3.5" aria-hidden />
         Share

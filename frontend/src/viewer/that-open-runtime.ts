@@ -819,8 +819,6 @@ export async function createThatOpenRuntime(
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
 
-  onStatus?.("3D viewer ready.", "info");
-
   const clear = async () => {
     clearRouteTubeMeshes();
     clearNavmeshMeshes();
