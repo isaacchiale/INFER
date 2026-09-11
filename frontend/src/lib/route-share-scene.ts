@@ -39,7 +39,7 @@ function routeSegments(route: NavmeshRoute): StoreySegment[] {
 }
 
 /** Real storey elevations in metres, keyed by global_id — same normalization route-tube.ts uses. */
-function storeyElevationsM(footprints: FootprintsDocument): Map<string, number> {
+export function storeyElevationsM(footprints: FootprintsDocument): Map<string, number> {
   const raw = footprints.storeys ?? [];
   const withElev = raw.filter(
     (s): s is { global_id: string; name: string; elevation: number } =>
@@ -60,7 +60,7 @@ function storeyElevationsM(footprints: FootprintsDocument): Map<string, number> 
  * to the rooms around it (the rooms happened to get the flip right via a
  * geometry-rotation side effect; the route's point positions didn't).
  */
-function planPoint(x: number, y: number, elevationM: number): THREE.Vector3 {
+export function planPoint(x: number, y: number, elevationM: number): THREE.Vector3 {
   const p = ifcPlanToThree(x, y, elevationM);
   return new THREE.Vector3(p.x, p.y, p.z);
 }
@@ -74,7 +74,7 @@ function planPoint(x: number, y: number, elevationM: number): THREE.Vector3 {
  * same negation planPoint applies explicitly. Flipping the shape's Y here
  * too would cancel it back out and reintroduce the mirror bug.
  */
-function prism(polygon: Point2D[], elevationM: number, heightM: number, color: number): THREE.Mesh {
+export function prism(polygon: Point2D[], elevationM: number, heightM: number, color: number): THREE.Mesh {
   const shape = new THREE.Shape(polygon.map((p) => new THREE.Vector2(p.x, p.y)));
   const geometry = new THREE.ExtrudeGeometry(shape, {
     depth: Math.max(heightM, 0.01),

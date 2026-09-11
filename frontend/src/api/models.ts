@@ -20,6 +20,7 @@ export interface ModelMetadata {
   size_bytes: number;
   created_at: string;
   extract_status: "none" | "ready" | "failed";
+  source_format: "ifc" | "indoorgml";
 }
 
 export interface EntitiesExtract {

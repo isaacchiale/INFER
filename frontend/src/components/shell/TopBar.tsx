@@ -11,7 +11,8 @@ import { ThemeToggle } from "./ThemeToggle";
 
 export function TopBar() {
   const { setIngestOpen, viewerStatus, viewerStatusKind, pendingIfc } = useInfer();
-  const modelName = pendingIfc?.name.replace(/\.ifc$/i, "") || "No model loaded";
+  const modelName =
+    pendingIfc?.name.replace(/\.(ifc|ifczip|gml|indoorgml)$/i, "") || "No model loaded";
 
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background px-3">

@@ -7,7 +7,8 @@ import { useInfer } from "@/state/infer-store";
 import { buildModelFootprints, buildModelGraph, extractModel, uploadModel } from "@/api/models";
 import { toast } from "sonner";
 
-const ACCEPT = [".ifc", ".ifczip"];
+const ACCEPT = [".ifc", ".ifczip", ".gml", ".indoorgml"];
+const INDOORGML_EXTENSIONS = [".gml", ".indoorgml"];
 
 export function IngestDialog() {
   const { ingestOpen, setIngestOpen, queueIfcFile, setModelGraph, setViewerStatus } = useInfer();
@@ -29,22 +30,29 @@ export function IngestDialog() {
   };
 
   const start = async (file: File) => {
-    const ok = ACCEPT.some((ext) => file.name.toLowerCase().endsWith(ext));
+    const lowerName = file.name.toLowerCase();
+    const ok = ACCEPT.some((ext) => lowerName.endsWith(ext));
     if (!ok) {
       setFileName(file.name);
       setProgress(0);
-      setError("Unsupported file. Use .ifc or .ifczip.");
+      setError("Unsupported file. Use .ifc, .ifczip, .gml, or .indoorgml.");
       return;
     }
+    const isIndoorGml = INDOORGML_EXTENSIONS.some((ext) => lowerName.endsWith(ext));
 
     setError(null);
     setFileName(file.name);
     setLoading(true);
     setProgress(8);
-    setStatus("Loading into 3D viewer…");
+    setStatus(isIndoorGml ? "Uploading…" : "Loading into 3D viewer…");
     setViewerStatus(`Loading ${file.name}`, "loading");
 
     try {
+      // Stored regardless of format (the top bar reads its filename for the
+      // model-name label) — the actual web-ifc load in InferModelViewport
+      // is what needs gating against non-IFC bytes, and that component
+      // never even mounts for an IndoorGML model (routes/index.tsx swaps in
+      // FootprintModelViewport instead), so there's nothing to feed it to.
       await queueIfcFile(file);
       setProgress(25);
       setStatus("Uploading to backend…");
@@ -74,7 +82,13 @@ export function IngestDialog() {
       const graph = await buildModelGraph(meta.model_id, "geometry");
       setProgress(95);
 
-      setModelGraph({ modelId: meta.model_id, graph, entities, footprints });
+      setModelGraph({
+        modelId: meta.model_id,
+        graph,
+        entities,
+        footprints,
+        sourceFormat: meta.source_format,
+      });
       setProgress(100);
       setStatus("Ready");
       setViewerStatus(
@@ -143,7 +157,7 @@ export function IngestDialog() {
               dragging && "border-primary bg-accent/40",
             )}
           >
-            <p className="text-[13px] text-muted-foreground">Drop IFC here</p>
+            <p className="text-[13px] text-muted-foreground">Drop IFC or IndoorGML here</p>
             <Button
               size="sm"
               variant="outline"
@@ -159,7 +173,7 @@ export function IngestDialog() {
         <input
           ref={inputRef}
           type="file"
-          accept=".ifc,.ifczip"
+          accept=".ifc,.ifczip,.gml,.indoorgml"
           className="sr-only"
           onChange={(e) => {
             const file = e.target.files?.[0];

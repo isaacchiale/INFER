@@ -57,6 +57,10 @@ interface ViewportState {
 interface ModelDataState {
   // Backend model + connectivity graph (null graph ⇒ demo fallback in viewer)
   backendModelId: string | null;
+  /** Which parser produced this model — determines the 3D pane's render path
+   * (That Open/web-ifc for "ifc", a plain-footprint Three.js scene for
+   * "indoorgml", which has no BIM geometry web-ifc could load). */
+  sourceFormat: "ifc" | "indoorgml";
   connectivityGraph: ConnectivityGraph | null;
   entitiesExtract: EntitiesExtract | null;
   footprintsDocument: FootprintsDocument | null;
@@ -81,6 +85,7 @@ interface ModelDataState {
     graph: ConnectivityGraph;
     entities: EntitiesExtract;
     footprints?: FootprintsDocument | null;
+    sourceFormat?: "ifc" | "indoorgml";
   }) => void;
   clearModelGraph: () => void;
 }
@@ -225,6 +230,7 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
   const { setViewerCameraPose, setViewerModelBounds, setViewerCoordInverse } = useViewerPose();
 
   const [backendModelId, setBackendModelId] = useState<string | null>(null);
+  const [sourceFormat, setSourceFormat] = useState<"ifc" | "indoorgml">("ifc");
   const [connectivityGraph, setConnectivityGraph] = useState<ConnectivityGraph | null>(null);
   const [entitiesExtract, setEntitiesExtract] = useState<EntitiesExtract | null>(null);
   const [footprintsDocument, setFootprintsDocument] = useState<FootprintsDocument | null>(null);
@@ -276,8 +282,10 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
       graph: ConnectivityGraph;
       entities: EntitiesExtract;
       footprints?: FootprintsDocument | null;
+      sourceFormat?: "ifc" | "indoorgml";
     }) => {
       setBackendModelId(payload.modelId);
+      setSourceFormat(payload.sourceFormat ?? "ifc");
       setConnectivityGraph(payload.graph);
       setEntitiesExtract(payload.entities);
       setFootprintsDocument(payload.footprints ?? null);
@@ -294,6 +302,7 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
 
   const clearModelGraph = useCallback(() => {
     setBackendModelId(null);
+    setSourceFormat("ifc");
     setConnectivityGraph(null);
     setEntitiesExtract(null);
     setFootprintsDocument(null);
@@ -314,6 +323,7 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
   const value = useMemo<ModelDataState>(
     () => ({
       backendModelId,
+      sourceFormat,
       connectivityGraph,
       entitiesExtract,
       footprintsDocument,
@@ -334,6 +344,7 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
     }),
     [
       backendModelId,
+      sourceFormat,
       connectivityGraph,
       entitiesExtract,
       footprintsDocument,
