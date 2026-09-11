@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Check, ChevronDown, FolderOpen, Move3d, Network, PersonStanding } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { GLASS } from "@/lib/floating-panel";
 import { Button } from "@/components/ui/button";
 import { buildAllStoreyNavmeshes, buildStoreyNavmesh } from "@/lib/navmesh";
 import {
@@ -32,9 +33,6 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-
-const GLASS =
-  "rounded-[6px] border border-border bg-background/90 shadow-sm backdrop-blur-[2px]";
 
 /** Navmesh slabs sit just above each storey elevation. */
 const NAVMESH_HEIGHT_OFFSET_M = 0.05;

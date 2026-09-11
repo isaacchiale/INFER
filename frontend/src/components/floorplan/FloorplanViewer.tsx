@@ -42,6 +42,7 @@ import {
   type Point2,
 } from "@/lib/floorplan-camera";
 import { cn } from "@/lib/utils";
+import { GLASS } from "@/lib/floating-panel";
 import { useAppTheme, type AppTheme } from "@/hooks/use-app-theme";
 import type { FootprintsDocument, Point2D } from "@/types/footprints";
 import {
@@ -56,9 +57,6 @@ import { useNavmeshRouting } from "./useNavmeshRouting";
 /** Same canvas colours as Graph Viewer (`graphPalette`). */
 const PLAN_CANVAS = "bg-[#F8FAFC] dark:bg-[#0F1117]";
 const PLAN_CANVAS_HEX: Record<AppTheme, string> = { light: "#F8FAFC", dark: "#0F1117" };
-
-const GLASS =
-  "rounded-[6px] border border-border bg-background/90 shadow-sm backdrop-blur-[2px]";
 
 /**
  * Wall poché inverts light/dark rather than reusing one hex — the whole

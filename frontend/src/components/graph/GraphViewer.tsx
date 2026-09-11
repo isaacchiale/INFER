@@ -20,6 +20,7 @@ import {
 import type { GraphLayout } from "@/lib/graph-layout";
 import type { GraphVariant } from "@/types/graph";
 import { cn } from "@/lib/utils";
+import { GLASS } from "@/lib/floating-panel";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -34,9 +35,6 @@ const VARIANT_OPTIONS: { id: GraphVariant; label: string }[] = [
   { id: "ifc", label: "IFC relations" },
   { id: "geometry", label: "Geometry rules" },
 ];
-
-const GLASS =
-  "rounded-[6px] border border-border bg-background/90 shadow-sm backdrop-blur-[2px]";
 
 export function GraphViewer({ className }: { className?: string }) {
   const {
