@@ -8,6 +8,7 @@ app install. The frontend builds the GLB client-side (route-share-scene.ts
 from __future__ import annotations
 
 import re
+import socket
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -23,8 +24,30 @@ MAX_BYTES = 20 * 1024 * 1024
 _SHARE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+def _lan_ip() -> str | None:
+    """
+    Best-effort LAN-facing IP for this machine. A share link built from
+    window.location.origin is useless when that origin is "localhost" —
+    scanning it from a phone points the phone at itself, not this computer.
+    The frontend swaps in this IP when it detects it was opened via
+    localhost/127.0.0.1.
+
+    Opening a UDP socket toward a public address never actually sends
+    anything (UDP "connect" just picks a local route/interface) — this
+    can't reach the network and doesn't need to; it only asks the OS which
+    local IP it would use. Returns None (caller keeps localhost) if there's
+    no route at all, e.g. a fully offline machine.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
 @router.post("", status_code=201)
-async def create_route_share(request: Request) -> dict[str, str]:
+async def create_route_share(request: Request) -> dict[str, str | None]:
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="Empty upload")
@@ -32,7 +55,7 @@ async def create_route_share(request: Request) -> dict[str, str]:
         raise HTTPException(status_code=413, detail="File too large")
     settings = get_settings()
     share_id = storage.save_route_share(settings, body)
-    return {"share_id": share_id}
+    return {"share_id": share_id, "lan_ip": _lan_ip()}
 
 
 @router.get("/{share_id}.glb")

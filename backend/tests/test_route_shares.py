@@ -24,8 +24,12 @@ def test_create_and_fetch_route_share(client: TestClient):
         headers={"content-type": "model/gltf-binary"},
     )
     assert created.status_code == 201
-    share_id = created.json()["share_id"]
+    body = created.json()
+    share_id = body["share_id"]
     assert len(share_id) == 32
+    # lan_ip is best-effort (None on a machine with no network route) — the
+    # response must carry the key either way, since the frontend reads it.
+    assert "lan_ip" in body
 
     fetched = client.get(f"/route-shares/{share_id}.glb")
     assert fetched.status_code == 200

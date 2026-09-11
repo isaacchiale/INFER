@@ -9,6 +9,9 @@ export default defineConfig({
   },
   vite: {
     server: {
+      // Listen on all interfaces, not just loopback — the route-share QR
+      // code needs this page reachable from a phone on the same network.
+      host: true,
       proxy: {
         "/api": {
           target: "http://127.0.0.1:8000",

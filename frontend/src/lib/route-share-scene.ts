@@ -1,24 +1,29 @@
 /**
- * Build a small, self-contained Three.js scene for one computed route —
- * the rooms it passes through (as flat slabs, for spatial context) plus the
- * route itself as a tube, stacked by real storey elevation. Meant to be
- * exported via GLTFExporter and shared as a standalone GLB, so it does NOT
- * reuse the live viewer's coordination-matrix/model-bounds alignment (there
- * is no live mesh on the receiving end) — it maps footprint plan XY (metres)
- * directly to a fresh Y-up scene.
+ * Build a small, self-contained Three.js scene for one computed route: the
+ * walls/rooms it passes through (extruded to a real height, not just flat
+ * floor outlines — a "navmesh"-flat export undersold what should read as an
+ * actual building) plus the route itself as a tube, stacked by real storey
+ * elevation. Meant to be exported via GLTFExporter and shared as a
+ * standalone GLB.
  */
 import * as THREE from "three";
 import { normalizeElevationsToMetres } from "@/lib/storey-elevations";
+import { ifcPlanToThree } from "@/lib/viewer-camera-pose";
 import type { FootprintsDocument, Point2D } from "@/types/footprints";
 import type { NavmeshRoute } from "@/state/infer-store";
 
 const ROOM_COLOR = 0xcbd5e1;
+const WALL_COLOR = 0xe7e2d8;
 const TUBE_COLOR = 0x1d4ed8;
 const START_COLOR = 0x22c55e;
 const END_COLOR = 0xef4444;
 const TUBE_RADIUS_M = 0.12;
 const TUBE_HEIGHT_OFFSET_M = 0.05;
 const MARKER_RADIUS_M = 0.22;
+const ROOM_SLAB_HEIGHT_M = 0.03;
+/** Real wall height isn't in the footprint schema (2D polygons only) — a
+ * typical ceiling height so the export reads as a building, not a floorplan. */
+const WALL_HEIGHT_M = 2.4;
 
 type StoreySegment = { storeyId: string; points: Point2D[] };
 
@@ -41,13 +46,39 @@ function storeyElevationsM(footprints: FootprintsDocument): Map<string, number> 
   return map;
 }
 
-function roomSlab(polygon: Point2D[], elevationM: number): THREE.Mesh {
+/**
+ * Plan XY (metres) + elevation -> Three.js world position (Y-up). Reuses the
+ * app's one established plan<->Three conversion — the live 3D viewer and the
+ * on-screen navmesh route tube both go through this same function — instead
+ * of a hand-rolled mapping. Getting its z = -y flip wrong is exactly what
+ * made an earlier version of this export show the route mirrored relative
+ * to the rooms around it (the rooms happened to get the flip right via a
+ * geometry-rotation side effect; the route's point positions didn't).
+ */
+function planPoint(x: number, y: number, elevationM: number): THREE.Vector3 {
+  const p = ifcPlanToThree(x, y, elevationM);
+  return new THREE.Vector3(p.x, p.y, p.z);
+}
+
+/**
+ * Extrude a flat plan polygon into a vertical prism from `elevationM` up by
+ * `heightM`. The shape is built with local Y = +planY (NOT flipped to match
+ * planPoint's z = -planY) on purpose: ExtrudeGeometry builds the shape at
+ * local Z=0 and extrudes to local Z=height, and rotateX(-90deg) below maps
+ * local (X, Y, Z) -> world (X, Z, -Y) -- that rotation already applies the
+ * same negation planPoint applies explicitly. Flipping the shape's Y here
+ * too would cancel it back out and reintroduce the mirror bug.
+ */
+function prism(polygon: Point2D[], elevationM: number, heightM: number, color: number): THREE.Mesh {
   const shape = new THREE.Shape(polygon.map((p) => new THREE.Vector2(p.x, p.y)));
-  const geometry = new THREE.ExtrudeGeometry(shape, { depth: 0.03, bevelEnabled: false });
-  geometry.rotateX(-Math.PI / 2); // extruded along local Z → world Y (up)
+  const geometry = new THREE.ExtrudeGeometry(shape, {
+    depth: Math.max(heightM, 0.01),
+    bevelEnabled: false,
+  });
+  geometry.rotateX(-Math.PI / 2);
   geometry.translate(0, elevationM, 0);
   const material = new THREE.MeshStandardMaterial({
-    color: ROOM_COLOR,
+    color,
     side: THREE.DoubleSide,
     roughness: 0.9,
   });
@@ -57,7 +88,7 @@ function roomSlab(polygon: Point2D[], elevationM: number): THREE.Mesh {
 function routeTube(points: Point2D[], elevationM: number): THREE.Mesh | null {
   if (points.length < 2) return null;
   const y = elevationM + TUBE_HEIGHT_OFFSET_M;
-  const curve = new THREE.CatmullRomCurve3(points.map((p) => new THREE.Vector3(p.x, y, p.y)));
+  const curve = new THREE.CatmullRomCurve3(points.map((p) => planPoint(p.x, p.y, y)));
   const segments = Math.max(points.length * 4, 8);
   const geometry = new THREE.TubeGeometry(curve, segments, TUBE_RADIUS_M, 8, false);
   const material = new THREE.MeshStandardMaterial({ color: TUBE_COLOR, roughness: 0.4 });
@@ -68,7 +99,7 @@ function marker(point: Point2D, elevationM: number, color: number): THREE.Mesh {
   const geometry = new THREE.SphereGeometry(MARKER_RADIUS_M, 16, 16);
   const material = new THREE.MeshStandardMaterial({ color });
   const mesh = new THREE.Mesh(geometry, material);
-  mesh.position.set(point.x, elevationM + TUBE_HEIGHT_OFFSET_M, point.y);
+  mesh.position.copy(planPoint(point.x, point.y, elevationM + TUBE_HEIGHT_OFFSET_M));
   return mesh;
 }
 
@@ -90,13 +121,29 @@ export function buildRouteShareScene(
   sun.position.set(3, 8, 4);
   scene.add(sun);
 
+  // A wall with no storey_global_id is shown "on every storey" elsewhere in
+  // the app (FloorplanViewer); here every segment renders simultaneously in
+  // one scene, so add each such wall once (at the first segment it matches)
+  // instead of stacking a duplicate copy at every storey's elevation.
+  const wallsAdded = new Set<string>();
+
   for (const segment of segments) {
     const elevationM = elevations.get(segment.storeyId) ?? 0;
+
     for (const space of footprints.spaces) {
       if (space.incomplete || space.polygon.length < 3) continue;
       if (space.storey_global_id !== segment.storeyId) continue;
-      scene.add(roomSlab(space.polygon, elevationM));
+      scene.add(prism(space.polygon, elevationM, ROOM_SLAB_HEIGHT_M, ROOM_COLOR));
     }
+
+    for (const wall of footprints.walls ?? []) {
+      if (wall.incomplete || wall.polygon.length < 3) continue;
+      if (wall.storey_global_id != null && wall.storey_global_id !== segment.storeyId) continue;
+      if (wallsAdded.has(wall.global_id)) continue;
+      wallsAdded.add(wall.global_id);
+      scene.add(prism(wall.polygon, elevationM, WALL_HEIGHT_M, WALL_COLOR));
+    }
+
     const tube = routeTube(segment.points, elevationM);
     if (tube) scene.add(tube);
   }
