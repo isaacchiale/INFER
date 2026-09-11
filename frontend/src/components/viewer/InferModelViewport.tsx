@@ -17,7 +17,6 @@ import {
   type Mat4Elements,
   type ThreeAabb,
 } from "@/lib/viewer-camera-pose";
-import type { HazardZone, Route } from "@/types/infer";
 import { useModelData, useViewport, useViewerPose, type NavmeshRoute } from "@/state/infer-store";
 import {
   createThatOpenRuntime,
@@ -88,15 +87,6 @@ function buildNavmeshRouteTube(
 export interface InferModelViewportProps {
   modelId: string;
   selectedElementIds?: string[];
-  highlightedRoute?: Route | null;
-  hiddenStoreyIds?: string[];
-  hazardZones?: HazardZone[];
-  navigationStart?: string | null;
-  navigationDestination?: string | null;
-  animationStepIndex?: number;
-  animationPlaying?: boolean;
-  onElementSelected?: (elementId: string) => void;
-  onPointSelected?: (point: { x: number; y: number; z: number }) => void;
   onViewerReady?: (host: HTMLDivElement) => void;
   className?: string;
   children?: React.ReactNode;
@@ -105,11 +95,6 @@ export interface InferModelViewportProps {
 function InferModelViewportImpl({
   modelId,
   selectedElementIds = [],
-  highlightedRoute = null,
-  hiddenStoreyIds = [],
-  hazardZones = [],
-  navigationStart = null,
-  navigationDestination = null,
   onViewerReady,
   className,
   children,
@@ -594,20 +579,12 @@ function InferModelViewportImpl({
     viewerCoordInverse,
   ]);
 
-  // Keep route/hazard props available for future overlays (not drawn by placeholder).
-  void highlightedRoute;
-  void hazardZones;
-  void selectedElementIds;
-
   return (
     <div
       className={cn("relative isolate h-full w-full overflow-hidden bg-viewport", className)}
       data-model-id={modelId}
       data-active-storey={viewerStoreyId}
-      data-hidden-storeys={hiddenStoreyIds.join(",")}
       data-selected={selectedElementIds.join(",")}
-      data-navigation-start={navigationStart ?? ""}
-      data-navigation-destination={navigationDestination ?? ""}
     >
       <div
         ref={viewerHostRef}

@@ -1,8 +1,4 @@
-import { useState } from "react";
-import { Check, ChevronDown, MoreHorizontal, Search } from "lucide-react";
-import { Link } from "@tanstack/react-router";
-import { building } from "@/data/mock";
-import { Button } from "@/components/ui/button";
+import { Check, ChevronDown } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -10,14 +6,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useInfer } from "@/state/infer-store";
-import { CommandPalette } from "./CommandPalette";
 import { ThemeToggle } from "./ThemeToggle";
 
 export function TopBar() {
   const { setIngestOpen, viewerStatus, viewerStatusKind, pendingIfc } = useInfer();
-  const [paletteOpen, setPaletteOpen] = useState(false);
   const modelName = pendingIfc?.name.replace(/\.ifc$/i, "") || "No model loaded";
 
   return (
@@ -56,60 +49,8 @@ export function TopBar() {
       </p>
 
       <div className="ml-auto flex items-center gap-0.5">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-8 rounded-[5px] text-muted-foreground"
-              aria-label="Search"
-              onClick={() => setPaletteOpen(true)}
-            >
-              <Search className="size-4" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>Search ⌘K</TooltipContent>
-        </Tooltip>
-
         <ThemeToggle />
-
-
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="mx-1 inline-flex cursor-default items-center gap-1.5 text-[12px] text-muted-foreground">
-              <span aria-hidden className="size-1.5 rounded-full bg-verified" />
-              {building.readinessScore}%
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>Model health</TooltipContent>
-        </Tooltip>
-
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon" className="size-8 rounded-[5px] text-muted-foreground" aria-label="More">
-              <MoreHorizontal className="size-4" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-48">
-            <DropdownMenuItem className="text-[13px]" onSelect={() => setIngestOpen(true)}>
-              Open model…
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem asChild className="text-[13px]">
-              <Link to="/overview">Overview</Link>
-            </DropdownMenuItem>
-            <DropdownMenuItem asChild className="text-[13px]">
-              <Link to="/validation">Validation report</Link>
-            </DropdownMenuItem>
-            <DropdownMenuItem asChild className="text-[13px]">
-              <Link to="/assets">Assets</Link>
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-
       </div>
-
-      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
     </header>
   );
 }

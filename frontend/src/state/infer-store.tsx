@@ -1,27 +1,8 @@
-import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from "react";
-import {
-  accessibleRoute,
-  defaultLayers,
-  defaultRoute,
-  hazardZones as mockHazards,
-  scenario as mockScenario,
-} from "@/data/mock";
-import type {
-  AgentProfileId,
-  HazardZone,
-  LayerId,
-  LayerState,
-  Route,
-  RouteMode,
-  RouteRestriction,
-  ScenarioCondition,
-} from "@/types/infer";
+import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
 import type { ConnectivityGraph, RouteResult } from "@/types/graph";
 import type { EntitiesExtract } from "@/api/models";
 import type { FootprintsDocument, Point2D } from "@/types/footprints";
 import type { ViewerCameraPose, ThreeAabb, Mat4Elements } from "@/lib/viewer-camera-pose";
-
-export type WorkMode = "model" | "navigate" | "layers" | "validate" | "scenario";
 
 /**
  * Floorplan click-to-click route (pins + A* polyline). Survives IFC/navmesh
@@ -41,20 +22,11 @@ export type NavmeshRoute = {
   segments: { storeyId: string; points: Point2D[] }[] | null;
 };
 
-export interface RouteRequest {
-  origin: string;
-  destination: string;
-  profile: AgentProfileId;
-  mode: RouteMode;
-  restrictions: RouteRestriction[];
-}
-
 /**
  * The store is split into several contexts by how often each group changes
  * and who actually reads it, instead of one big InferState — bundling
- * everything meant e.g. typing in ScenarioPanel (ScenarioState) re-rendered
- * the 3D viewport and Floorplan (which only ever read ViewportState /
- * ModelDataState). Heavy render consumers (FloorplanViewer, GraphViewer,
+ * everything meant e.g. a selection-driven update re-rendering every part of
+ * the app. Heavy render consumers (FloorplanViewer, GraphViewer,
  * InferModelViewport, the workspace route) call the specific hook(s) they
  * need; everything else keeps using the combined useInfer() below.
  *
@@ -62,14 +34,8 @@ export interface RouteRequest {
  * the same reason — it publishes at up to 20Hz during Fly navigation.
  */
 interface ViewportState {
-  workMode: WorkMode;
-  setWorkMode: (m: WorkMode) => void;
-
   activeStoreyId: string | "all";
   setActiveStoreyId: (id: string | "all") => void;
-  layers: LayerState[];
-  toggleLayer: (id: LayerId) => void;
-  setAllLayers: (visible: boolean) => void;
 
   selectedElementIds: string[];
   selectElement: (id: string | null) => void;
@@ -109,7 +75,7 @@ interface ModelDataState {
   excludedEdgeIds: ReadonlySet<string>;
   toggleExcludedEdge: (edgeId: string) => void;
   clearExcludedEdges: () => void;
-  graphSource: "demo" | "model" | "none";
+  graphSource: "model" | "none";
   setModelGraph: (payload: {
     modelId: string;
     graph: ConnectivityGraph;
@@ -119,36 +85,8 @@ interface ModelDataState {
   clearModelGraph: () => void;
 }
 
-interface ScenarioState {
-  // routing
-  request: RouteRequest;
-  updateRequest: (patch: Partial<RouteRequest>) => void;
-  route: Route | null;
-  computing: boolean;
-  computeRoute: () => void;
-  clearRoute: () => void;
-
-  // animation
-  animation: { playing: boolean; stepIndex: number };
-  play: () => void;
-  pause: () => void;
-  stepForward: () => void;
-  resetAnimation: () => void;
-
-  // scenario
-  conditions: ScenarioCondition[];
-  addCondition: (c: ScenarioCondition) => void;
-  removeCondition: (id: string) => void;
-  undoRemove: () => void;
-  hazardZones: HazardZone[];
-
-  // validation
-  selectedIssueId: string | null;
-  setSelectedIssueId: (id: string | null) => void;
-}
-
 /** Combined shape returned by useInfer() — every field from every context. */
-type InferState = ViewportState & ModelDataState & ScenarioState;
+type InferState = ViewportState & ModelDataState;
 
 /**
  * Split out of InferState: viewerCameraPose publishes at up to 20Hz during
@@ -204,9 +142,7 @@ export function useViewerPose(): ViewerPoseState {
 const ViewportCtx = createContext<ViewportState | null>(null);
 
 function ViewportProvider({ children }: { children: ReactNode }) {
-  const [workMode, setWorkMode] = useState<WorkMode>("model");
   const [activeStoreyId, setActiveStoreyId] = useState<string | "all">("all");
-  const [layers, setLayers] = useState<LayerState[]>(defaultLayers);
   const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
   const [ingestOpen, setIngestOpen] = useState(false);
   const [pendingIfc, setPendingIfc] = useState<{ name: string; buffer: Uint8Array } | null>(
@@ -216,13 +152,6 @@ function ViewportProvider({ children }: { children: ReactNode }) {
   const [viewerStatusKind, setViewerStatusKind] = useState<"info" | "error" | "loading">(
     "info",
   );
-
-  const toggleLayer = useCallback((id: LayerId) => {
-    setLayers((prev) => prev.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)));
-  }, []);
-  const setAllLayers = useCallback((visible: boolean) => {
-    setLayers((prev) => prev.map((l) => ({ ...l, visible })));
-  }, []);
 
   const selectElement = useCallback((id: string | null) => {
     if (!id) {
@@ -252,13 +181,8 @@ function ViewportProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<ViewportState>(
     () => ({
-      workMode,
-      setWorkMode,
       activeStoreyId,
       setActiveStoreyId,
-      layers,
-      toggleLayer,
-      setAllLayers,
       selectedElementIds,
       selectElement,
       setSelectedElementIds,
@@ -272,11 +196,7 @@ function ViewportProvider({ children }: { children: ReactNode }) {
       viewerStatusKind,
     }),
     [
-      workMode,
       activeStoreyId,
-      layers,
-      toggleLayer,
-      setAllLayers,
       selectedElementIds,
       selectElement,
       ingestOpen,
@@ -440,132 +360,11 @@ export function useModelData(): ModelDataState {
   return ctx;
 }
 
-const ScenarioCtx = createContext<ScenarioState | null>(null);
-
-function ScenarioProvider({ children }: { children: ReactNode }) {
-  const [request, setRequest] = useState<RouteRequest>({
-    origin: "Meeting Room 03-12",
-    destination: "Exit E-02",
-    profile: "visitor",
-    mode: "fastest",
-    restrictions: ["avoid-hazards"],
-  });
-  const [route, setRoute] = useState<Route | null>(defaultRoute);
-  const [computing, setComputing] = useState(false);
-  const [animation, setAnimation] = useState({ playing: false, stepIndex: 0 });
-  const [conditions, setConditions] = useState<ScenarioCondition[]>(mockScenario.conditions);
-  const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
-  const removedRef = useRef<ScenarioCondition | null>(null);
-
-  const updateRequest = useCallback((patch: Partial<RouteRequest>) => {
-    setRequest((prev) => ({ ...prev, ...patch }));
-  }, []);
-
-  const computeRoute = useCallback(() => {
-    setComputing(true);
-    setAnimation({ playing: false, stepIndex: 0 });
-    window.setTimeout(() => {
-      setRoute((_prev) => {
-        const base = request.mode === "accessible" || request.profile === "wheelchair" ? accessibleRoute : defaultRoute;
-        return {
-          ...base,
-          label: `${request.origin} → ${request.destination}`,
-          mode: request.mode,
-          profile: request.profile,
-        };
-      });
-      setComputing(false);
-    }, 700);
-  }, [request]);
-
-  const clearRoute = useCallback(() => {
-    setRoute(null);
-    setAnimation({ playing: false, stepIndex: 0 });
-  }, []);
-
-  const play = useCallback(() => setAnimation((a) => ({ ...a, playing: true })), []);
-  const pause = useCallback(() => setAnimation((a) => ({ ...a, playing: false })), []);
-  const stepForward = useCallback(
-    () =>
-      setAnimation((a) => ({
-        playing: false,
-        stepIndex: Math.min(a.stepIndex + 1, (route?.steps.length ?? 1) - 1),
-      })),
-    [route],
-  );
-  const resetAnimation = useCallback(() => setAnimation({ playing: false, stepIndex: 0 }), []);
-
-  const addCondition = useCallback((c: ScenarioCondition) => setConditions((p) => [c, ...p]), []);
-  const removeCondition = useCallback((id: string) => {
-    setConditions((p) => {
-      removedRef.current = p.find((c) => c.id === id) ?? null;
-      return p.filter((c) => c.id !== id);
-    });
-  }, []);
-  const undoRemove = useCallback(() => {
-    if (removedRef.current) {
-      setConditions((p) => [removedRef.current as ScenarioCondition, ...p]);
-      removedRef.current = null;
-    }
-  }, []);
-
-  const value = useMemo<ScenarioState>(
-    () => ({
-      request,
-      updateRequest,
-      route,
-      computing,
-      computeRoute,
-      clearRoute,
-      animation,
-      play,
-      pause,
-      stepForward,
-      resetAnimation,
-      conditions,
-      addCondition,
-      removeCondition,
-      undoRemove,
-      hazardZones: mockHazards,
-      selectedIssueId,
-      setSelectedIssueId,
-    }),
-    [
-      request,
-      updateRequest,
-      route,
-      computing,
-      computeRoute,
-      clearRoute,
-      animation,
-      play,
-      pause,
-      stepForward,
-      resetAnimation,
-      conditions,
-      addCondition,
-      removeCondition,
-      undoRemove,
-      selectedIssueId,
-    ],
-  );
-
-  return <ScenarioCtx.Provider value={value}>{children}</ScenarioCtx.Provider>;
-}
-
-export function useScenario(): ScenarioState {
-  const ctx = useContext(ScenarioCtx);
-  if (!ctx) throw new Error("useScenario must be used inside InferProvider");
-  return ctx;
-}
-
 export function InferProvider({ children }: { children: ReactNode }) {
   return (
     <ViewerPoseProvider>
       <ViewportProvider>
-        <ModelDataProvider>
-          <ScenarioProvider>{children}</ScenarioProvider>
-        </ModelDataProvider>
+        <ModelDataProvider>{children}</ModelDataProvider>
       </ViewportProvider>
     </ViewerPoseProvider>
   );
@@ -576,15 +375,11 @@ export function InferProvider({ children }: { children: ReactNode }) {
  * lightweight consumers (panels, toolbars, the ingest dialog) where
  * subscribing to everything costs nothing. Render-heavy consumers
  * (FloorplanViewer, GraphViewer, InferModelViewport, the workspace route)
- * call useViewport()/useModelData()/useScenario() directly instead, so a
- * change in one doesn't re-render a component that only reads another.
+ * call useViewport()/useModelData() directly instead, so a change in one
+ * doesn't re-render a component that only reads another.
  */
 export function useInfer(): InferState {
   const viewport = useViewport();
   const modelData = useModelData();
-  const scenario = useScenario();
-  return useMemo(
-    () => ({ ...viewport, ...modelData, ...scenario }),
-    [viewport, modelData, scenario],
-  );
+  return useMemo(() => ({ ...viewport, ...modelData }), [viewport, modelData]);
 }

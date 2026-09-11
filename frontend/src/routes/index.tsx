@@ -1,14 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { building } from "@/data/mock";
 import { InferModelViewport } from "@/components/viewer/InferModelViewport";
-import { RouteControls } from "@/components/viewer/ViewportControls";
 import { Inspector } from "@/components/panels/Inspector";
-import { NavigatePanel } from "@/components/panels/NavigatePanel";
-import { ValidatePanel } from "@/components/panels/ValidatePanel";
-import { ScenarioPanel } from "@/components/panels/ScenarioPanel";
-import { LayersPanel } from "@/components/panels/LayersPanel";
 import { SplitWorkspace } from "@/components/workspace/SplitWorkspace";
-import { useViewport, useScenario } from "@/state/infer-store";
+import { useModelData, useViewport } from "@/state/infer-store";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -16,13 +10,12 @@ export const Route = createFileRoute("/")({
       { title: "Model workspace — INFER" },
       {
         name: "description",
-        content:
-          "Inspect the indoor spatial model, plan routes, validate connectivity and simulate disruptions in one workspace.",
+        content: "Inspect the indoor spatial model and plan navmesh routes in one workspace.",
       },
       { property: "og:title", content: "Model workspace — INFER" },
       {
         property: "og:description",
-        content: "Split 3D + graph workspace for indoor model inspection, routing and scenarios.",
+        content: "Split 3D + graph workspace for indoor model inspection and routing.",
       },
     ],
   }),
@@ -30,32 +23,18 @@ export const Route = createFileRoute("/")({
 });
 
 function WorkspaceScreen() {
-  const { workMode, setWorkMode, selectedElementIds, selectElement } = useViewport();
-  const { route, hazardZones, animation } = useScenario();
+  const { backendModelId } = useModelData();
+  const { selectedElementIds } = useViewport();
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <SplitWorkspace
         modelPane={
           <InferModelViewport
-            modelId={building.id}
+            modelId={backendModelId ?? "model"}
             selectedElementIds={selectedElementIds}
-            highlightedRoute={route}
-            hazardZones={hazardZones}
-            animationStepIndex={animation.stepIndex}
-            animationPlaying={animation.playing}
-            onElementSelected={(id) => selectElement(id)}
           >
-            <div className="viewport-dark contents">
-              <RouteControls />
-            </div>
-
-            {workMode === "navigate" && <NavigatePanel onClose={() => setWorkMode("model")} />}
-            {workMode === "validate" && <ValidatePanel onClose={() => setWorkMode("model")} />}
-            {workMode === "scenario" && <ScenarioPanel onClose={() => setWorkMode("model")} />}
-            {workMode === "layers" && <LayersPanel onClose={() => setWorkMode("model")} />}
-
-            {!animation.playing && <Inspector />}
+            <Inspector />
           </InferModelViewport>
         }
       />
