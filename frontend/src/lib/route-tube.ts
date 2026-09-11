@@ -107,7 +107,7 @@ export type BuildRouteTubeArgs = {
   modelBounds?: ThreeAabb | null;
 };
 
-function isUsableCoordInverse(m: Mat4Elements | null | undefined): boolean {
+function isUsableCoordInverse(m: Mat4Elements | null | undefined): m is Mat4Elements {
   return Boolean(m && m.length >= 16);
 }
 
@@ -249,7 +249,11 @@ export function buildRouteTubePolylines(
         : 0,
     modelBounds,
     storeyElevationsM,
-    coordInverse,
+    // exactOptionalPropertyTypes: the destructured local is `T | undefined`
+    // even though the param only declares `T | null` — coordInverse is
+    // treated identically whether absent or null throughout this file, so
+    // normalizing to null is a no-op in meaning, not just a type-checker fix.
+    coordInverse: coordInverse ?? null,
   });
 
   const seen = new Set<string>();
@@ -305,7 +309,7 @@ export function buildPlanRouteTubePolylines(args: {
         : 0,
     modelBounds,
     storeyElevationsM,
-    coordInverse,
+    coordInverse: coordInverse ?? null,
   });
 
   const elevation = metres.find((s) => s.global_id === storeyId)?.elevation ?? 0;

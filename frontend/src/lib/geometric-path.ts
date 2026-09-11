@@ -808,11 +808,23 @@ function stairByGid(doc: FootprintsDocument, gid: string): StairFootprint | unde
   return (doc.stairs ?? []).find((s) => s.global_id === gid);
 }
 
-function usableSpace(s: SpaceFootprint | undefined): s is SpaceFootprint {
+/**
+ * The predicate's true-branch type is `& { incomplete: false }`, not plain
+ * `SpaceFootprint` — narrowing to the exact same type the input already had
+ * (once `undefined` is excluded) makes the negated branch collapse to
+ * `never` at call sites that already know `s` is defined, since "not truly
+ * usable" is a real, reachable case (incomplete/degenerate geometry) that
+ * the wider type would incorrectly rule out.
+ */
+function usableSpace(
+  s: SpaceFootprint | undefined,
+): s is SpaceFootprint & { incomplete: false } {
   return Boolean(s && !s.incomplete && s.polygon.length >= 3);
 }
 
-function usableStair(s: StairFootprint | undefined): s is StairFootprint {
+function usableStair(
+  s: StairFootprint | undefined,
+): s is StairFootprint & { incomplete: false } {
   return Boolean(s && !s.incomplete && s.polygon.length >= 3);
 }
 

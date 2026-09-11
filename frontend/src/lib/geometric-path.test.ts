@@ -551,7 +551,9 @@ describe("geometric-path", () => {
   it("A* through L-shaped room for door↔space–space in both directions", () => {
     // A (left) --door-- B (L) --heal-- C (top). Forward used to chord door→portal.
     const fp: FootprintsDocument = {
+      schema_version: "1.0",
       model_id: "t",
+      coordinate_system: "ifc_world_xy_metres",
       storeys: [{ global_id: "S1", name: "S1", elevation: 0 }],
       spaces: [
         {
@@ -602,6 +604,7 @@ describe("geometric-path", () => {
           name: "D_AB",
           storey_global_id: "S1",
           point: { x: 4, y: 2 },
+          segment: [],
           incomplete: false,
           method: "ifc_object_placement",
         },

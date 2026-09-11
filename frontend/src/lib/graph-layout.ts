@@ -886,13 +886,17 @@ export function buildGraphLayout(
     seen.add(key);
     const inferred =
       Boolean(edge.inferred) || edge.method !== "ifc_rel_space_boundary";
+    const heal = healKindForEdge(edge.method, edge.kind, inferred);
     edges.push({
       id: edge.id,
       source: edge.source,
       target: edge.target,
       vertical: edge.kind === "vertical",
       inferred,
-      heal: healKindForEdge(edge.method, edge.kind, inferred),
+      // exactOptionalPropertyTypes: omit the key rather than set it to
+      // undefined — `heal` being absent and `heal: undefined` aren't the
+      // same thing under this flag, and LayoutEdge declares it optional.
+      ...(heal !== undefined ? { heal } : {}),
       excluded: excludedEdgeIds.has(edge.id),
     });
   }

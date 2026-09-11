@@ -107,6 +107,7 @@ function InferModelViewportImpl({
   const [geometryMode, setGeometryMode] = useState<GeometryDisplayMode>("ifc");
 
   const {
+    backendModelId,
     connectivityRoute,
     navmeshRoute,
     footprintsDocument,
@@ -725,8 +726,22 @@ function InferModelViewportImpl({
       )}
 
       {!engineReady && !engineError && (
-        <div className="pointer-events-none absolute inset-0 grid place-items-center text-[13px] text-muted-foreground">
-          Starting 3D viewer…
+        <div className="pointer-events-none absolute inset-0 grid place-items-center">
+          {/* text-muted-foreground reads fine on the app's light/dark theme
+              surfaces, but this viewport is *always* a dark canvas — the
+              same dark-gray token sits at near-zero contrast directly on it.
+              Back it with the app's normal GLASS chip instead of hardcoding
+              a viewport-only text color, so it stays legible in both themes. */}
+          <div className={cn(GLASS, "px-3 py-1.5 text-[13px] text-foreground")}>
+            Starting 3D viewer…
+          </div>
+        </div>
+      )}
+      {engineReady && !engineError && !backendModelId && (
+        <div className="pointer-events-none absolute inset-0 grid place-items-center px-4">
+          <div className={cn(GLASS, "max-w-xs px-3 py-1.5 text-center text-[13px] text-foreground")}>
+            No model loaded. Open an IFC model from the menu above to view it in 3D.
+          </div>
         </div>
       )}
       {engineError && (

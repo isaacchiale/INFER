@@ -12,6 +12,17 @@ import {
   threePositionToPlanPose,
   type ViewerCameraPose,
 } from "@/lib/viewer-camera-pose";
+// Type-only: @thatopen/components itself is still dynamically imported below
+// to keep it out of the initial bundle. `import type` is fully erased at
+// compile time, so this doesn't reintroduce that cost — it just gives the
+// `worlds.create<...>()` generic call below real types instead of trying to
+// use the dynamic import's value binding (`const OBC = await import(...)`)
+// as a type namespace, which TS doesn't support.
+import type {
+  OrthoPerspectiveCamera,
+  SimpleRenderer,
+  SimpleScene,
+} from "@thatopen/components";
 
 export type ViewerStatusKind = "info" | "error" | "loading";
 
@@ -129,11 +140,7 @@ export async function createThatOpenRuntime(
 
   const components = new OBC.Components();
   const worlds = components.get(OBC.Worlds);
-  const world = worlds.create<
-    OBC.SimpleScene,
-    OBC.OrthoPerspectiveCamera,
-    OBC.SimpleRenderer
-  >();
+  const world = worlds.create<SimpleScene, OrthoPerspectiveCamera, SimpleRenderer>();
 
   world.scene = new OBC.SimpleScene(components);
   world.scene.setup();
@@ -918,7 +925,14 @@ export async function createThatOpenRuntime(
             ).getCoordinationMatrix;
             if (!getMatrix) continue;
             const matrix = await Promise.resolve(getMatrix.call(model));
-            if (matrix && (matrix as THREE.Matrix4).isMatrix4) {
+            // isMatrix4 is a real runtime marker three.js sets on every
+            // Matrix4 instance (Matrix4.prototype.isMatrix4 = true), used
+            // deliberately here instead of `instanceof THREE.Matrix4` since
+            // that breaks across duplicate three.js copies in node_modules
+            // (a real risk with a fragments/components dependency bundling
+            // its own three.js) while the marker property doesn't. The
+            // installed @types/three just doesn't declare it.
+            if (matrix && (matrix as unknown as { isMatrix4?: boolean }).isMatrix4) {
               const mat = matrix as THREE.Matrix4;
               const inv = mat.clone().invert();
               const t = new THREE.Vector3();
@@ -929,7 +943,10 @@ export async function createThatOpenRuntime(
               mat.decompose(tFwd, q, s);
               const shifted = t.lengthSq() > 1e-4 || tFwd.lengthSq() > 1e-4;
               if (shifted) {
-                publishCoordInverse(inv.toArray());
+                // toArray()'s installed type infers ArrayLike<number> here
+                // rather than number[] (a types-def gap, same class as the
+                // isMatrix4 one above) — it's a real number[] at runtime.
+                publishCoordInverse(Array.from(inv.toArray()));
                 published = true;
                 break;
               }
