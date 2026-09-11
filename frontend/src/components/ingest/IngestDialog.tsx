@@ -54,14 +54,24 @@ export function IngestDialog() {
       setStatus("Extracting spaces / doors / stairs…");
 
       const entities = await extractModel(meta.model_id);
-      setProgress(70);
-      setStatus("Building connectivity graph…");
-
-      const graph = await buildModelGraph(meta.model_id);
-      setProgress(85);
+      setProgress(65);
       setStatus("Building space footprints…");
 
+      // Footprints before the graph (not after, as this used to be ordered):
+      // the "geometry" variant needs them, and building the graph first would
+      // make the backend auto-build footprints as a side effect, then this
+      // call would rebuild them again from scratch right after.
       const footprints = await buildModelFootprints(meta.model_id);
+      setProgress(85);
+      setStatus("Building connectivity graph…");
+
+      // "geometry" (not "ifc") so routing works out of the box — plain IFC
+      // relations are often too sparse to route on (many real exports have
+      // no explicit space-door-space relations at all), and the Graph Viewer
+      // is no longer open by default for someone to discover the toggle that
+      // used to be required to get a usable graph. Still just a toggle in
+      // Graph Viewer for anyone who wants the raw, unhealed relations back.
+      const graph = await buildModelGraph(meta.model_id, "geometry");
       setProgress(95);
 
       setModelGraph({ modelId: meta.model_id, graph, entities, footprints });
