@@ -618,11 +618,6 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const incompleteCount =
     footprintsDocument?.spaces.filter((s) => s.incomplete).length ?? 0;
 
-  const pathD =
-    pathPoints.length >= 2
-      ? pathPoints.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ")
-      : "";
-
   const navmeshStatusParts: string[] = [];
   if (planDisplayMode === "navmesh" && storeyNavmesh) {
     navmeshStatusParts.push(
@@ -1089,7 +1084,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     stairs={stairs}
                     doors={doors}
                     storeyNavmesh={storeyNavmesh}
-                    pathD={pathD}
+                    pathPoints={pathPoints}
                     navmeshStart={navmeshStart}
                     navmeshEnd={navmeshEnd}
                     isExitRoute={isExitRoute}

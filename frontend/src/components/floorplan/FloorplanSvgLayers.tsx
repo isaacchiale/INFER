@@ -1,6 +1,6 @@
 import { memo } from "react";
 import { buildDoorGlyph } from "@/lib/door-symbol";
-import type { Point2 } from "@/lib/floorplan-camera";
+import { smoothPolylinePathD, type Point2 } from "@/lib/floorplan-camera";
 import type {
   DoorPortal,
   FurnitureFootprint,
@@ -186,7 +186,7 @@ export type FloorplanSvgLayersProps = {
   stairs: StairFootprint[];
   doors: DoorPortal[];
   storeyNavmesh: StoreyNavmesh | null;
-  pathD: string;
+  pathPoints: Point2[];
   navmeshStart: Point2 | null;
   navmeshEnd: Point2 | null;
   isExitRoute: boolean;
@@ -225,7 +225,7 @@ function FloorplanSvgLayersImpl({
   stairs,
   doors,
   storeyNavmesh,
-  pathD,
+  pathPoints,
   navmeshStart,
   navmeshEnd,
   isExitRoute,
@@ -244,6 +244,7 @@ function FloorplanSvgLayersImpl({
   routeStroke,
   selectedStroke,
 }: FloorplanSvgLayersProps) {
+  const routeD = smoothPolylinePathD(pathPoints);
   return (
     <>
       {planDisplayMode === "ifc" ? (
@@ -535,9 +536,9 @@ function FloorplanSvgLayersImpl({
         </>
       )}
 
-      {layers.route && pathD ? (
+      {layers.route && routeD ? (
         <path
-          d={pathD}
+          d={routeD}
           fill="none"
           stroke="#93c5fd"
           strokeWidth={routeHalo}
@@ -546,9 +547,9 @@ function FloorplanSvgLayersImpl({
           opacity={0.85}
         />
       ) : null}
-      {layers.route && pathD ? (
+      {layers.route && routeD ? (
         <path
-          d={pathD}
+          d={routeD}
           fill="none"
           stroke="#1d4ed8"
           strokeWidth={routeStroke}

@@ -36,6 +36,38 @@ export function toViewBox(v: PlanView) {
   return `${v.minX} ${-v.maxY} ${viewWidth(v)} ${viewHeight(v)}`;
 }
 
+/**
+ * Smooth an ordered polyline into a Catmull-Rom-through-cubic-Bezier SVG path
+ * (uniform parametrization, tension 1/6, clamped end tangents by duplicating
+ * the first/last point). A plain `M..L..L..` polyline shows every A*
+ * waypoint as a hard corner; the 3D viewer draws the exact same route point
+ * data through THREE.CatmullRomCurve3 for its tube, so without this the flat
+ * 2D route reads as noticeably more jagged than 3D even though the
+ * underlying path is identical (and already string-pulled — see
+ * simplifyLocalPath in geometric-path.ts). Purely a display curve: the
+ * points it interpolates between are unchanged, so it doesn't affect
+ * anything but how the line is drawn.
+ */
+export function smoothPolylinePathD(points: Point2[]): string {
+  const n = points.length;
+  if (n < 2) return "";
+  if (n === 2) return `M${points[0]!.x} ${points[0]!.y} L${points[1]!.x} ${points[1]!.y}`;
+  const at = (i: number) => points[Math.max(0, Math.min(n - 1, i))]!;
+  let d = `M${points[0]!.x} ${points[0]!.y}`;
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = at(i - 1);
+    const p1 = at(i);
+    const p2 = at(i + 1);
+    const p3 = at(i + 2);
+    const c1x = p1.x + (p2.x - p0.x) / 6;
+    const c1y = p1.y + (p2.y - p0.y) / 6;
+    const c2x = p2.x - (p3.x - p1.x) / 6;
+    const c2y = p2.y - (p3.y - p1.y) / 6;
+    d += ` C${c1x} ${c1y} ${c2x} ${c2y} ${p2.x} ${p2.y}`;
+  }
+  return d;
+}
+
 export function boundsFromPoints(points: Point2[], padRatio = 0.08): PlanView | null {
   if (!points.length) return null;
   let minX = Infinity;
