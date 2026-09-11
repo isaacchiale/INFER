@@ -1040,9 +1040,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
               </div>
             ) : null}
 
-            {planDisplayMode === "navmesh" ? (
-              <ShareRouteButton navmeshRoute={navmeshRoute} footprintsDocument={footprintsDocument} />
-            ) : null}
+            <ShareRouteButton navmeshRoute={navmeshRoute} footprintsDocument={footprintsDocument} />
           </div>
 
           <button
