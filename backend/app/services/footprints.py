@@ -30,6 +30,7 @@ import ifcopenshell.util.placement
 from app.schemas.footprints import (
     DoorPortal,
     FootprintsDocument,
+    FurnitureFootprint,
     OpeningPortal,
     Point2D,
     SpaceFootprint,
@@ -46,6 +47,10 @@ logger = logging.getLogger(__name__)
 _XY_NDIGITS = 4
 # Douglas–Peucker simplify epsilon (metres) for noisy outlines.
 _SIMPLIFY_EPS_M = 0.05
+# Drop furniture hulls smaller than this (m^2) — wall-mounted clocks, picture
+# frames, and other near-zero-footprint items that would clutter the local
+# pathfinding obstacle set without ever actually blocking a walkable route.
+_MIN_FURNITURE_AREA_M2 = 0.05
 
 
 def _unique_xy(points: Iterable[tuple[float, float]], tol: float = 1e-6) -> list[tuple[float, float]]:
@@ -898,6 +903,48 @@ def _wall_footprint(ifc, wall) -> WallFootprint:
     )
 
 
+def _furniture_footprint(ifc, item) -> FurnitureFootprint | None:
+    """Furniture uses the same hull / placement-bbox waterfall as walls, but a
+    *measured* hull under `_MIN_FURNITURE_AREA_M2` is dropped rather than kept
+    or re-approximated — most furniture-typed elements (wall art, small
+    fixtures) have no real footprint a person could collide with, and keeping
+    them would clutter the local pathfinding obstacle set for no benefit.
+    This only applies when the mesh gave us a real (small) measurement; if
+    there's no mesh at all we still fall through to the placement-bbox guess,
+    same as walls, rather than assuming "no mesh" means "tiny"."""
+    gid = _gid(item)
+    storey = _storey_gid(ifc, item)
+    name = _name(item)
+
+    xy = _unique_xy(_mesh_xy_points(item))
+    if len(xy) >= 3:
+        hull = _convex_hull(xy)
+        if len(hull) >= 3:
+            if abs(_signed_area(hull)) < _MIN_FURNITURE_AREA_M2:
+                return None
+            return FurnitureFootprint(
+                global_id=gid,
+                name=name,
+                storey_global_id=storey,
+                polygon=_to_points(hull),
+                incomplete=False,
+                method="ifc_mesh_xy_hull",
+            )
+
+    bbox = _bbox_polygon_from_placement(item)
+    if bbox is not None:
+        return FurnitureFootprint(
+            global_id=gid,
+            name=name,
+            storey_global_id=storey,
+            polygon=_to_points(bbox),
+            incomplete=False,
+            method="ifc_placement_bbox",
+        )
+
+    return None
+
+
 def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
     """
     Derive footprints for spaces, doors, openings, stairs, and walls used by
@@ -953,6 +1000,20 @@ def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
         seen_wall.add(gid)
         walls.append(_wall_footprint(ifc, wall))
 
+    # IfcFurniture (IFC4+) is a subtype of IfcFurnishingElement, so this one
+    # query already covers both schema versions without needing a separate,
+    # schema-conditional IfcFurniture lookup.
+    furniture: list[FurnitureFootprint] = []
+    seen_furniture: set[str] = set()
+    for item in ifc.by_type("IfcFurnishingElement"):
+        gid = _gid(item)
+        if not gid or gid in seen_furniture:
+            continue
+        seen_furniture.add(gid)
+        footprint = _furniture_footprint(ifc, item)
+        if footprint is not None:
+            furniture.append(footprint)
+
     return FootprintsDocument(
         model_id=model_id,
         storeys=storeys,
@@ -961,4 +1022,5 @@ def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
         openings=openings,
         stairs=stairs,
         walls=walls,
+        furniture=furniture,
     )

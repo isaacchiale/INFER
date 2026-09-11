@@ -1,7 +1,13 @@
 import { memo } from "react";
 import { buildDoorGlyph } from "@/lib/door-symbol";
 import type { Point2 } from "@/lib/floorplan-camera";
-import type { DoorPortal, SpaceFootprint, StairFootprint, WallFootprint } from "@/types/footprints";
+import type {
+  DoorPortal,
+  FurnitureFootprint,
+  SpaceFootprint,
+  StairFootprint,
+  WallFootprint,
+} from "@/types/footprints";
 import type { NavmeshPortal, NavmeshRegion, StoreyNavmesh } from "@/lib/navmesh";
 
 /**
@@ -19,6 +25,11 @@ export const PORTAL_COLORS = {
   blocked: "#94a3b8", // gray
 } as const;
 
+/** Fixed regardless of theme, like doors' amber — furniture obstacles need
+ * to read distinctly from both wall poché shades (light and dark). */
+const FURNITURE_FILL = "#0d9488"; // teal-600
+const FURNITURE_STROKE = "#0f766e"; // teal-700
+
 /** Typical tread depth (metres) — world-space, same units as the footprint geometry. */
 const STAIR_TREAD_SPACING_M = 0.28;
 
@@ -29,7 +40,7 @@ export type FloorplanPalette = {
   canvasBg: string;
 };
 
-export type PlanLayer = "spaces" | "walls" | "doors" | "stairs" | "route";
+export type PlanLayer = "spaces" | "walls" | "doors" | "stairs" | "furniture" | "route";
 
 function polygonPathD(polygon: Point2[]): string {
   return polygon.map((p, i) => `${i === 0 ? "M" : "L"}${p.x} ${p.y}`).join(" ") + " Z";
@@ -170,6 +181,7 @@ export type FloorplanSvgLayersProps = {
   planDisplayMode: "ifc" | "navmesh";
   layers: Record<PlanLayer, boolean>;
   walls: WallFootprint[];
+  furniture: FurnitureFootprint[];
   spaces: SpaceFootprint[];
   stairs: StairFootprint[];
   doors: DoorPortal[];
@@ -208,6 +220,7 @@ function FloorplanSvgLayersImpl({
   planDisplayMode,
   layers,
   walls,
+  furniture,
   spaces,
   stairs,
   doors,
@@ -317,6 +330,20 @@ function FloorplanSvgLayersImpl({
                     className="pointer-events-none"
                   />
                 </g>
+              ))
+            : null}
+          {layers.furniture
+            ? furniture.map((item) => (
+                <path
+                  key={`furniture:${item.global_id}`}
+                  d={polygonPathD(item.polygon)}
+                  fill={FURNITURE_FILL}
+                  fillOpacity={0.55}
+                  stroke={FURNITURE_STROKE}
+                  strokeWidth={roomStroke}
+                >
+                  <title>{item.name ? `Furniture: ${item.name}` : "Furniture"}</title>
+                </path>
               ))
             : null}
           {layers.doors

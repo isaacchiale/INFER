@@ -10,6 +10,7 @@ import {
   localPathInPolygon,
   pointInSpace,
   wallsOverlappingSpace,
+  furnitureOverlappingSpace,
   doorwayVoidsInSpace,
   hasLineOfSight,
   MinHeap,
@@ -401,7 +402,10 @@ function localWalk(
 ): Point2D[] {
   const space = spaceFootprintForRegion(footprints, region);
   if (space && footprints) {
-    const obstacles = wallsOverlappingSpace(footprints, space);
+    const obstacles = [
+      ...wallsOverlappingSpace(footprints, space),
+      ...furnitureOverlappingSpace(footprints, space),
+    ];
     const voids = doorwayVoidsInSpace(footprints, space);
     return localPathInPolygon(
       start,
@@ -436,7 +440,10 @@ function regionGeometry(
   const space = spaceFootprintForRegion(footprints, region);
   if (!space || !footprints) return { obstacles: [], voids: [] };
   return {
-    obstacles: wallsOverlappingSpace(footprints, space),
+    obstacles: [
+      ...wallsOverlappingSpace(footprints, space),
+      ...furnitureOverlappingSpace(footprints, space),
+    ],
     voids: doorwayVoidsInSpace(footprints, space),
   };
 }

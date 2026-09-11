@@ -14,6 +14,7 @@ import type { NavmeshRoute } from "@/state/infer-store";
 
 const ROOM_COLOR = 0xcbd5e1;
 const WALL_COLOR = 0xe7e2d8;
+const FURNITURE_COLOR = 0x0d9488;
 const TUBE_COLOR = 0x1d4ed8;
 const START_COLOR = 0x22c55e;
 const END_COLOR = 0xef4444;
@@ -24,6 +25,10 @@ const ROOM_SLAB_HEIGHT_M = 0.03;
 /** Real wall height isn't in the footprint schema (2D polygons only) — a
  * typical ceiling height so the export reads as a building, not a floorplan. */
 const WALL_HEIGHT_M = 2.4;
+/** Furniture height isn't in the schema either (plan-only obstacle extraction) —
+ * a generic desk/cabinet height, shorter than a wall so the route tube stays
+ * visible passing beside it rather than reading as another wall. */
+const FURNITURE_HEIGHT_M = 0.75;
 
 type StoreySegment = { storeyId: string; points: Point2D[] };
 
@@ -126,6 +131,7 @@ export function buildRouteShareScene(
   // one scene, so add each such wall once (at the first segment it matches)
   // instead of stacking a duplicate copy at every storey's elevation.
   const wallsAdded = new Set<string>();
+  const furnitureAdded = new Set<string>();
 
   for (const segment of segments) {
     const elevationM = elevations.get(segment.storeyId) ?? 0;
@@ -142,6 +148,14 @@ export function buildRouteShareScene(
       if (wallsAdded.has(wall.global_id)) continue;
       wallsAdded.add(wall.global_id);
       scene.add(prism(wall.polygon, elevationM, WALL_HEIGHT_M, WALL_COLOR));
+    }
+
+    for (const item of footprints.furniture ?? []) {
+      if (item.incomplete || item.polygon.length < 3) continue;
+      if (item.storey_global_id != null && item.storey_global_id !== segment.storeyId) continue;
+      if (furnitureAdded.has(item.global_id)) continue;
+      furnitureAdded.add(item.global_id);
+      scene.add(prism(item.polygon, elevationM, FURNITURE_HEIGHT_M, FURNITURE_COLOR));
     }
 
     const tube = routeTube(segment.points, elevationM);

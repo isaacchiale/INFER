@@ -10,6 +10,7 @@ import {
   findNearestExitPath,
   regionAtPoint,
 } from "./navmesh.ts";
+import { pointInPolygon } from "./geometric-path.ts";
 import type { ConnectivityGraph } from "../types/graph.ts";
 import type { FootprintsDocument } from "../types/footprints.ts";
 
@@ -171,6 +172,40 @@ describe("navmesh", () => {
     });
     const path = findNavmeshPath(mesh, { x: 1, y: 2 }, { x: 7, y: 2 }, footprints);
     assert.equal(path.found, false);
+  });
+
+  it("routes around a furniture obstacle inside a single region", () => {
+    // A desk-shaped strip splitting room A almost top-to-bottom, directly in
+    // the way of the straight line between the two pick points below —
+    // proves furniture actually reaches findNavmeshPath's local A*, not just
+    // the low-level astarInPolygon it happens to share code with.
+    const desk = {
+      global_id: "Desk",
+      name: "Desk",
+      storey_global_id: "S1",
+      polygon: [
+        { x: 1.8, y: 0.5 },
+        { x: 2.2, y: 0.5 },
+        { x: 2.2, y: 3.5 },
+        { x: 1.8, y: 3.5 },
+      ],
+      incomplete: false,
+      method: "ifc_placement_bbox" as const,
+    };
+    const fp: FootprintsDocument = { ...footprints, furniture: [desk] };
+    const mesh = buildStoreyNavmesh(fp, graph, "S1");
+
+    const path = findNavmeshPath(mesh, { x: 0.5, y: 2 }, { x: 3.5, y: 2 }, fp);
+    assert.equal(path.found, true);
+    for (const p of path.points) {
+      assert.ok(!pointInPolygon(p.x, p.y, desk.polygon), `path cut through the desk at ${p.x},${p.y}`);
+    }
+    // The direct straight line runs at y=2, straight through the desk — a
+    // real detour must leave that line, not hug it.
+    assert.ok(
+      path.points.some((p) => Math.abs(p.y - 2) > 0.3),
+      "expected a detour around the desk, not a straight line through it",
+    );
   });
 
   describe("exit portals", () => {

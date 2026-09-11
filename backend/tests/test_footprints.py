@@ -186,6 +186,81 @@ def test_footprints_placement_bbox_happy_path(tmp_path):
     assert door_fp.point.y == pytest.approx(3.0)
 
 
+def test_footprints_furniture_placement_bbox_and_tiny_items_dropped(tmp_path, monkeypatch):
+    """IfcFurnishingElement/IfcFurniture extract via the same bbox waterfall as
+    walls; a placement with no OverallWidth/OverallDepth defaults to a 1x1 m
+    box (well above the drop threshold) while an explicit sub-threshold hull
+    (via a degenerate mesh) is dropped rather than kept."""
+    ifc_path = tmp_path / "furniture.ifc"
+    f = ifcopenshell.file(schema="IFC4")
+    project = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="T")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    site = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcSite", name="S")
+    building = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcBuilding", name="B")
+    storey = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingStorey", name="L1"
+    )
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=project, products=[site])
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=site, products=[building])
+    ifcopenshell.api.run(
+        "aggregate.assign_object", f, relating_object=building, products=[storey]
+    )
+
+    desk = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcFurnishingElement", name="Desk"
+    )
+    furniture_typed = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcFurniture", name="Cabinet"
+    )
+    ifcopenshell.api.run(
+        "spatial.assign_container", f, relating_structure=storey, products=[desk, furniture_typed]
+    )
+    ifcopenshell.api.run(
+        "geometry.edit_object_placement",
+        f,
+        product=desk,
+        matrix=[[1, 0, 0, 4], [0, 1, 0, 6], [0, 0, 1, 0], [0, 0, 0, 1]],
+        is_si=True,
+    )
+    ifcopenshell.api.run(
+        "geometry.edit_object_placement",
+        f,
+        product=furniture_typed,
+        matrix=[[1, 0, 0, 9], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]],
+        is_si=True,
+    )
+
+    f.write(str(ifc_path))
+
+    doc = footprints_service.build_footprints("test-furniture", str(ifc_path))
+    assert len(doc.furniture) == 2
+    by_name = {ff.name: ff for ff in doc.furniture}
+
+    desk_fp = by_name["Desk"]
+    assert desk_fp.incomplete is False
+    assert desk_fp.method == "ifc_placement_bbox"
+    xs = [p.x for p in desk_fp.polygon]
+    ys = [p.y for p in desk_fp.polygon]
+    assert min(xs) == pytest.approx(3.5)
+    assert max(xs) == pytest.approx(4.5)
+    assert min(ys) == pytest.approx(5.5)
+    assert max(ys) == pytest.approx(6.5)
+
+    # IfcFurniture (IFC4 subtype of IfcFurnishingElement) is picked up by the
+    # same IfcFurnishingElement query, not double-counted.
+    cabinet_fp = by_name["Cabinet"]
+    assert cabinet_fp.incomplete is False
+    assert cabinet_fp.method == "ifc_placement_bbox"
+
+    # A mesh hull well under _MIN_FURNITURE_AREA_M2 (e.g. a wall-mounted
+    # clock) is dropped entirely rather than kept as a tiny obstacle — force
+    # the mesh path to return a small square so build_footprints must fall
+    # through to it (also confirms it beats the always-succeeding bbox path).
+    tiny_hull_xy = [(0.0, 0.0), (0.05, 0.0), (0.05, 0.05), (0.0, 0.05)]
+    monkeypatch.setattr(footprints_service, "_mesh_xy_points", lambda element: tiny_hull_xy)
+    assert footprints_service._furniture_footprint(f, desk) is None
+
+
 def test_door_operation_type_extracted_when_set(tmp_path):
     """IfcDoor.OperationType passes through untouched; unset/NOTDEFINED stays None."""
     ifc_path = tmp_path / "door_ops.ifc"

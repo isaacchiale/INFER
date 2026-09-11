@@ -120,6 +120,22 @@ class WallFootprint(BaseModel):
     ] = "unavailable"
 
 
+class FurnitureFootprint(BaseModel):
+    """2D plan outline for an IfcFurnishingElement/IfcFurniture (top-down hull),
+    used as a local-pathfinding obstacle alongside walls."""
+
+    global_id: str
+    name: str = ""
+    storey_global_id: str | None = None
+    polygon: list[Point2D] = Field(default_factory=list)
+    incomplete: bool = False
+    method: Literal[
+        "ifc_mesh_xy_hull",
+        "ifc_placement_bbox",
+        "unavailable",
+    ] = "unavailable"
+
+
 class FootprintsDocument(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     model_id: str
@@ -131,3 +147,4 @@ class FootprintsDocument(BaseModel):
     openings: list[OpeningPortal] = Field(default_factory=list)
     stairs: list[StairFootprint] = Field(default_factory=list)
     walls: list[WallFootprint] = Field(default_factory=list)
+    furniture: list[FurnitureFootprint] = Field(default_factory=list)

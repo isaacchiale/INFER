@@ -18,7 +18,6 @@ import type {
   Point2D,
   SpaceFootprint,
   StairFootprint,
-  WallFootprint,
 } from "@/types/footprints";
 import type { ConnectivityGraph } from "@/types/graph";
 
@@ -259,43 +258,66 @@ export function wallsOverlappingSpace(
 
   const out: Point2D[][] = [];
   for (const wall of walls) {
-    if (!wallOverlapsSpace(wall, space)) continue;
+    if (!footprintOverlapsSpace(wall, space)) continue;
     out.push(wall.polygon);
   }
   return out;
 }
 
-function wallOverlapsSpace(wall: WallFootprint, space: SpaceFootprint): boolean {
-  if (wall.incomplete || wall.polygon.length < 3) return false;
+/**
+ * IfcFurnishingElement footprints (desks, cabinets, shelving) that overlap a
+ * space. Same shape as {@link wallsOverlappingSpace}: fed straight into the
+ * local A* cost map's `obstacles`, which is otherwise obstacle-source-agnostic.
+ */
+export function furnitureOverlappingSpace(
+  footprints: FootprintsDocument,
+  space: SpaceFootprint,
+): Point2D[][] {
+  const furniture = footprints.furniture ?? [];
+  if (!furniture.length || space.polygon.length < 3) return [];
+
+  const out: Point2D[][] = [];
+  for (const item of furniture) {
+    if (!footprintOverlapsSpace(item, space)) continue;
+    out.push(item.polygon);
+  }
+  return out;
+}
+
+function footprintOverlapsSpace(
+  footprint: { incomplete: boolean; polygon: Point2D[]; storey_global_id: string | null },
+  space: SpaceFootprint,
+): boolean {
+  if (footprint.incomplete || footprint.polygon.length < 3) return false;
   if (
-    wall.storey_global_id &&
+    footprint.storey_global_id &&
     space.storey_global_id &&
-    wall.storey_global_id !== space.storey_global_id
+    footprint.storey_global_id !== space.storey_global_id
   ) {
     return false;
   }
 
-  for (const p of wall.polygon) {
+  for (const p of footprint.polygon) {
     if (pointInSpace(p.x, p.y, space.polygon, space.holes)) return true;
   }
-  const wc = polygonCentroid(wall.polygon);
-  if (wc && pointInSpace(wc.x, wc.y, space.polygon, space.holes)) return true;
+  const fc = polygonCentroid(footprint.polygon);
+  if (fc && pointInSpace(fc.x, fc.y, space.polygon, space.holes)) return true;
 
   for (const p of space.polygon) {
-    if (pointInPolygon(p.x, p.y, wall.polygon)) return true;
+    if (pointInPolygon(p.x, p.y, footprint.polygon)) return true;
   }
   for (const hole of space.holes ?? []) {
     for (const p of hole) {
-      if (pointInPolygon(p.x, p.y, wall.polygon)) return true;
+      if (pointInPolygon(p.x, p.y, footprint.polygon)) return true;
     }
   }
 
-  // Thin walls can cross the room without vertices inside either ring —
-  // sample edge midpoints.
-  const n = wall.polygon.length;
+  // Thin obstacles (e.g. a wall) can cross the room without vertices inside
+  // either ring — sample edge midpoints.
+  const n = footprint.polygon.length;
   for (let i = 0; i < n; i++) {
-    const a = wall.polygon[i]!;
-    const b = wall.polygon[(i + 1) % n]!;
+    const a = footprint.polygon[i]!;
+    const b = footprint.polygon[(i + 1) % n]!;
     const mx = 0.5 * (a.x + b.x);
     const my = 0.5 * (a.y + b.y);
     if (pointInSpace(mx, my, space.polygon, space.holes)) return true;
@@ -351,14 +373,17 @@ export function doorwayVoidsInSpace(
   return out;
 }
 
-/** Local A* inside a space, including overlapping IfcWall obstacles. */
+/** Local A* inside a space, including overlapping IfcWall and furniture obstacles. */
 function localPathInSpace(
   start: Point2D,
   goal: Point2D,
   space: SpaceFootprint,
   footprints: FootprintsDocument,
 ): Point2D[] {
-  const obstacles = wallsOverlappingSpace(footprints, space);
+  const obstacles = [
+    ...wallsOverlappingSpace(footprints, space),
+    ...furnitureOverlappingSpace(footprints, space),
+  ];
   const attempt = astarInPolygon(
     start,
     goal,

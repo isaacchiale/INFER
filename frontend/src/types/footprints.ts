@@ -79,6 +79,15 @@ export type WallFootprint = {
   method: "ifc_mesh_xy_hull" | "ifc_placement_bbox" | "unavailable";
 };
 
+export type FurnitureFootprint = {
+  global_id: string;
+  name: string;
+  storey_global_id: string | null;
+  polygon: Point2D[];
+  incomplete: boolean;
+  method: "ifc_mesh_xy_hull" | "ifc_placement_bbox" | "unavailable";
+};
+
 export type FootprintsDocument = {
   schema_version: "1.0";
   model_id: string;
@@ -93,4 +102,6 @@ export type FootprintsDocument = {
   stairs?: StairFootprint[];
   /** Optional for older footprints.json built before wall-strip heal. */
   walls?: WallFootprint[];
+  /** Optional for older footprints.json built before furniture obstacle extraction. */
+  furniture?: FurnitureFootprint[];
 };

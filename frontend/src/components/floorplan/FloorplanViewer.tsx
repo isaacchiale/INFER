@@ -69,6 +69,7 @@ const DEFAULT_PLAN_LAYERS: Record<PlanLayer, boolean> = {
   walls: true,
   doors: true,
   stairs: true,
+  furniture: true,
   route: true,
 };
 
@@ -471,6 +472,16 @@ export function FloorplanViewer({ className }: { className?: string }) {
       if (w.incomplete || w.polygon.length < 3) return false;
       if (w.storey_global_id == null) return true;
       return w.storey_global_id === displayStoreyId;
+    });
+  }, [footprintsDocument, displayStoreyId]);
+
+  /** Furniture: same storey-matching rule as walls. */
+  const furniture = useMemo(() => {
+    const list = footprintsDocument?.furniture ?? [];
+    return list.filter((item) => {
+      if (item.incomplete || item.polygon.length < 3) return false;
+      if (item.storey_global_id == null) return true;
+      return item.storey_global_id === displayStoreyId;
     });
   }, [footprintsDocument, displayStoreyId]);
 
@@ -1073,6 +1084,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     planDisplayMode={planDisplayMode}
                     layers={layers}
                     walls={walls}
+                    furniture={furniture}
                     spaces={spaces}
                     stairs={stairs}
                     doors={doors}
@@ -1272,6 +1284,16 @@ export function FloorplanViewer({ className }: { className?: string }) {
                             <span
                               className="inline-block h-0.5 w-4 border-t-2 border-dashed"
                               style={{ borderColor: "#7c3aed" }}
+                            />
+                          ),
+                        },
+                        {
+                          key: "furniture" as const,
+                          label: "Furniture",
+                          swatch: (
+                            <span
+                              className="inline-block size-2.5 border"
+                              style={{ background: "#0d9488", borderColor: "#0f766e" }}
                             />
                           ),
                         },

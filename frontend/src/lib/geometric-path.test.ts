@@ -4,6 +4,7 @@ import {
   buildGeometricPath,
   continuousPolylineForStorey,
   doorwayVoidsInSpace,
+  furnitureOverlappingSpace,
   localPathInPolygon,
   pathSegmentsForStorey,
   pointInPolygon,
@@ -248,6 +249,57 @@ describe("geometric-path", () => {
       ],
     };
     const obs = wallsOverlappingSpace(fp, space);
+    assert.equal(obs.length, 1);
+    assert.equal(obs[0]![0]!.x, 15);
+  });
+
+  it("furnitureOverlappingSpace picks same-storey furniture that intersects the room", () => {
+    const space = footprints.spaces[1]!; // corridor B
+    const fp: FootprintsDocument = {
+      ...footprints,
+      furniture: [
+        {
+          global_id: "F-in",
+          name: "Desk",
+          storey_global_id: "S1",
+          polygon: [
+            { x: 15, y: 2 },
+            { x: 16, y: 2 },
+            { x: 16, y: 8 },
+            { x: 15, y: 8 },
+          ],
+          incomplete: false,
+          method: "ifc_placement_bbox",
+        },
+        {
+          global_id: "F-other-floor",
+          name: "Other",
+          storey_global_id: "S2",
+          polygon: [
+            { x: 15, y: 2 },
+            { x: 16, y: 2 },
+            { x: 16, y: 8 },
+            { x: 15, y: 8 },
+          ],
+          incomplete: false,
+          method: "ifc_placement_bbox",
+        },
+        {
+          global_id: "F-outside",
+          name: "Outside",
+          storey_global_id: "S1",
+          polygon: [
+            { x: 100, y: 0 },
+            { x: 101, y: 0 },
+            { x: 101, y: 1 },
+            { x: 100, y: 1 },
+          ],
+          incomplete: false,
+          method: "ifc_placement_bbox",
+        },
+      ],
+    };
+    const obs = furnitureOverlappingSpace(fp, space);
     assert.equal(obs.length, 1);
     assert.equal(obs[0]![0]!.x, 15);
   });
