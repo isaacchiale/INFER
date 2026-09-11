@@ -1,8 +1,12 @@
+import os
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.main import create_app
+from app.services import storage
 
 
 @pytest.fixture()
@@ -50,3 +54,26 @@ def test_unknown_share_id_404s(client: TestClient):
 def test_path_traversal_share_id_404s(client: TestClient):
     response = client.get("/route-shares/..%2f..%2f..%2fetc%2fpasswd.glb")
     assert response.status_code == 404
+
+
+def test_expired_shares_swept_on_next_upload(client: TestClient):
+    """The router docstring calls this "ephemeral hosting" — verify old
+    shares actually get deleted rather than accumulating forever."""
+    old = client.post("/route-shares", content=b"old-share-bytes")
+    assert old.status_code == 201
+    old_id = old.json()["share_id"]
+
+    settings = get_settings()
+    old_path = storage.route_share_path(settings, old_id)
+    assert old_path.is_file()
+    # Back-date it past the expiry window instead of waiting real time.
+    cutoff = time.time() - (storage.ROUTE_SHARE_MAX_AGE_DAYS + 1) * 86400
+    os.utime(old_path, (cutoff, cutoff))
+
+    new = client.post("/route-shares", content=b"new-share-bytes")
+    assert new.status_code == 201
+    new_id = new.json()["share_id"]
+
+    assert not old_path.is_file()
+    assert client.get(f"/route-shares/{old_id}.glb").status_code == 404
+    assert client.get(f"/route-shares/{new_id}.glb").status_code == 200

@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     # Comma-separated origins for the external frontend (local dev defaults).
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000"
     data_dir: str = str(REPO_ROOT / "data")
+    # Generous cap for a single-building IFC — guards against an accidental
+    # huge upload exhausting disk, not a tight production-grade limit.
+    max_upload_mb: int = 500
+
+    @property
+    def max_upload_bytes(self) -> int:
+        return self.max_upload_mb * 1024 * 1024
 
     @property
     def cors_origin_list(self) -> list[str]:

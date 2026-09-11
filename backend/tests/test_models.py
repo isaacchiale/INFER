@@ -1,4 +1,6 @@
 import hashlib
+import io
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,14 @@ from app.config import get_settings
 from app.main import create_app
 
 FIXTURE = Path(__file__).parent / "fixtures" / "minimal.ifc"
+
+
+def _zip_bytes(members: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
 
 
 @pytest.fixture()
@@ -74,3 +84,62 @@ def test_upload_extract_and_immutable_source(client: TestClient):
 
 def test_missing_model(client: TestClient):
     assert client.get("/models/does-not-exist").status_code == 404
+
+
+def test_ifczip_upload_extracts_inner_ifc(client: TestClient):
+    """.ifczip is advertised as a supported upload type in the frontend
+    picker — the stored model.ifc must be the real unzipped STEP text
+    ifcopenshell can open, not the raw zip bytes under a misleading name."""
+    inner_bytes = FIXTURE.read_bytes()
+    payload = _zip_bytes({"building/model.ifc": inner_bytes})
+
+    upload = client.post(
+        "/models",
+        files={"file": ("archive.ifczip", payload, "application/octet-stream")},
+    )
+    assert upload.status_code == 201
+    model_id = upload.json()["model_id"]
+
+    extract = client.post(f"/models/{model_id}/extract")
+    assert extract.status_code == 200
+    assert any(s["name"] == "Room 101" for s in extract.json()["spaces"])
+
+    settings = get_settings()
+    stored = (settings.data_path / "models" / model_id / "model.ifc").read_bytes()
+    assert hashlib.sha256(stored).hexdigest() == hashlib.sha256(inner_bytes).hexdigest()
+
+
+def test_ifczip_upload_rejects_invalid_zip(client: TestClient):
+    response = client.post(
+        "/models",
+        files={"file": ("archive.ifczip", b"not a zip file", "application/octet-stream")},
+    )
+    assert response.status_code == 400
+
+
+def test_ifczip_upload_rejects_zip_with_no_ifc_inside(client: TestClient):
+    payload = _zip_bytes({"readme.txt": b"no ifc here"})
+    response = client.post(
+        "/models",
+        files={"file": ("archive.ifczip", payload, "application/octet-stream")},
+    )
+    assert response.status_code == 400
+
+
+def test_upload_rejects_oversized_file(client: TestClient, monkeypatch):
+    monkeypatch.setenv("MAX_UPLOAD_MB", "0")
+    get_settings.cache_clear()
+    try:
+        payload = FIXTURE.read_bytes()
+        response = client.post(
+            "/models",
+            files={"file": ("minimal.ifc", payload, "application/octet-stream")},
+        )
+        assert response.status_code == 400
+
+        # No orphaned model directory left behind after a rejected upload.
+        settings = get_settings()
+        models_root = settings.data_path / "models"
+        assert not models_root.exists() or not any(models_root.iterdir())
+    finally:
+        get_settings.cache_clear()

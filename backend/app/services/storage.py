@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,6 +72,56 @@ def read_meta(settings: Settings, model_id: str) -> ModelMetadata:
     return ModelMetadata.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+async def _stream_upload(settings: Settings, upload: UploadFile, destination: Path) -> int:
+    """Stream to disk in chunks (never buffers the whole file in memory),
+    aborting once the configured size cap is exceeded rather than after
+    writing an unbounded amount to disk."""
+    size = 0
+    with destination.open("wb") as out:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > settings.max_upload_bytes:
+                raise InvalidIfcUploadError(
+                    f"File exceeds the {settings.max_upload_mb} MB upload limit."
+                )
+            out.write(chunk)
+    return size
+
+
+async def _save_ifczip_upload(settings: Settings, upload: UploadFile, destination: Path) -> int:
+    """Unzip at upload time so every downstream consumer (extract/footprints/
+    graph builders) can keep calling ifcopenshell.open() on the fixed
+    `model.ifc` path and get real STEP text — mirrors what
+    ifcopenshell.open() does internally for a .ifcZIP path (extract the inner
+    .ifc/.ifcXML to a temp dir and open that), just persisted at the model's
+    well-known location instead of a throwaway temp dir that vanishes after
+    that one open() call."""
+    with tempfile.NamedTemporaryFile(suffix=".ifczip", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        await _stream_upload(settings, upload, tmp_path)
+        try:
+            with zipfile.ZipFile(tmp_path) as zf:
+                inner = next(
+                    (n for n in zf.namelist() if Path(n).suffix.lower() in (".ifc", ".ifcxml")),
+                    None,
+                )
+                if inner is None:
+                    raise InvalidIfcUploadError(
+                        "No .ifc or .ifcXML file found inside the .ifczip archive."
+                    )
+                with zf.open(inner) as src, destination.open("wb") as out:
+                    shutil.copyfileobj(src, out)
+        except zipfile.BadZipFile as exc:
+            raise InvalidIfcUploadError("Uploaded .ifczip is not a valid zip archive.") from exc
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return destination.stat().st_size
+
+
 async def save_upload(settings: Settings, upload: UploadFile) -> ModelMetadata:
     filename = upload.filename or "upload.ifc"
     suffix = Path(filename).suffix.lower()
@@ -81,15 +134,18 @@ async def save_upload(settings: Settings, upload: UploadFile) -> ModelMetadata:
     directory = model_dir(settings, model_id)
     directory.mkdir(parents=True, exist_ok=False)
 
-    destination = ifc_path(settings, model_id)
-    size = 0
-    with destination.open("wb") as out:
-        while True:
-            chunk = await upload.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            out.write(chunk)
+    try:
+        destination = ifc_path(settings, model_id)
+        if suffix == ".ifczip":
+            size = await _save_ifczip_upload(settings, upload, destination)
+        else:
+            size = await _stream_upload(settings, upload, destination)
+    except Exception:
+        # Don't leave a half-written model directory behind on any failure
+        # (size cap, bad zip, missing inner IFC) — the model_id was never
+        # handed back to the caller, so nothing else could be pointing at it.
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
 
     meta = ModelMetadata(
         model_id=model_id,
@@ -170,10 +226,33 @@ def route_share_path(settings: Settings, share_id: str) -> Path:
     return _route_shares_root(settings) / f"{share_id}.glb"
 
 
+# Router docstring calls this "ephemeral hosting" — without an actual sweep
+# it was permanent hosting with an expiry date nobody enforced. No task
+# queue or cron in this app, so the cheapest correct trigger is "whenever a
+# new one is created" rather than a background job.
+ROUTE_SHARE_MAX_AGE_DAYS = 7
+
+
+def _sweep_expired_route_shares(settings: Settings) -> None:
+    root = _route_shares_root(settings)
+    if not root.is_dir():
+        return
+    cutoff = datetime.now(timezone.utc).timestamp() - ROUTE_SHARE_MAX_AGE_DAYS * 86400
+    for glb in root.glob("*.glb"):
+        try:
+            if glb.stat().st_mtime < cutoff:
+                glb.unlink(missing_ok=True)
+        except OSError:
+            # Best-effort — a share someone's actively viewing shouldn't
+            # block or fail the upload that triggered this sweep.
+            pass
+
+
 def save_route_share(settings: Settings, data: bytes) -> str:
     """Store an exported route GLB under a fresh random id; returns that id."""
     root = _route_shares_root(settings)
     root.mkdir(parents=True, exist_ok=True)
+    _sweep_expired_route_shares(settings)
     share_id = uuid.uuid4().hex
     route_share_path(settings, share_id).write_bytes(data)
     return share_id
