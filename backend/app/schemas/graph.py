@@ -15,11 +15,15 @@ EdgeMethod = Literal[
     "geom_stair_space",
     "geom_opening_space",
     "topologicpy_adjacency",
+    "indoorgml_transition",
 ]
 
 IFC_BASELINE_METHODS: frozenset[str] = frozenset(
     {
         "ifc_rel_space_boundary",
+        # IndoorGML's State/Transition graph is explicit/authoritative, same
+        # role "ifc_rel_space_boundary" plays for IFC — not an inferred heal.
+        "indoorgml_transition",
     }
 )
 

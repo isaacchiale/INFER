@@ -10,6 +10,10 @@ class ModelMetadata(BaseModel):
     size_bytes: int
     created_at: datetime
     extract_status: Literal["none", "ready", "failed"] = "none"
+    # "ifc" covers both .ifc and .ifczip (normalized to plain STEP text at
+    # upload time). Determines which parser every downstream step reaches
+    # for: ifcopenshell for "ifc", the IndoorGML XML parser for "indoorgml".
+    source_format: Literal["ifc", "indoorgml"] = "ifc"
 
 
 class EntityBase(BaseModel):

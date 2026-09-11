@@ -9,6 +9,7 @@ from app.services import footprints as footprints_service
 from app.services import graph as graph_service
 from app.services import graph_geometry
 from app.services import graph_topologic
+from app.services import indoorgml as indoorgml_service
 from app.services import storage
 
 router = APIRouter(prefix="/models", tags=["models"])
@@ -18,6 +19,10 @@ _VARIANT_DETAIL = {
     "geometry": "Geometry graph not found. Run POST /models/{id}/graph?variant=geometry first.",
     "topologic": "Topologic graph not found. Run POST /models/{id}/graph?variant=topologic first.",
 }
+
+
+def _is_indoorgml(settings, model_id: str) -> bool:
+    return storage.read_meta(settings, model_id).source_format == "indoorgml"
 
 
 @router.post("", response_model=ModelMetadata, status_code=201)
@@ -42,20 +47,23 @@ def get_model(model_id: str) -> ModelMetadata:
 def extract_model(model_id: str) -> EntitiesExtract:
     settings = get_settings()
     try:
-        storage.read_meta(settings, model_id)
+        meta = storage.read_meta(settings, model_id)
     except storage.ModelNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Model not found") from exc
 
-    path = storage.ifc_path(settings, model_id)
+    path = storage.source_path(settings, model_id, meta.source_format)
     try:
-        result = extract_service.extract_entities(model_id, str(path))
+        if meta.source_format == "indoorgml":
+            result, _footprints, _graph = indoorgml_service.parse_indoorgml(model_id, str(path))
+        else:
+            result = extract_service.extract_entities(model_id, str(path))
         storage.save_entities(settings, result)
         storage.update_extract_status(settings, model_id, "ready")
         return result
     except Exception as exc:  # noqa: BLE001 - surface parser failures cleanly
         storage.update_extract_status(settings, model_id, "failed")
         raise HTTPException(
-            status_code=500, detail=f"IFC extraction failed: {exc}"
+            status_code=500, detail=f"Extraction failed: {exc}"
         ) from exc
 
 
@@ -89,8 +97,12 @@ def _ensure_footprints(settings, model_id: str) -> FootprintsDocument:
     try:
         return storage.read_footprints(settings, model_id)
     except storage.ModelNotFoundError:
-        path = storage.ifc_path(settings, model_id)
-        doc = footprints_service.build_footprints(model_id, str(path))
+        meta = storage.read_meta(settings, model_id)
+        path = storage.source_path(settings, model_id, meta.source_format)
+        if meta.source_format == "indoorgml":
+            _entities, doc, _graph = indoorgml_service.parse_indoorgml(model_id, str(path))
+        else:
+            doc = footprints_service.build_footprints(model_id, str(path))
         storage.save_footprints(settings, doc)
         return doc
 
@@ -102,12 +114,24 @@ def build_graph(
 ) -> ConnectivityGraph:
     settings = get_settings()
     try:
-        storage.read_meta(settings, model_id)
+        meta = storage.read_meta(settings, model_id)
     except storage.ModelNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Model not found") from exc
 
-    path = storage.ifc_path(settings, model_id)
+    path = storage.source_path(settings, model_id, meta.source_format)
     try:
+        if meta.source_format == "indoorgml":
+            # IndoorGML's State/Transition graph is already explicit and
+            # authoritative (see IFC_BASELINE_METHODS) — there's no healing
+            # tier to layer on top of it, so every variant just resolves to
+            # the same parsed graph, stamped with whichever variant was
+            # asked for so the frontend's variant-sync UI still behaves.
+            _entities, doc, graph = indoorgml_service.parse_indoorgml(model_id, str(path))
+            graph = graph.model_copy(update={"variant": variant})
+            storage.save_footprints(settings, doc)
+            storage.save_graph(settings, graph, variant)
+            return graph
+
         if variant == "ifc":
             graph = graph_service.build_connectivity_graph(model_id, str(path))
             storage.save_graph(settings, graph, "ifc")
@@ -175,9 +199,20 @@ def live_geometry_graph(
         )
     settings = get_settings()
     try:
-        storage.read_meta(settings, model_id)
+        meta = storage.read_meta(settings, model_id)
     except storage.ModelNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Model not found") from exc
+
+    if meta.source_format == "indoorgml":
+        # Nothing to re-heal: IndoorGML's graph is already explicit, and
+        # excluded-node filtering already happens downstream (navmesh
+        # build) independent of which graph is loaded — just hand back the
+        # same parsed graph rather than running IFC-only reheal logic
+        # against it (graph_geometry.reheal_geometry_graph expects IFC-
+        # shaped footprints/graph and would fail on this source format).
+        path = storage.source_path(settings, model_id, meta.source_format)
+        _entities, _footprints, graph = indoorgml_service.parse_indoorgml(model_id, str(path))
+        return graph.model_copy(update={"variant": "geometry"})
 
     ifc_graph = _ensure_ifc_graph(settings, model_id)
     footprints = _ensure_footprints(settings, model_id)
@@ -204,13 +239,16 @@ def live_geometry_graph(
 def build_footprints(model_id: str) -> FootprintsDocument:
     settings = get_settings()
     try:
-        storage.read_meta(settings, model_id)
+        meta = storage.read_meta(settings, model_id)
     except storage.ModelNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Model not found") from exc
 
-    path = storage.ifc_path(settings, model_id)
+    path = storage.source_path(settings, model_id, meta.source_format)
     try:
-        doc = footprints_service.build_footprints(model_id, str(path))
+        if meta.source_format == "indoorgml":
+            _entities, doc, _graph = indoorgml_service.parse_indoorgml(model_id, str(path))
+        else:
+            doc = footprints_service.build_footprints(model_id, str(path))
         storage.save_footprints(settings, doc)
         return doc
     except Exception as exc:  # noqa: BLE001

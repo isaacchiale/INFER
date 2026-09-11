@@ -30,6 +30,7 @@ class SpaceFootprint(BaseModel):
         "ifc_mesh_xy_outline",
         "ifc_mesh_xy_hull",
         "ifc_placement_bbox",
+        "indoorgml_geometry",
         "unavailable",
     ] = "unavailable"
 
@@ -54,6 +55,8 @@ class DoorPortal(BaseModel):
     method: Literal[
         "ifc_mesh_xy_centroid",
         "ifc_object_placement",
+        "indoorgml_boundary_centroid",
+        "indoorgml_transition_midpoint",
         "unavailable",
     ] = "unavailable"
 

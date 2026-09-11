@@ -10,6 +10,7 @@ from app.config import get_settings
 from app.main import create_app
 
 FIXTURE = Path(__file__).parent / "fixtures" / "minimal.ifc"
+INDOORGML_FIXTURE = Path(__file__).parent / "fixtures" / "sample.indoorgml"
 
 
 def _zip_bytes(members: dict[str, bytes]) -> bytes:
@@ -143,3 +144,55 @@ def test_upload_rejects_oversized_file(client: TestClient, monkeypatch):
         assert not models_root.exists() or not any(models_root.iterdir())
     finally:
         get_settings.cache_clear()
+
+
+def test_indoorgml_upload_extract_footprints_and_graph(client: TestClient):
+    """Full ingest flow (upload -> extract -> footprints -> graph) through
+    the real HTTP API for an IndoorGML file — the same sequence
+    IngestDialog.tsx runs for every upload, IFC or not."""
+    payload = INDOORGML_FIXTURE.read_bytes()
+
+    upload = client.post(
+        "/models",
+        files={"file": ("building.indoorgml", payload, "application/xml")},
+    )
+    assert upload.status_code == 201
+    meta = upload.json()
+    model_id = meta["model_id"]
+    assert meta["source_format"] == "indoorgml"
+
+    extract = client.post(f"/models/{model_id}/extract")
+    assert extract.status_code == 200
+    assert {s["name"] for s in extract.json()["spaces"]} == {"Room A", "Room B"}
+
+    footprints = client.post(f"/models/{model_id}/footprints")
+    assert footprints.status_code == 200
+    fp_body = footprints.json()
+    assert len(fp_body["spaces"]) == 2
+    assert len(fp_body["doors"]) == 1
+
+    # Same default the ingest flow requests for every upload now (see
+    # IngestDialog.tsx) — must not 500 trying to run IFC-only healing.
+    graph = client.post(f"/models/{model_id}/graph", params={"variant": "geometry"})
+    assert graph.status_code == 200
+    graph_body = graph.json()
+    assert graph_body["variant"] == "geometry"
+    assert len(graph_body["nodes"]) == 3  # 2 spaces + 1 door
+    assert len(graph_body["edges"]) == 2
+    assert all(e["method"] == "indoorgml_transition" for e in graph_body["edges"])
+
+    # GET after POST finds the same variant slot that was just saved.
+    fetched_graph = client.get(f"/models/{model_id}/graph", params={"variant": "geometry"})
+    assert fetched_graph.status_code == 200
+    assert len(fetched_graph.json()["edges"]) == 2
+
+    # Live reheal (the geometry-variant "what-if exclusion" endpoint the
+    # frontend calls) must not crash trying to run IFC-only reheal logic.
+    live = client.post(f"/models/{model_id}/graph/live", json={"excluded_node_ids": []})
+    assert live.status_code == 200
+    assert len(live.json()["edges"]) == 2
+
+    settings = get_settings()
+    stored = settings.data_path / "models" / model_id / "model.indoorgml"
+    assert stored.is_file()
+    assert stored.read_bytes() == payload

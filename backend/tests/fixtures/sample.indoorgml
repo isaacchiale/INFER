@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<core:IndoorFeatures xmlns:core="http://www.opengis.net/indoorgml/1.0/core"
+                      xmlns:gml="http://www.opengis.net/gml/3.2"
+                      xmlns:xlink="http://www.w3.org/1999/xlink"
+                      gml:id="IF_1">
+  <core:primalSpaceFeatures>
+    <core:PrimalSpaceFeatures gml:id="PSF_1">
+      <core:cellSpaceMember>
+        <core:CellSpace gml:id="CS_A">
+          <gml:name>Room A</gml:name>
+          <core:duality xlink:href="#ST_A"/>
+          <core:cellSpaceGeometry>
+            <core:Geometry2D>
+              <gml:Polygon gml:id="geom_CS_A" srsDimension="2">
+                <gml:exterior>
+                  <gml:LinearRing>
+                    <gml:posList>0 0 10 0 10 10 0 10 0 0</gml:posList>
+                  </gml:LinearRing>
+                </gml:exterior>
+              </gml:Polygon>
+            </core:Geometry2D>
+          </core:cellSpaceGeometry>
+        </core:CellSpace>
+      </core:cellSpaceMember>
+      <core:cellSpaceMember>
+        <core:CellSpace gml:id="CS_B">
+          <gml:name>Room B</gml:name>
+          <core:duality xlink:href="#ST_B"/>
+          <core:cellSpaceGeometry>
+            <core:Geometry2D>
+              <gml:Polygon gml:id="geom_CS_B" srsDimension="2">
+                <gml:exterior>
+                  <gml:LinearRing>
+                    <gml:posList>10 0 20 0 20 10 10 10 10 0</gml:posList>
+                  </gml:LinearRing>
+                </gml:exterior>
+              </gml:Polygon>
+            </core:Geometry2D>
+          </core:cellSpaceGeometry>
+        </core:CellSpace>
+      </core:cellSpaceMember>
+      <core:cellSpaceBoundaryMember>
+        <core:CellSpaceBoundary gml:id="CSB_AB">
+          <gml:name>Door A-B</gml:name>
+          <core:duality xlink:href="#TR_AB"/>
+          <core:cellSpaceBoundaryGeometry>
+            <core:Geometry2D>
+              <gml:LineString gml:id="geom_CSB_AB" srsDimension="2">
+                <gml:posList>10 4 10 6</gml:posList>
+              </gml:LineString>
+            </core:Geometry2D>
+          </core:cellSpaceBoundaryGeometry>
+        </core:CellSpaceBoundary>
+      </core:cellSpaceBoundaryMember>
+    </core:PrimalSpaceFeatures>
+  </core:primalSpaceFeatures>
+  <core:multiLayeredGraph>
+    <core:MultiLayeredGraph gml:id="MLG_1">
+      <core:spaceLayerMember>
+        <core:SpaceLayer gml:id="SL_1">
+          <core:nodeMember>
+            <core:State gml:id="ST_A">
+              <core:duality xlink:href="#CS_A"/>
+              <core:geometry>
+                <gml:Point gml:id="pt_A" srsDimension="2"><gml:pos>5 5</gml:pos></gml:Point>
+              </core:geometry>
+            </core:State>
+          </core:nodeMember>
+          <core:nodeMember>
+            <core:State gml:id="ST_B">
+              <core:duality xlink:href="#CS_B"/>
+              <core:geometry>
+                <gml:Point gml:id="pt_B" srsDimension="2"><gml:pos>15 5</gml:pos></gml:Point>
+              </core:geometry>
+            </core:State>
+          </core:nodeMember>
+          <core:edgeMember>
+            <core:Transition gml:id="TR_AB">
+              <core:duality xlink:href="#CSB_AB"/>
+              <core:connects xlink:href="#ST_A"/>
+              <core:connects xlink:href="#ST_B"/>
+              <core:weight>1.0</core:weight>
+            </core:Transition>
+          </core:edgeMember>
+        </core:SpaceLayer>
+      </core:spaceLayerMember>
+    </core:MultiLayeredGraph>
+  </core:multiLayeredGraph>
+</core:IndoorFeatures>

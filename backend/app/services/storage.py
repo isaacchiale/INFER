@@ -15,7 +15,8 @@ from app.schemas.entities import EntitiesExtract, ModelMetadata
 from app.schemas.graph import ConnectivityGraph
 from app.schemas.footprints import FootprintsDocument
 
-ALLOWED_EXTENSIONS = {".ifc", ".ifczip"}
+ALLOWED_EXTENSIONS = {".ifc", ".ifczip", ".gml", ".indoorgml"}
+INDOORGML_EXTENSIONS = {".gml", ".indoorgml"}
 
 
 class ModelNotFoundError(Exception):
@@ -40,6 +41,21 @@ def model_dir(settings: Settings, model_id: str) -> Path:
 
 def ifc_path(settings: Settings, model_id: str) -> Path:
     return model_dir(settings, model_id) / "model.ifc"
+
+
+def indoorgml_path(settings: Settings, model_id: str) -> Path:
+    return model_dir(settings, model_id) / "model.indoorgml"
+
+
+def source_path(settings: Settings, model_id: str, source_format: str) -> Path:
+    """The stored source file for whichever format this model was uploaded
+    as — every downstream service resolves its own input through this
+    rather than assuming `ifc_path()`."""
+    return (
+        indoorgml_path(settings, model_id)
+        if source_format == "indoorgml"
+        else ifc_path(settings, model_id)
+    )
 
 
 def meta_path(settings: Settings, model_id: str) -> Path:
@@ -133,9 +149,10 @@ async def save_upload(settings: Settings, upload: UploadFile) -> ModelMetadata:
     model_id = str(uuid.uuid4())
     directory = model_dir(settings, model_id)
     directory.mkdir(parents=True, exist_ok=False)
+    source_format = "indoorgml" if suffix in INDOORGML_EXTENSIONS else "ifc"
 
     try:
-        destination = ifc_path(settings, model_id)
+        destination = source_path(settings, model_id, source_format)
         if suffix == ".ifczip":
             size = await _save_ifczip_upload(settings, upload, destination)
         else:
@@ -153,6 +170,7 @@ async def save_upload(settings: Settings, upload: UploadFile) -> ModelMetadata:
         size_bytes=size,
         created_at=datetime.now(timezone.utc),
         extract_status="none",
+        source_format=source_format,
     )
     _write_meta(meta_path(settings, model_id), meta)
     return meta
