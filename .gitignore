@@ -11,12 +11,15 @@ venv/
 .coverage
 htmlcov/
 
-# Node (if a frontend is ever re-added locally)
+# Node
 node_modules/
 dist/
 dist-ssr/
 *.local
 npm-debug.log*
+
+# TanStack Router auto-generates this on every dev/build run
+frontend/src/routeTree.gen.ts
 
 # Editor
 .vscode/*
