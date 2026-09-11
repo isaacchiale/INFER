@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useModelData, useViewport, useViewerPose } from "@/state/infer-store";
-import { continuousPolylineForStorey } from "@/lib/geometric-path";
+import { continuousPolylineForStorey, pointInPolygon } from "@/lib/geometric-path";
 import { buildStoreyNavmesh, regionAtPoint } from "@/lib/navmesh";
 import {
   elevationsForVerticalRemap,
@@ -102,6 +102,49 @@ function headingConePath(
   return `${d} Z`;
 }
 
+/**
+ * Raw footprint hit-testing for the exclude/restore toggle and plain-tab
+ * selection — deliberately NOT storeyNavmesh-based. The navmesh's regions
+ * and portals are already built with exclusions applied (that's what makes
+ * routing correctly avoid them), so an excluded room has no region left to
+ * hit-test against there. Restoring it needs a hit-test that still knows
+ * about it, which only the raw footprints document does.
+ */
+function spaceAtWorldPoint(
+  world: Point2D,
+  footprints: FootprintsDocument | null,
+  storeyId: string,
+): { global_id: string } | null {
+  if (!footprints) return null;
+  for (const s of footprints.spaces) {
+    if (s.incomplete || s.polygon.length < 3) continue;
+    if (s.storey_global_id !== storeyId) continue;
+    if (pointInPolygon(world.x, world.y, s.polygon)) return s;
+  }
+  return null;
+}
+
+function doorAtWorldPoint(
+  world: Point2D,
+  footprints: FootprintsDocument | null,
+  storeyId: string,
+  hitR: number,
+): { global_id: string } | null {
+  if (!footprints) return null;
+  let best: { global_id: string } | null = null;
+  let bestDist = hitR;
+  for (const d of footprints.doors) {
+    if (d.incomplete || !d.point) continue;
+    if (d.storey_global_id !== storeyId) continue;
+    const dist = Math.hypot(d.point.x - world.x, d.point.y - world.y);
+    if (dist <= bestDist) {
+      bestDist = dist;
+      best = d;
+    }
+  }
+  return best;
+}
+
 export function FloorplanViewer({ className }: { className?: string }) {
   const {
     footprintsDocument,
@@ -112,6 +155,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     setNavmeshRoute,
     excludedNodeIds,
     excludedEdgeIds,
+    toggleExcludedNode,
   } = useModelData();
   const { activeStoreyId, setActiveStoreyId, selectedElementIds, selectElement, setIngestOpen } =
     useViewport();
@@ -437,16 +481,16 @@ export function FloorplanViewer({ className }: { className?: string }) {
     resetCamera();
   }, [footprintsId, resetCamera]);
 
+  // Excluded rooms stay in this list (rendered dashed via `excludedNodeIds`
+  // in the SVG layer) rather than vanishing — right-click-to-restore in the
+  // plain Floorplan tab needs something to click, same as the Graph Viewer
+  // keeps excluded nodes visible instead of deleting them from the layout.
   const spaces = useMemo(() => {
     if (!footprintsDocument) return [];
-    const keep = (s: { global_id: string; incomplete: boolean; polygon: unknown[] }) =>
-      !s.incomplete &&
-      s.polygon.length >= 3 &&
-      !excludedNodeIds.has(`space:${s.global_id}`);
     return footprintsDocument.spaces.filter(
-      (s) => s.storey_global_id === displayStoreyId && keep(s),
+      (s) => s.storey_global_id === displayStoreyId && !s.incomplete && s.polygon.length >= 3,
     );
-  }, [footprintsDocument, displayStoreyId, excludedNodeIds]);
+  }, [footprintsDocument, displayStoreyId]);
 
   const doors = useMemo(() => {
     if (!footprintsDocument) return [];
@@ -595,6 +639,12 @@ export function FloorplanViewer({ className }: { className?: string }) {
 
   const navmeshPickRef = useRef({
     enabled: false as boolean,
+    // Plain Floorplan (IFC) tab: click-to-select / right-click-to-exclude on
+    // the same underlying region/portal hit-testing as Navmesh mode's pins,
+    // since storeyNavmesh is built unconditionally either way. Separate flag
+    // (not folded into `enabled`) because the two modes' click semantics
+    // don't overlap — Navmesh mode never reaches this branch and vice versa.
+    ifcPickEnabled: false as boolean,
     mesh: null as ReturnType<typeof buildStoreyNavmesh> | null,
     mode: "route" as "route" | "exit",
     footprints: null as FootprintsDocument | null,
@@ -611,6 +661,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
   });
   navmeshPickRef.current = {
     enabled: planDisplayMode === "navmesh" && storeyNavmesh != null,
+    ifcPickEnabled: planDisplayMode === "ifc" && storeyNavmesh != null,
     mesh: storeyNavmesh,
     mode: navmeshPickMode,
     footprints: footprintsDocument,
@@ -625,6 +676,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
 
   const selectElementRef = useRef(selectElement);
   selectElementRef.current = selectElement;
+  const toggleExcludedNodeRef = useRef(toggleExcludedNode);
+  toggleExcludedNodeRef.current = toggleExcludedNode;
 
   const incompleteCount =
     footprintsDocument?.spaces.filter((s) => s.incomplete).length ?? 0;
@@ -776,6 +829,30 @@ export function FloorplanViewer({ className }: { className?: string }) {
       });
     };
 
+    /**
+     * Plain Floorplan tab, short right-click: toggle the room (or, via its
+     * nearest portal, the door) out of the model — same excludedNodeIds the
+     * Graph Viewer's right-click already writes, so it affects routing and
+     * rendering everywhere, not just this pane. A portal with no real IFC
+     * door behind it (an inferred space-space heal) has nothing to exclude.
+     */
+    const toggleExcludeAt = (clientX: number, clientY: number) => {
+      const pick = navmeshPickRef.current;
+      if (!pick.ifcPickEnabled) return;
+      const bounds = boundsRef.current;
+      const svg = svgRef.current;
+      if (!bounds || !svg) return;
+      const world = clientToView(clientX, clientY, svg, bounds, cameraRef.current);
+      const door = doorAtWorldPoint(world, pick.footprints, pick.storeyId, pick.portalHitR);
+      if (door) {
+        toggleExcludedNodeRef.current(`door:${door.global_id}`);
+        return;
+      }
+      const space = spaceAtWorldPoint(world, pick.footprints, pick.storeyId);
+      if (!space) return;
+      toggleExcludedNodeRef.current(`space:${space.global_id}`);
+    };
+
     const onPointerDown = (e: PointerEvent) => {
       if (e.button === 0) {
         e.preventDefault();
@@ -869,9 +946,14 @@ export function FloorplanViewer({ className }: { className?: string }) {
         } catch {
           /* ignore */
         }
-        // Short right-click on a region → start then end pin.
+        // Short right-click on a region → start then end pin (Navmesh tab),
+        // or toggle it out of the model (plain Floorplan tab).
         if (!longFired && !moved) {
-          placeNavmeshPin(e.clientX, e.clientY);
+          if (navmeshPickRef.current.ifcPickEnabled) {
+            toggleExcludeAt(e.clientX, e.clientY);
+          } else {
+            placeNavmeshPin(e.clientX, e.clientY);
+          }
         }
         return;
       }
@@ -893,24 +975,40 @@ export function FloorplanViewer({ className }: { className?: string }) {
       // otherwise a region toggles graph/floorplan selection.
       if (!drag || drag.moved) return;
       const pick = navmeshPickRef.current;
-      if (!pick.enabled || !pick.mesh) return;
-      const bounds = boundsRef.current;
-      const svg = svgRef.current;
-      if (!bounds || !svg) return;
-      const world = clientToView(e.clientX, e.clientY, svg, bounds, cameraRef.current);
-      const portal = nearestPortalWithin(pick.mesh.portals, world, pick.portalHitR);
-      if (portal) {
-        setBlockedPortalIds((prev) => {
-          const next = new Set(prev);
-          if (next.has(portal.id)) next.delete(portal.id);
-          else next.add(portal.id);
-          return next;
-        });
+      if (pick.enabled && pick.mesh) {
+        const bounds = boundsRef.current;
+        const svg = svgRef.current;
+        if (!bounds || !svg) return;
+        const world = clientToView(e.clientX, e.clientY, svg, bounds, cameraRef.current);
+        const portal = nearestPortalWithin(pick.mesh.portals, world, pick.portalHitR);
+        if (portal) {
+          setBlockedPortalIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(portal.id)) next.delete(portal.id);
+            else next.add(portal.id);
+            return next;
+          });
+          return;
+        }
+        const region = regionAtPoint(pick.mesh, world);
+        if (!region) return;
+        selectElementRef.current(region.spaceId);
         return;
       }
-      const region = regionAtPoint(pick.mesh, world);
-      if (!region) return;
-      selectElementRef.current(region.spaceId);
+      // Plain Floorplan tab: click a room to select it, same as the Graph
+      // Viewer's left-click-to-select (no portal-block here — that's a
+      // Navmesh-mode routing what-if, not a floorplan concept). Raw
+      // footprint hit-test, not the navmesh mesh — an excluded room stays
+      // selectable/inspectable even though it has no navmesh region.
+      if (pick.ifcPickEnabled) {
+        const bounds = boundsRef.current;
+        const svg = svgRef.current;
+        if (!bounds || !svg) return;
+        const world = clientToView(e.clientX, e.clientY, svg, bounds, cameraRef.current);
+        const space = spaceAtWorldPoint(world, pick.footprints, pick.storeyId);
+        if (!space) return;
+        selectElementRef.current(`space:${space.global_id}`);
+      }
     };
 
     const onContextMenu = (e: MouseEvent) => {
@@ -1108,6 +1206,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     walls={walls}
                     furniture={furniture}
                     spaces={spaces}
+                    excludedNodeIds={excludedNodeIds}
                     stairs={stairs}
                     doors={doors}
                     storeyNavmesh={storeyNavmesh}
@@ -1208,7 +1307,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
               title={
                 planDisplayMode === "navmesh"
                   ? "Left-click region: select/deselect space. Left-click a portal: block/unblock it. Right-click: set start then end. Long right-click: clear pins and path. Drag to pan."
-                  : undefined
+                  : "Left-click a room: select/deselect. Right-click a room or door: remove or restore it (affects routing everywhere, same as the Graph Viewer). Drag to pan."
               }
             />
 

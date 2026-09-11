@@ -183,6 +183,8 @@ export type FloorplanSvgLayersProps = {
   walls: WallFootprint[];
   furniture: FurnitureFootprint[];
   spaces: SpaceFootprint[];
+  /** Node ids ("space:<gid>", "door:<gid>", ...) currently excluded from the model. */
+  excludedNodeIds: ReadonlySet<string>;
   stairs: StairFootprint[];
   doors: DoorPortal[];
   storeyNavmesh: StoreyNavmesh | null;
@@ -222,6 +224,7 @@ function FloorplanSvgLayersImpl({
   walls,
   furniture,
   spaces,
+  excludedNodeIds,
   stairs,
   doors,
   storeyNavmesh,
@@ -282,16 +285,22 @@ function FloorplanSvgLayersImpl({
           {layers.spaces
             ? spaces.map((s) => {
                 const c = polygonCentroid(s.polygon);
+                const excluded = excludedNodeIds.has(`space:${s.global_id}`);
                 return (
                   <g key={s.global_id}>
                     <path
                       d={spacePathD(s.polygon, s.holes)}
-                      fill="rgba(148,163,184,0.35)"
+                      fill={excluded ? "rgba(148,163,184,0.12)" : "rgba(148,163,184,0.35)"}
                       fillRule="evenodd"
                       stroke="#64748b"
                       strokeWidth={roomStroke}
+                      strokeDasharray={excluded ? `${roomStroke * 3} ${roomStroke * 2}` : undefined}
+                      opacity={excluded ? 0.6 : 1}
                     >
-                      <title>{s.name || s.global_id}</title>
+                      <title>
+                        {(s.name || s.global_id) +
+                          (excluded ? " (excluded — right-click to restore)" : "")}
+                      </title>
                     </path>
                     {s.name ? (
                       <g transform={`translate(${c.x} ${c.y})`}>

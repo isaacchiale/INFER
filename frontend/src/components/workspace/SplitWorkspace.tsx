@@ -144,10 +144,14 @@ const PARKED_STYLE: CSSProperties = {
 
 export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
   const { navmeshRoute, footprintsDocument } = useModelData();
+  // Graph Viewer starts closed — it's a power-user/debugging tool now that
+  // the Floorplan tab covers selection and exclusion directly (see
+  // toggleExcludeAt in FloorplanViewer). 3D + Floorplan are the default
+  // working view; Graph is opt-in via the PANES row.
   const [panes, setPanes] = useState<Record<PaneId, PaneState>>({
     model3d: { open: true },
     floorplan: { open: true },
-    graph: { open: true },
+    graph: { open: false },
   });
 
   const workspaceRef = useRef<HTMLDivElement | null>(null);
