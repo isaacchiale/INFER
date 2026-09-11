@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronDown, Maximize2 } from "lucide-react";
+import { Check, ChevronDown, FolderOpen, Maximize2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import {
   buildModelGraph,
   getModelGraph,
@@ -50,7 +51,7 @@ export function GraphViewer({ className }: { className?: string }) {
     excludedEdgeIds,
     toggleExcludedEdge,
   } = useModelData();
-  const { selectedElementIds, selectElement } = useViewport();
+  const { selectedElementIds, selectElement, setIngestOpen } = useViewport();
   const theme = useAppTheme();
   const graph = connectivityGraph;
   const hasGraph = Boolean(graph && graph.nodes.length > 0);
@@ -372,11 +373,15 @@ export function GraphViewer({ className }: { className?: string }) {
           Fit
         </button>
         {!hasGraph && (
-          <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 px-6 text-center">
+          <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 px-6 text-center">
             <p className="text-sm font-medium">No graph loaded</p>
             <p className="max-w-sm text-xs text-muted-foreground">
               Open an IFC model to build the connectivity graph.
             </p>
+            <Button size="sm" className="pointer-events-auto" onClick={() => setIngestOpen(true)}>
+              <FolderOpen aria-hidden />
+              Open model
+            </Button>
           </div>
         )}
         {hasGraph && !engineReady && !cyError && (

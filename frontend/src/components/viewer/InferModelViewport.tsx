@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { Box, Check, ChevronDown, Move3d, Network, PersonStanding } from "lucide-react";
+import { Box, Check, ChevronDown, FolderOpen, Move3d, Network, PersonStanding } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { buildAllStoreyNavmeshes, buildStoreyNavmesh } from "@/lib/navmesh";
 import {
   buildPlanRouteTubePolylines,
@@ -119,6 +120,7 @@ function InferModelViewportImpl({
   const {
     pendingIfc,
     setViewerStatus,
+    setIngestOpen,
     // Shared with FloorplanViewer — picking a storey in either pane now
     // isolates the same floor in both, instead of two independent filters.
     activeStoreyId: viewerStoreyId,
@@ -597,9 +599,11 @@ function InferModelViewportImpl({
 
       {engineReady && !engineError && (
         <div className="pointer-events-auto absolute left-3 top-3 z-20 flex flex-col items-start gap-1.5">
-          <div className={cn(GLASS, "flex overflow-hidden")}>
+          <div className={cn(GLASS, "flex overflow-hidden")} role="tablist" aria-label="Camera navigation mode">
             <button
               type="button"
+              role="tab"
+              aria-selected={navMode === "orbit"}
               onClick={() => switchNavMode("orbit")}
               className={cn(
                 "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
@@ -614,6 +618,8 @@ function InferModelViewportImpl({
             </button>
             <button
               type="button"
+              role="tab"
+              aria-selected={navMode === "fly"}
               onClick={() => switchNavMode("fly")}
               className={cn(
                 "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
@@ -628,9 +634,11 @@ function InferModelViewportImpl({
             </button>
           </div>
 
-          <div className={cn(GLASS, "flex overflow-hidden")}>
+          <div className={cn(GLASS, "flex overflow-hidden")} role="tablist" aria-label="Geometry display mode">
             <button
               type="button"
+              role="tab"
+              aria-selected={geometryMode === "ifc"}
               onClick={() => switchGeometryMode("ifc")}
               className={cn(
                 "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
@@ -645,6 +653,8 @@ function InferModelViewportImpl({
             </button>
             <button
               type="button"
+              role="tab"
+              aria-selected={geometryMode === "navmesh"}
               onClick={() => switchGeometryMode("navmesh")}
               className={cn(
                 "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
@@ -739,8 +749,19 @@ function InferModelViewportImpl({
       )}
       {engineReady && !engineError && !backendModelId && (
         <div className="pointer-events-none absolute inset-0 grid place-items-center px-4">
-          <div className={cn(GLASS, "max-w-xs px-3 py-1.5 text-center text-[13px] text-foreground")}>
-            No model loaded. Open an IFC model from the menu above to view it in 3D.
+          <div
+            className={cn(
+              GLASS,
+              "pointer-events-auto flex max-w-xs flex-col items-center gap-3 px-5 py-4 text-center",
+            )}
+          >
+            <p className="text-[13px] text-foreground">
+              Open an IFC model to inspect its geometry and plan routes in 3D.
+            </p>
+            <Button size="sm" onClick={() => setIngestOpen(true)}>
+              <FolderOpen aria-hidden />
+              Open model
+            </Button>
           </div>
         </div>
       )}

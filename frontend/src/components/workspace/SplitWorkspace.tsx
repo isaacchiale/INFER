@@ -246,6 +246,7 @@ export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
               key={id}
               type="button"
               onClick={() => (active ? closePane(id) : openPane(id))}
+              aria-pressed={active}
               className={cn(
                 "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs transition-colors",
                 active

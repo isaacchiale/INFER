@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Box, Check, ChevronDown, LogOut, Maximize2, Network, Route as RouteIcon } from "lucide-react";
+import {
+  Box,
+  Check,
+  ChevronDown,
+  FolderOpen,
+  LogOut,
+  Maximize2,
+  Network,
+  Route as RouteIcon,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { useModelData, useViewport, useViewerPose } from "@/state/infer-store";
 import { continuousPolylineForStorey } from "@/lib/geometric-path";
 import { buildStoreyNavmesh, regionAtPoint } from "@/lib/navmesh";
@@ -103,7 +113,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
     excludedNodeIds,
     excludedEdgeIds,
   } = useModelData();
-  const { activeStoreyId, setActiveStoreyId, selectedElementIds, selectElement } = useViewport();
+  const { activeStoreyId, setActiveStoreyId, selectedElementIds, selectElement, setIngestOpen } =
+    useViewport();
   const { viewerCameraPose, viewerModelBounds, viewerCoordInverse } = useViewerPose();
   const theme = useAppTheme();
   const palette = useMemo(() => floorplanPalette(theme), [theme]);
@@ -940,9 +951,11 @@ export function FloorplanViewer({ className }: { className?: string }) {
       <div className={cn("relative min-h-0 flex-1", PLAN_CANVAS)}>
         <div className="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-start justify-between gap-2 p-3">
           <div className="pointer-events-auto flex flex-col items-start gap-1.5">
-            <div className={cn(GLASS, "flex overflow-hidden")}>
+            <div className={cn(GLASS, "flex overflow-hidden")} role="tablist" aria-label="Plan display mode">
               <button
                 type="button"
+                role="tab"
+                aria-selected={planDisplayMode === "ifc"}
                 onClick={() => setPlanDisplayMode("ifc")}
                 className={cn(
                   "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
@@ -957,6 +970,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
               </button>
               <button
                 type="button"
+                role="tab"
+                aria-selected={planDisplayMode === "navmesh"}
                 onClick={() => setPlanDisplayMode("navmesh")}
                 className={cn(
                   "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
@@ -1007,9 +1022,11 @@ export function FloorplanViewer({ className }: { className?: string }) {
             </DropdownMenu>
 
             {planDisplayMode === "navmesh" ? (
-              <div className={cn(GLASS, "flex overflow-hidden")}>
+              <div className={cn(GLASS, "flex overflow-hidden")} role="tablist" aria-label="Navmesh pick mode">
                 <button
                   type="button"
+                  role="tab"
+                  aria-selected={navmeshPickMode === "route"}
                   onClick={() => {
                     setNavmeshPickMode("route");
                     clearNavmeshRoute();
@@ -1027,6 +1044,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
                 </button>
                 <button
                   type="button"
+                  role="tab"
+                  aria-selected={navmeshPickMode === "exit"}
                   onClick={() => {
                     setNavmeshPickMode("exit");
                     clearNavmeshRoute();
@@ -1062,8 +1081,16 @@ export function FloorplanViewer({ className }: { className?: string }) {
         </div>
 
         {!footprintsDocument ? (
-          <div className="grid h-full place-items-center px-4 text-center text-xs text-muted-foreground">
-            Footprints not loaded. Ingest a model to build space polygons for the plan.
+          <div className="grid h-full place-items-center px-4 text-center">
+            <div className="flex flex-col items-center gap-3">
+              <p className="text-xs text-muted-foreground">
+                Open a model to build space polygons for the plan.
+              </p>
+              <Button size="sm" onClick={() => setIngestOpen(true)}>
+                <FolderOpen aria-hidden />
+                Open model
+              </Button>
+            </div>
           </div>
         ) : (
           <>
