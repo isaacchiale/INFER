@@ -200,12 +200,20 @@ function pointInObstacles(x: number, y: number, obstacles?: Point2D[][]): boolea
 /**
  * Inside a doorway void, or within the same half-cell used to thicken
  * obstacles below. Without that tolerance a doorway thinner than the grid
- * would have its approach cells blocked and re-seal the gap.
+ * would have its approach cells blocked and re-seal the gap. `cellSize`
+ * defaults to the finest resolution (real-world wall thinness doesn't
+ * change just because a large room's grid got coarsened) but the actual
+ * grid in use is threaded through explicitly wherever one exists.
  */
-function inDoorwayVoid(x: number, y: number, voids?: Point2D[][]): boolean {
+function inDoorwayVoid(
+  x: number,
+  y: number,
+  voids: Point2D[][] | undefined,
+  cellSize: number = LOCAL_PATH_CELL_M,
+): boolean {
   if (!voids?.length) return false;
   if (pointInObstacles(x, y, voids)) return true;
-  return distToRings(x, y, voids) <= LOCAL_PATH_CELL_M * 0.45;
+  return distToRings(x, y, voids) <= cellSize * 0.45;
 }
 
 /**
@@ -213,7 +221,10 @@ function inDoorwayVoid(x: number, y: number, voids?: Point2D[][]): boolean {
  * wall footprints. Cells inside an obstacle are blocked (−1). Thin walls
  * that miss the cell centre still block when within ~half a cell. Doorway
  * voids re-open wall cells, because wall footprints are solid hulls that fill
- * in their own openings.
+ * in their own openings. `cellSize` should match whatever grid is being
+ * evaluated (see {@link pickCellSize}) so the half-cell tolerance scales
+ * with it; callers with no grid of their own (e.g. a continuous
+ * line-of-sight check) can leave it at the default.
  */
 function cellClearance(
   x: number,
@@ -222,16 +233,16 @@ function cellClearance(
   holes?: Point2D[][],
   obstacles?: Point2D[][],
   doorwayVoids?: Point2D[][],
+  cellSize: number = LOCAL_PATH_CELL_M,
 ): number {
   if (!pointInSpace(x, y, exterior, holes)) return -1;
   const dSpace = distToSpaceWall(x, y, exterior, holes);
   if (!obstacles?.length) return dSpace;
 
   const dObs = distToRings(x, y, obstacles);
-  // Half-cell thicken so 0.1 m grid can't slip through sub-cell walls.
-  const blocked =
-    pointInObstacles(x, y, obstacles) || dObs < LOCAL_PATH_CELL_M * 0.45;
-  if (blocked) return inDoorwayVoid(x, y, doorwayVoids) ? dSpace : -1;
+  // Half-cell thicken so the grid can't slip through sub-cell walls.
+  const blocked = pointInObstacles(x, y, obstacles) || dObs < cellSize * 0.45;
+  if (blocked) return inDoorwayVoid(x, y, doorwayVoids, cellSize) ? dSpace : -1;
   return Math.min(dSpace, dObs);
 }
 
@@ -363,8 +374,32 @@ function localPathInSpace(
   return astarInPolygon(start, goal, space.polygon, space.holes).points;
 }
 
-/** Fixed cell size for in-polygon A* (metres). */
+/** Default (finest) cell size for in-polygon A* (metres). */
 export const LOCAL_PATH_CELL_M = 0.1;
+
+/**
+ * Upper bound on the local-search grid's cell count. At the default 0.1 m
+ * cell size that's a room up to ~20m x 20m at full resolution; a bigger
+ * room (an atrium, a warehouse floor, a large open-plan office) would
+ * otherwise build an unbounded grid — clearance is precomputed for every
+ * cell up front, so an ungapped 0.1 m grid over a 100m x 60m floor would be
+ * 600,000+ cells, each scanning every obstacle edge. {@link pickCellSize}
+ * coarsens the grid just enough to stay under this cap instead.
+ */
+const MAX_LOCAL_PATH_CELLS = 200 * 200;
+
+/**
+ * Cell size for a room of the given plan size: the default fine resolution
+ * when it fits under {@link MAX_LOCAL_PATH_CELLS}, otherwise scaled up just
+ * enough (uniformly, so cells stay square) to fit the cap.
+ */
+function pickCellSize(width: number, height: number): number {
+  const naturalCols = Math.max(2, Math.ceil(width / LOCAL_PATH_CELL_M) + 1);
+  const naturalRows = Math.max(2, Math.ceil(height / LOCAL_PATH_CELL_M) + 1);
+  const naturalCells = naturalCols * naturalRows;
+  if (naturalCells <= MAX_LOCAL_PATH_CELLS) return LOCAL_PATH_CELL_M;
+  return LOCAL_PATH_CELL_M * Math.sqrt(naturalCells / MAX_LOCAL_PATH_CELLS);
+}
 
 /** Floor so wall-adjacent cells don't send A* cost to Infinity. */
 const CLEARANCE_EPS_M = 0.02;
@@ -379,10 +414,13 @@ function clearanceStepCost(stepLen: number, clearM: number): number {
 
 /**
  * Grid A* inside a space (door↔door, door↔centroid, etc. only).
- * Step cost ∝ 1/clearance on a 0.1 m grid (no string-pull).
- * Optional holes are treated as blocked (exterior-minus-holes).
- * Optional `obstacles` (e.g. IfcWall footprints) are solid: interior cells
- * blocked, and their edges reduce clearance like space walls.
+ * Step cost ∝ 1/clearance on a grid sized by {@link pickCellSize} (0.1 m by
+ * default, coarser for very large rooms). Optional holes are treated as
+ * blocked (exterior-minus-holes). Optional `obstacles` (e.g. IfcWall
+ * footprints) are solid: interior cells blocked, and their edges reduce
+ * clearance like space walls. The raw grid-cell path is then simplified
+ * (greedy line-of-sight string-pulling) so the result is the fewest
+ * straight segments that stay in free space, not a blocky cell-by-cell walk.
  */
 export function localPathInPolygon(
   start: Point2D,
@@ -474,7 +512,9 @@ function astarInPolygon(
     maxY = Math.max(maxY, p.y);
   }
 
-  const cell = LOCAL_PATH_CELL_M;
+  // Coarsens automatically for a room too large to grid at full resolution
+  // (see MAX_LOCAL_PATH_CELLS) instead of building an unbounded grid.
+  const cell = pickCellSize(maxX - minX, maxY - minY);
   const cols = Math.max(2, Math.ceil((maxX - minX) / cell) + 1);
   const rows = Math.max(2, Math.ceil((maxY - minY) / cell) + 1);
 
@@ -490,7 +530,7 @@ function astarInPolygon(
     for (let c = 0; c < cols; c++) {
       const idx = r * cols + c;
       const p = cellCentre(c, r);
-      const d = cellClearance(p.x, p.y, polygon, holes, obstacles, doorwayVoids);
+      const d = cellClearance(p.x, p.y, polygon, holes, obstacles, doorwayVoids, cell);
       clearance[idx] = d;
       if (d > maxClear) maxClear = d;
     }
@@ -572,7 +612,8 @@ function astarInPolygon(
       }
       raw.push(s);
       raw.reverse();
-      return { points: raw, reached: true };
+      const smoothed = simplifyLocalPath(raw, polygon, holes, obstacles, doorwayVoids);
+      return { points: smoothed, reached: true };
     }
     for (const [dc, dr] of neighbors) {
       const nc = cur.c + dc!;
@@ -605,6 +646,129 @@ function astarInPolygon(
   }
 
   return { points: [s, g], reached: false };
+}
+
+/**
+ * Sampled line-of-sight check between two points already known to be in
+ * free space: true when every sample along the straight segment between
+ * them also clears {@link cellClearance}. Deliberately continuous (not
+ * snapped to any grid) and uses the default, finest clearance tolerance
+ * regardless of what grid resolution produced the path being simplified —
+ * a real wall isn't any thinner just because a big room's search grid was
+ * coarsened.
+ */
+export function hasLineOfSight(
+  a: Point2D,
+  b: Point2D,
+  polygon: Point2D[],
+  holes?: Point2D[][],
+  obstacles?: Point2D[][],
+  doorwayVoids?: Point2D[][],
+): boolean {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-9) return true;
+  const step = LOCAL_PATH_CELL_M * 0.5;
+  const samples = Math.max(1, Math.ceil(len / step));
+  for (let i = 1; i < samples; i++) {
+    const t = i / samples;
+    const x = a.x + dx * t;
+    const y = a.y + dy * t;
+    if (cellClearance(x, y, polygon, holes, obstacles, doorwayVoids) < 0) return false;
+  }
+  return true;
+}
+
+/** Cost of a straight segment, sampled the same way as {@link hasLineOfSight}. */
+function straightSegmentCost(
+  a: Point2D,
+  b: Point2D,
+  polygon: Point2D[],
+  holes?: Point2D[][],
+  obstacles?: Point2D[][],
+  doorwayVoids?: Point2D[][],
+): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-9) return 0;
+  const step = LOCAL_PATH_CELL_M * 0.5;
+  const samples = Math.max(1, Math.ceil(len / step));
+  const stepLen = len / samples;
+  let cost = 0;
+  for (let i = 0; i < samples; i++) {
+    const t = (i + 0.5) / samples;
+    const x = a.x + dx * t;
+    const y = a.y + dy * t;
+    const clear = cellClearance(x, y, polygon, holes, obstacles, doorwayVoids);
+    cost += clearanceStepCost(stepLen, clear < 0 ? CLEARANCE_EPS_M : clear);
+  }
+  return cost;
+}
+
+/** Cost of the original grid-walk between raw[i]..raw[j], for comparison against a shortcut. */
+function rawSegmentCost(
+  raw: Point2D[],
+  i: number,
+  j: number,
+  polygon: Point2D[],
+  holes?: Point2D[][],
+  obstacles?: Point2D[][],
+  doorwayVoids?: Point2D[][],
+): number {
+  let cost = 0;
+  for (let k = i; k < j; k++) {
+    const a = raw[k]!;
+    const b = raw[k + 1]!;
+    const clear = cellClearance(b.x, b.y, polygon, holes, obstacles, doorwayVoids);
+    cost += clearanceStepCost(dist(a, b), clear < 0 ? CLEARANCE_EPS_M : clear);
+  }
+  return cost;
+}
+
+/** A straight shortcut may cost a bit more than the grid walk before it's rejected. */
+const SIMPLIFY_COST_TOLERANCE = 1.15;
+
+/**
+ * Greedy string-pulling: collapses a blocky grid-cell walk into the fewest
+ * straight segments that stay in free space AND don't meaningfully raise
+ * the clearance-weighted travel cost (the funnel-algorithm result for a
+ * portal corridor; here it's line-of-sight based since we have a clearance
+ * field instead of a triangle corridor). The cost check matters as much as
+ * line-of-sight: a straight chord through a corridor is never "blocked",
+ * but hugging a wall is more costly than the A* search's centre-biased
+ * route, so a shortcut that quietly discards that bias would undo the
+ * 1/clearance cost model. Without this, an 8-directional grid path through
+ * open space comes out as a visible staircase of short segments instead of
+ * the direct line a person would actually walk.
+ */
+function simplifyLocalPath(
+  points: Point2D[],
+  polygon: Point2D[],
+  holes?: Point2D[][],
+  obstacles?: Point2D[][],
+  doorwayVoids?: Point2D[][],
+): Point2D[] {
+  if (points.length <= 2) return points;
+  const result: Point2D[] = [points[0]!];
+  let i = 0;
+  while (i < points.length - 1) {
+    let j = points.length - 1;
+    while (j > i + 1) {
+      if (!hasLineOfSight(points[i]!, points[j]!, polygon, holes, obstacles, doorwayVoids)) {
+        j--;
+        continue;
+      }
+      const straight = straightSegmentCost(points[i]!, points[j]!, polygon, holes, obstacles, doorwayVoids);
+      const raw = rawSegmentCost(points, i, j, polygon, holes, obstacles, doorwayVoids);
+      if (straight <= raw * SIMPLIFY_COST_TOLERANCE) break;
+      j--;
+    }
+    result.push(points[j]!);
+    i = j;
+  }
+  return result;
 }
 
 function spaceByGid(doc: FootprintsDocument, gid: string): SpaceFootprint | undefined {

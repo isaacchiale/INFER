@@ -11,6 +11,7 @@ import {
   pointInSpace,
   wallsOverlappingSpace,
   doorwayVoidsInSpace,
+  hasLineOfSight,
   MinHeap,
 } from "@/lib/geometric-path";
 import type { DoorPortal, FootprintsDocument, Point2D, SpaceFootprint } from "@/types/footprints";
@@ -421,15 +422,65 @@ type PortalGraph = {
   adjacency: Map<string, { id: string; viaRegion: string; cost: number }[]>;
 };
 
+function pathLength(points: Point2D[]): number {
+  let total = 0;
+  for (let i = 1; i < points.length; i++) total += dist(points[i - 1]!, points[i]!);
+  return total;
+}
+
+/** Obstacle/doorway-void geometry a region's local pathing needs, computed once per region and reused. */
+function regionGeometry(
+  region: NavmeshRegion,
+  footprints: FootprintsDocument | null | undefined,
+): { obstacles: Point2D[][]; voids: Point2D[][] } {
+  const space = spaceFootprintForRegion(footprints, region);
+  if (!space || !footprints) return { obstacles: [], voids: [] };
+  return {
+    obstacles: wallsOverlappingSpace(footprints, space),
+    voids: doorwayVoidsInSpace(footprints, space),
+  };
+}
+
+/**
+ * Edge cost between two points that share a walkable region: straight-line
+ * distance when there's a clear line of sight between them (the common
+ * case — cheap and exact, since there's genuinely no detour needed), or the
+ * true local-A* walking distance when something in the room blocks that
+ * line. Straight-line distance always UNDERESTIMATES the real cost of
+ * detouring around an obstacle, so without this, the portal-graph search
+ * (and "nearest exit" search) could judge a route "shortest" using a chord
+ * through furniture/a column it can't actually walk through, while the
+ * rendered path — already obstacle-aware via `localWalk` — comes out
+ * longer than the graph thought when picking between routes.
+ */
+function traversalCost(
+  a: Point2D,
+  b: Point2D,
+  region: NavmeshRegion,
+  obstacles: Point2D[][],
+  voids: Point2D[][],
+): number {
+  const straight = dist(a, b);
+  if (!obstacles.length) return straight;
+  if (hasLineOfSight(a, b, region.polygon, region.holes, obstacles, voids)) return straight;
+  return pathLength(localPathInPolygon(a, b, region.polygon, region.holes, obstacles, voids));
+}
+
 /**
  * Shared portal-graph builder for `findNavmeshPath` and `findNearestExitPath`:
  * one node per extra point (click targets) plus every non-blocked portal,
  * bucketed by region so adjacency is built once in O(V) rather than an O(V^2)
- * per-node rescan (a portal-dense storey can have hundreds of doors).
+ * per-node rescan (a portal-dense storey can have hundreds of doors). Edge
+ * costs come from `traversalCost` above; region obstacle/void geometry is
+ * computed once per region (not once per edge — wallsOverlappingSpace scans
+ * every wall in the model, and an edge-per-call cost would turn this back
+ * into an O(V x walls) rescan).
  */
 function buildPortalGraph(
   mesh: StoreyNavmesh,
+  regionById: Map<string, NavmeshRegion>,
   extraNodes: PortalGraphNode[],
+  footprints: FootprintsDocument | null | undefined,
   blockedPortalIds?: ReadonlySet<string>,
 ): PortalGraph {
   const nodes = new Map<string, PortalGraphNode>();
@@ -452,6 +503,16 @@ function buildPortalGraph(
       nodesByRegion.set(regionId, list);
     }
   }
+  const geomByRegion = new Map<string, { obstacles: Point2D[][]; voids: Point2D[][] }>();
+  const geometryFor = (regionId: string, region: NavmeshRegion) => {
+    let g = geomByRegion.get(regionId);
+    if (!g) {
+      g = regionGeometry(region, footprints);
+      geomByRegion.set(regionId, g);
+    }
+    return g;
+  };
+
   const adjacency = new Map<string, { id: string; viaRegion: string; cost: number }[]>();
   for (const node of nodes.values()) {
     const out: { id: string; viaRegion: string; cost: number }[] = [];
@@ -459,10 +520,16 @@ function buildPortalGraph(
     // First of this node's own regions (in order) that the other node also
     // belongs to — stable tie-break, independent of Map iteration order.
     for (const regionId of node.regions) {
+      const region = regionById.get(regionId);
       for (const other of nodesByRegion.get(regionId) ?? []) {
         if (other.id === node.id || linked.has(other.id)) continue;
         linked.add(other.id);
-        out.push({ id: other.id, viaRegion: regionId, cost: dist(node.point, other.point) });
+        let cost = dist(node.point, other.point);
+        if (region) {
+          const { obstacles, voids } = geometryFor(regionId, region);
+          cost = traversalCost(node.point, other.point, region, obstacles, voids);
+        }
+        out.push({ id: other.id, viaRegion: regionId, cost });
       }
     }
     adjacency.set(node.id, out);
@@ -540,16 +607,19 @@ export function findNavmeshPath(
   const regionById = new Map(mesh.regions.map((r) => [r.spaceId, r]));
   const graph = buildPortalGraph(
     mesh,
+    regionById,
     [
       { id: "__start", point: start, regions: [startRegion.spaceId] },
       { id: "__end", point: end, regions: [endRegion.spaceId] },
     ],
+    footprints,
     opts.blockedPortalIds,
   );
 
-  // A* over the portal graph (euclidean edge costs), binary-heap open set —
-  // re-pushes a cheaper route instead of mutating an open entry, so stale
-  // entries are skipped via `closed` on pop (no decrease-key needed).
+  // A* over the portal graph (obstacle-aware edge costs — see
+  // `traversalCost`), binary-heap open set — re-pushes a cheaper route
+  // instead of mutating an open entry, so stale entries are skipped via
+  // `closed` on pop (no decrease-key needed).
   const cameFrom = new Map<string, { prev: string; viaRegion: string }>();
   const gScore = new Map<string, number>([["__start", 0]]);
   const open = new MinHeap<{ id: string; f: number }>((a, b) => a.f < b.f);
@@ -625,7 +695,9 @@ export function findNearestExitPath(
   const regionById = new Map(mesh.regions.map((r) => [r.spaceId, r]));
   const graph = buildPortalGraph(
     mesh,
+    regionById,
     [{ id: "__start", point: start, regions: [startRegion.spaceId] }],
+    footprints,
     opts.blockedPortalIds,
   );
 
@@ -857,15 +929,35 @@ export function findMultiStoreyNavmeshPath(
       nodesByRegion.set(regionId, list);
     }
   }
+  // Same-region obstacle/void geometry, computed once per region and reused
+  // across every edge that crosses it — see `traversalCost` / `buildPortalGraph`.
+  const geomByRegion = new Map<string, { obstacles: Point2D[][]; voids: Point2D[][] }>();
+  const geometryFor = (regionId: string, region: NavmeshRegion) => {
+    let g = geomByRegion.get(regionId);
+    if (!g) {
+      g = regionGeometry(region, footprints);
+      geomByRegion.set(regionId, g);
+    }
+    return g;
+  };
+
   const adjacency = new Map<string, { id: string; viaRegion: string | null; cost: number }[]>();
   for (const node of nodes.values()) {
     const out: { id: string; viaRegion: string | null; cost: number }[] = [];
     const linked = new Set<string>();
     for (const regionId of node.regions) {
+      // node.storeyId === other.storeyId is guaranteed here: space ids are
+      // globally unique, so two nodes sharing a regionId share a storey too.
+      const region = regionByIdPerStorey.get(node.storeyId)?.get(regionId);
       for (const other of nodesByRegion.get(regionId) ?? []) {
         if (other.id === node.id || linked.has(other.id)) continue;
         linked.add(other.id);
-        out.push({ id: other.id, viaRegion: regionId, cost: dist(node.point, other.point) });
+        let cost = dist(node.point, other.point);
+        if (region) {
+          const { obstacles, voids } = geometryFor(regionId, region);
+          cost = traversalCost(node.point, other.point, region, obstacles, voids);
+        }
+        out.push({ id: other.id, viaRegion: regionId, cost });
       }
     }
     adjacency.set(node.id, out);

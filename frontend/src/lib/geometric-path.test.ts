@@ -735,7 +735,10 @@ describe("geometric-path", () => {
       fp,
       "S1",
     );
-    assert.ok(line.points.length > 20, "expected A* density, not a chord");
+    // A* still has to bend around the divider and through the doorway; string-pulling
+    // now collapses that into a few straight segments instead of a dense cell walk, but
+    // a literal 2-point chord (the `reached: false` fallback) would mean it gave up.
+    assert.ok(line.points.length > 2, "expected a routed path, not a straight chord");
 
     const crossings = [];
     for (let i = 1; i < line.points.length; i++) {
@@ -759,7 +762,9 @@ describe("geometric-path", () => {
       fp,
       "S1",
     );
-    assert.ok(line.points.length > 20, "expected a routed path, not a chord");
+    // Same reasoning as the doorway test above: string-pulling shortens the raw
+    // grid walk, but it must still be more than the bare 2-point failure fallback.
+    assert.ok(line.points.length > 2, "expected a routed path, not a straight chord");
     for (const p of line.points) {
       assert.ok(
         pointInSpace(p.x, p.y, fp.spaces[0]!.polygon),
