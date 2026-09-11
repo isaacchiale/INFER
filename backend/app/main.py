@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import models, routing
+from app.routers import models, route_shares, routing
 
 
 @asynccontextmanager
@@ -13,6 +13,7 @@ async def lifespan(_app: FastAPI):
     settings.data_path.mkdir(parents=True, exist_ok=True)
     (settings.data_path / "models").mkdir(parents=True, exist_ok=True)
     (settings.data_path / "derived").mkdir(parents=True, exist_ok=True)
+    (settings.data_path / "route-shares").mkdir(parents=True, exist_ok=True)
     yield
 
 
@@ -37,6 +38,7 @@ def create_app() -> FastAPI:
 
     application.include_router(models.router)
     application.include_router(routing.router)
+    application.include_router(route_shares.router)
     return application
 
 

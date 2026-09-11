@@ -160,3 +160,20 @@ def read_footprints(settings: Settings, model_id: str) -> FootprintsDocument:
     if not path.is_file():
         raise ModelNotFoundError(f"footprints for {model_id}")
     return FootprintsDocument.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _route_shares_root(settings: Settings) -> Path:
+    return settings.data_path / "route-shares"
+
+
+def route_share_path(settings: Settings, share_id: str) -> Path:
+    return _route_shares_root(settings) / f"{share_id}.glb"
+
+
+def save_route_share(settings: Settings, data: bytes) -> str:
+    """Store an exported route GLB under a fresh random id; returns that id."""
+    root = _route_shares_root(settings)
+    root.mkdir(parents=True, exist_ok=True)
+    share_id = uuid.uuid4().hex
+    route_share_path(settings, share_id).write_bytes(data)
+    return share_id
