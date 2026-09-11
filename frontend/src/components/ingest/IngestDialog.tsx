@@ -167,11 +167,6 @@ export function IngestDialog() {
             e.target.value = "";
           }}
         />
-
-        <p className="text-[11px] text-muted-foreground">
-          Loads 3D locally, then upload → extract → graph on the backend for the graph viewer. Backend
-          must be running on :8000.
-        </p>
       </DialogContent>
     </Dialog>
   );
