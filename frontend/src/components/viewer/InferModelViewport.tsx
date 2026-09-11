@@ -18,7 +18,7 @@ import {
   type ThreeAabb,
 } from "@/lib/viewer-camera-pose";
 import type { HazardZone, Route } from "@/types/infer";
-import { useInfer, useViewerPose, type NavmeshRoute } from "@/state/infer-store";
+import { useModelData, useViewport, useViewerPose, type NavmeshRoute } from "@/state/infer-store";
 import {
   createThatOpenRuntime,
   type GeometryDisplayMode,
@@ -122,8 +122,6 @@ function InferModelViewportImpl({
   const [geometryMode, setGeometryMode] = useState<GeometryDisplayMode>("ifc");
 
   const {
-    pendingIfc,
-    setViewerStatus,
     connectivityRoute,
     navmeshRoute,
     footprintsDocument,
@@ -131,11 +129,15 @@ function InferModelViewportImpl({
     excludedNodeIds,
     excludedEdgeIds,
     entitiesExtract,
+  } = useModelData();
+  const {
+    pendingIfc,
+    setViewerStatus,
     // Shared with FloorplanViewer — picking a storey in either pane now
     // isolates the same floor in both, instead of two independent filters.
     activeStoreyId: viewerStoreyId,
     setActiveStoreyId: setViewerStoreyId,
-  } = useInfer();
+  } = useViewport();
   const {
     setViewerCameraPose,
     setViewerModelBounds,

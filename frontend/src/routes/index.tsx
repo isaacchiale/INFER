@@ -8,7 +8,7 @@ import { ValidatePanel } from "@/components/panels/ValidatePanel";
 import { ScenarioPanel } from "@/components/panels/ScenarioPanel";
 import { LayersPanel } from "@/components/panels/LayersPanel";
 import { SplitWorkspace } from "@/components/workspace/SplitWorkspace";
-import { useInfer } from "@/state/infer-store";
+import { useViewport, useScenario } from "@/state/infer-store";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -30,15 +30,8 @@ export const Route = createFileRoute("/")({
 });
 
 function WorkspaceScreen() {
-  const {
-    workMode,
-    setWorkMode,
-    selectedElementIds,
-    selectElement,
-    route,
-    hazardZones,
-    animation,
-  } = useInfer();
+  const { workMode, setWorkMode, selectedElementIds, selectElement } = useViewport();
+  const { route, hazardZones, animation } = useScenario();
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">

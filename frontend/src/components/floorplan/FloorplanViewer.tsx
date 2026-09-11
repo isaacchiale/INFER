@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Check, ChevronDown, LogOut, Maximize2, Network, Route as RouteIcon } from "lucide-react";
-import { useInfer, useViewerPose } from "@/state/infer-store";
+import { useModelData, useViewport, useViewerPose } from "@/state/infer-store";
 import { continuousPolylineForStorey } from "@/lib/geometric-path";
 import { buildDoorGlyph } from "@/lib/door-symbol";
 import {
@@ -377,17 +377,14 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const {
     footprintsDocument,
     entitiesExtract,
-    activeStoreyId,
-    setActiveStoreyId,
     connectivityGraph,
     connectivityRoute,
     navmeshRoute,
     setNavmeshRoute,
     excludedNodeIds,
     excludedEdgeIds,
-    selectedElementIds,
-    selectElement,
-  } = useInfer();
+  } = useModelData();
+  const { activeStoreyId, setActiveStoreyId, selectedElementIds, selectElement } = useViewport();
   const { viewerCameraPose, viewerModelBounds, viewerCoordInverse } = useViewerPose();
   const theme = useAppTheme();
   const palette = useMemo(() => floorplanPalette(theme), [theme]);

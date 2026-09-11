@@ -5,7 +5,7 @@ import {
   getModelGraph,
   rehealModelGraph,
 } from "@/api/models";
-import { useInfer } from "@/state/infer-store";
+import { useModelData, useViewport } from "@/state/infer-store";
 import { useAppTheme } from "@/hooks/use-app-theme";
 import {
   buildGraphLayout,
@@ -49,9 +49,8 @@ export function GraphViewer({ className }: { className?: string }) {
     toggleExcludedNode,
     excludedEdgeIds,
     toggleExcludedEdge,
-    selectedElementIds,
-    selectElement,
-  } = useInfer();
+  } = useModelData();
+  const { selectedElementIds, selectElement } = useViewport();
   const theme = useAppTheme();
   const graph = connectivityGraph;
   const hasGraph = Boolean(graph && graph.nodes.length > 0);

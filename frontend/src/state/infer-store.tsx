@@ -49,49 +49,33 @@ export interface RouteRequest {
   restrictions: RouteRestriction[];
 }
 
-interface InferState {
-  // mode
+/**
+ * The store is split into several contexts by how often each group changes
+ * and who actually reads it, instead of one big InferState — bundling
+ * everything meant e.g. typing in ScenarioPanel (ScenarioState) re-rendered
+ * the 3D viewport and Floorplan (which only ever read ViewportState /
+ * ModelDataState). Heavy render consumers (FloorplanViewer, GraphViewer,
+ * InferModelViewport, the workspace route) call the specific hook(s) they
+ * need; everything else keeps using the combined useInfer() below.
+ *
+ * ViewerPoseState (viewerCameraPose etc.) was already split out earlier for
+ * the same reason — it publishes at up to 20Hz during Fly navigation.
+ */
+interface ViewportState {
   workMode: WorkMode;
   setWorkMode: (m: WorkMode) => void;
 
-  // viewport
   activeStoreyId: string | "all";
   setActiveStoreyId: (id: string | "all") => void;
   layers: LayerState[];
   toggleLayer: (id: LayerId) => void;
   setAllLayers: (visible: boolean) => void;
 
-  // selection
   selectedElementIds: string[];
   selectElement: (id: string | null) => void;
+  /** Raw setter — used by ModelDataState to drop a selection when its node is excluded. */
+  setSelectedElementIds: (ids: string[] | ((prev: string[]) => string[])) => void;
 
-  // routing
-  request: RouteRequest;
-  updateRequest: (patch: Partial<RouteRequest>) => void;
-  route: Route | null;
-  computing: boolean;
-  computeRoute: () => void;
-  clearRoute: () => void;
-
-  // animation
-  animation: { playing: boolean; stepIndex: number };
-  play: () => void;
-  pause: () => void;
-  stepForward: () => void;
-  resetAnimation: () => void;
-
-  // scenario
-  conditions: ScenarioCondition[];
-  addCondition: (c: ScenarioCondition) => void;
-  removeCondition: (id: string) => void;
-  undoRemove: () => void;
-  hazardZones: HazardZone[];
-
-  // validation
-  selectedIssueId: string | null;
-  setSelectedIssueId: (id: string | null) => void;
-
-  // chrome
   ingestOpen: boolean;
   setIngestOpen: (v: boolean) => void;
 
@@ -102,7 +86,9 @@ interface InferState {
   viewerStatus: string;
   setViewerStatus: (message: string, kind?: "info" | "error" | "loading") => void;
   viewerStatusKind: "info" | "error" | "loading";
+}
 
+interface ModelDataState {
   // Backend model + connectivity graph (null graph ⇒ demo fallback in viewer)
   backendModelId: string | null;
   connectivityGraph: ConnectivityGraph | null;
@@ -133,7 +119,36 @@ interface InferState {
   clearModelGraph: () => void;
 }
 
-const Ctx = createContext<InferState | null>(null);
+interface ScenarioState {
+  // routing
+  request: RouteRequest;
+  updateRequest: (patch: Partial<RouteRequest>) => void;
+  route: Route | null;
+  computing: boolean;
+  computeRoute: () => void;
+  clearRoute: () => void;
+
+  // animation
+  animation: { playing: boolean; stepIndex: number };
+  play: () => void;
+  pause: () => void;
+  stepForward: () => void;
+  resetAnimation: () => void;
+
+  // scenario
+  conditions: ScenarioCondition[];
+  addCondition: (c: ScenarioCondition) => void;
+  removeCondition: (id: string) => void;
+  undoRemove: () => void;
+  hazardZones: HazardZone[];
+
+  // validation
+  selectedIssueId: string | null;
+  setSelectedIssueId: (id: string | null) => void;
+}
+
+/** Combined shape returned by useInfer() — every field from every context. */
+type InferState = ViewportState & ModelDataState & ScenarioState;
 
 /**
  * Split out of InferState: viewerCameraPose publishes at up to 20Hz during
@@ -186,31 +201,13 @@ export function useViewerPose(): ViewerPoseState {
   return ctx;
 }
 
-export function InferProvider({ children }: { children: ReactNode }) {
-  return (
-    <ViewerPoseProvider>
-      <InferProviderInner>{children}</InferProviderInner>
-    </ViewerPoseProvider>
-  );
-}
+const ViewportCtx = createContext<ViewportState | null>(null);
 
-function InferProviderInner({ children }: { children: ReactNode }) {
+function ViewportProvider({ children }: { children: ReactNode }) {
   const [workMode, setWorkMode] = useState<WorkMode>("model");
   const [activeStoreyId, setActiveStoreyId] = useState<string | "all">("all");
   const [layers, setLayers] = useState<LayerState[]>(defaultLayers);
   const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
-  const [request, setRequest] = useState<RouteRequest>({
-    origin: "Meeting Room 03-12",
-    destination: "Exit E-02",
-    profile: "visitor",
-    mode: "fastest",
-    restrictions: ["avoid-hazards"],
-  });
-  const [route, setRoute] = useState<Route | null>(defaultRoute);
-  const [computing, setComputing] = useState(false);
-  const [animation, setAnimation] = useState({ playing: false, stepIndex: 0 });
-  const [conditions, setConditions] = useState<ScenarioCondition[]>(mockScenario.conditions);
-  const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
   const [ingestOpen, setIngestOpen] = useState(false);
   const [pendingIfc, setPendingIfc] = useState<{ name: string; buffer: Uint8Array } | null>(
     null,
@@ -219,8 +216,94 @@ function InferProviderInner({ children }: { children: ReactNode }) {
   const [viewerStatusKind, setViewerStatusKind] = useState<"info" | "error" | "loading">(
     "info",
   );
-  const { setViewerCameraPose, setViewerModelBounds, setViewerCoordInverse } =
-    useViewerPose();
+
+  const toggleLayer = useCallback((id: LayerId) => {
+    setLayers((prev) => prev.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)));
+  }, []);
+  const setAllLayers = useCallback((visible: boolean) => {
+    setLayers((prev) => prev.map((l) => ({ ...l, visible })));
+  }, []);
+
+  const selectElement = useCallback((id: string | null) => {
+    if (!id) {
+      setSelectedElementIds([]);
+      return;
+    }
+    setSelectedElementIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+  }, []);
+
+  const queueIfcFile = useCallback(async (file: File) => {
+    const buffer = new Uint8Array(await file.arrayBuffer());
+    // Owned copy — web-ifc may detach the underlying ArrayBuffer during convert.
+    setPendingIfc({ name: file.name, buffer: buffer.slice() });
+  }, []);
+
+  const clearPendingIfc = useCallback(() => setPendingIfc(null), []);
+
+  const setViewerStatus = useCallback(
+    (message: string, kind: "info" | "error" | "loading" = "info") => {
+      setViewerStatusMessage(message);
+      setViewerStatusKind(kind);
+    },
+    [],
+  );
+
+  const value = useMemo<ViewportState>(
+    () => ({
+      workMode,
+      setWorkMode,
+      activeStoreyId,
+      setActiveStoreyId,
+      layers,
+      toggleLayer,
+      setAllLayers,
+      selectedElementIds,
+      selectElement,
+      setSelectedElementIds,
+      ingestOpen,
+      setIngestOpen,
+      pendingIfc,
+      queueIfcFile,
+      clearPendingIfc,
+      viewerStatus,
+      setViewerStatus,
+      viewerStatusKind,
+    }),
+    [
+      workMode,
+      activeStoreyId,
+      layers,
+      toggleLayer,
+      setAllLayers,
+      selectedElementIds,
+      selectElement,
+      ingestOpen,
+      pendingIfc,
+      queueIfcFile,
+      clearPendingIfc,
+      viewerStatus,
+      setViewerStatus,
+      viewerStatusKind,
+    ],
+  );
+
+  return <ViewportCtx.Provider value={value}>{children}</ViewportCtx.Provider>;
+}
+
+export function useViewport(): ViewportState {
+  const ctx = useContext(ViewportCtx);
+  if (!ctx) throw new Error("useViewport must be used inside InferProvider");
+  return ctx;
+}
+
+const ModelDataCtx = createContext<ModelDataState | null>(null);
+
+function ModelDataProvider({ children }: { children: ReactNode }) {
+  const { setActiveStoreyId, setSelectedElementIds } = useViewport();
+  const { setViewerCameraPose, setViewerModelBounds, setViewerCoordInverse } = useViewerPose();
+
   const [backendModelId, setBackendModelId] = useState<string | null>(null);
   const [connectivityGraph, setConnectivityGraph] = useState<ConnectivityGraph | null>(null);
   const [entitiesExtract, setEntitiesExtract] = useState<EntitiesExtract | null>(null);
@@ -233,20 +316,22 @@ function InferProviderInner({ children }: { children: ReactNode }) {
   const [excludedEdgeIds, setExcludedEdgeIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
-  const removedRef = useRef<ScenarioCondition | null>(null);
 
-  const toggleExcludedNode = useCallback((nodeId: string) => {
-    setExcludedNodeIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(nodeId)) next.delete(nodeId);
-      else next.add(nodeId);
-      return next;
-    });
-    // Drop floorplan/graph highlight when the node is removed (or restored).
-    setSelectedElementIds((prev) =>
-      prev.includes(nodeId) ? prev.filter((id) => id !== nodeId) : prev,
-    );
-  }, []);
+  const toggleExcludedNode = useCallback(
+    (nodeId: string) => {
+      setExcludedNodeIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(nodeId)) next.delete(nodeId);
+        else next.add(nodeId);
+        return next;
+      });
+      // Drop floorplan/graph highlight when the node is removed (or restored).
+      setSelectedElementIds((prev) =>
+        prev.includes(nodeId) ? prev.filter((id) => id !== nodeId) : prev,
+      );
+    },
+    [setSelectedElementIds],
+  );
 
   const clearExcludedNodes = useCallback(() => {
     setExcludedNodeIds(new Set());
@@ -264,14 +349,6 @@ function InferProviderInner({ children }: { children: ReactNode }) {
   const clearExcludedEdges = useCallback(() => {
     setExcludedEdgeIds(new Set());
   }, []);
-
-  const queueIfcFile = useCallback(async (file: File) => {
-    const buffer = new Uint8Array(await file.arrayBuffer());
-    // Owned copy — web-ifc may detach the underlying ArrayBuffer during convert.
-    setPendingIfc({ name: file.name, buffer: buffer.slice() });
-  }, []);
-
-  const clearPendingIfc = useCallback(() => setPendingIfc(null), []);
 
   const setModelGraph = useCallback(
     (payload: {
@@ -292,7 +369,7 @@ function InferProviderInner({ children }: { children: ReactNode }) {
         payload.footprints?.storeys[0]?.global_id ?? payload.entities.storeys[0]?.global_id;
       if (firstStorey) setActiveStoreyId(firstStorey);
     },
-    [],
+    [setActiveStoreyId],
   );
 
   const clearModelGraph = useCallback(() => {
@@ -304,7 +381,6 @@ function InferProviderInner({ children }: { children: ReactNode }) {
     setNavmeshRoute(null);
     setExcludedNodeIds(new Set());
     setExcludedEdgeIds(new Set());
-    setPendingIfc(null);
     setViewerCameraPose(null);
     setViewerModelBounds(null);
     setViewerCoordInverse(null);
@@ -315,30 +391,71 @@ function InferProviderInner({ children }: { children: ReactNode }) {
     setConnectivityRoute(null);
   }, []);
 
-  const setViewerStatus = useCallback(
-    (message: string, kind: "info" | "error" | "loading" = "info") => {
-      setViewerStatusMessage(message);
-      setViewerStatusKind(kind);
-    },
-    [],
+  const value = useMemo<ModelDataState>(
+    () => ({
+      backendModelId,
+      connectivityGraph,
+      entitiesExtract,
+      footprintsDocument,
+      connectivityRoute,
+      setConnectivityRoute,
+      navmeshRoute,
+      setNavmeshRoute,
+      setConnectivityGraphOnly,
+      excludedNodeIds,
+      toggleExcludedNode,
+      clearExcludedNodes,
+      excludedEdgeIds,
+      toggleExcludedEdge,
+      clearExcludedEdges,
+      graphSource: connectivityGraph ? "model" : "none",
+      setModelGraph,
+      clearModelGraph,
+    }),
+    [
+      backendModelId,
+      connectivityGraph,
+      entitiesExtract,
+      footprintsDocument,
+      connectivityRoute,
+      navmeshRoute,
+      setConnectivityGraphOnly,
+      excludedNodeIds,
+      toggleExcludedNode,
+      clearExcludedNodes,
+      excludedEdgeIds,
+      toggleExcludedEdge,
+      clearExcludedEdges,
+      setModelGraph,
+      clearModelGraph,
+    ],
   );
 
-  const toggleLayer = useCallback((id: LayerId) => {
-    setLayers((prev) => prev.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)));
-  }, []);
-  const setAllLayers = useCallback((visible: boolean) => {
-    setLayers((prev) => prev.map((l) => ({ ...l, visible })));
-  }, []);
+  return <ModelDataCtx.Provider value={value}>{children}</ModelDataCtx.Provider>;
+}
 
-  const selectElement = useCallback((id: string | null) => {
-    if (!id) {
-      setSelectedElementIds([]);
-      return;
-    }
-    setSelectedElementIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-    );
-  }, []);
+export function useModelData(): ModelDataState {
+  const ctx = useContext(ModelDataCtx);
+  if (!ctx) throw new Error("useModelData must be used inside InferProvider");
+  return ctx;
+}
+
+const ScenarioCtx = createContext<ScenarioState | null>(null);
+
+function ScenarioProvider({ children }: { children: ReactNode }) {
+  const [request, setRequest] = useState<RouteRequest>({
+    origin: "Meeting Room 03-12",
+    destination: "Exit E-02",
+    profile: "visitor",
+    mode: "fastest",
+    restrictions: ["avoid-hazards"],
+  });
+  const [route, setRoute] = useState<Route | null>(defaultRoute);
+  const [computing, setComputing] = useState(false);
+  const [animation, setAnimation] = useState({ playing: false, stepIndex: 0 });
+  const [conditions, setConditions] = useState<ScenarioCondition[]>(mockScenario.conditions);
+  const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
+  const removedRef = useRef<ScenarioCondition | null>(null);
 
   const updateRequest = useCallback((patch: Partial<RouteRequest>) => {
     setRequest((prev) => ({ ...prev, ...patch }));
@@ -392,17 +509,8 @@ function InferProviderInner({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const value = useMemo<InferState>(
+  const value = useMemo<ScenarioState>(
     () => ({
-      workMode,
-      setWorkMode,
-      activeStoreyId,
-      setActiveStoreyId,
-      layers,
-      toggleLayer,
-      setAllLayers,
-      selectedElementIds,
-      selectElement,
       request,
       updateRequest,
       route,
@@ -421,41 +529,8 @@ function InferProviderInner({ children }: { children: ReactNode }) {
       hazardZones: mockHazards,
       selectedIssueId,
       setSelectedIssueId,
-      ingestOpen,
-      setIngestOpen,
-      pendingIfc,
-      queueIfcFile,
-      clearPendingIfc,
-      viewerStatus,
-      setViewerStatus,
-      viewerStatusKind,
-      backendModelId,
-      connectivityGraph,
-      entitiesExtract,
-      footprintsDocument,
-      connectivityRoute,
-      setConnectivityRoute,
-      navmeshRoute,
-      setNavmeshRoute,
-      setConnectivityGraphOnly,
-      excludedNodeIds,
-      toggleExcludedNode,
-      clearExcludedNodes,
-      excludedEdgeIds,
-      toggleExcludedEdge,
-      clearExcludedEdges,
-      graphSource: connectivityGraph ? "model" : "none",
-      setModelGraph,
-      clearModelGraph,
     }),
     [
-      workMode,
-      activeStoreyId,
-      layers,
-      toggleLayer,
-      setAllLayers,
-      selectedElementIds,
-      selectElement,
       request,
       updateRequest,
       route,
@@ -472,36 +547,44 @@ function InferProviderInner({ children }: { children: ReactNode }) {
       removeCondition,
       undoRemove,
       selectedIssueId,
-      ingestOpen,
-      pendingIfc,
-      queueIfcFile,
-      clearPendingIfc,
-      viewerStatus,
-      setViewerStatus,
-      viewerStatusKind,
-      backendModelId,
-      connectivityGraph,
-      entitiesExtract,
-      footprintsDocument,
-      connectivityRoute,
-      navmeshRoute,
-      setConnectivityGraphOnly,
-      excludedNodeIds,
-      toggleExcludedNode,
-      clearExcludedNodes,
-      excludedEdgeIds,
-      toggleExcludedEdge,
-      clearExcludedEdges,
-      setModelGraph,
-      clearModelGraph,
     ],
   );
 
-  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+  return <ScenarioCtx.Provider value={value}>{children}</ScenarioCtx.Provider>;
 }
 
-export function useInfer() {
-  const ctx = useContext(Ctx);
-  if (!ctx) throw new Error("useInfer must be used inside InferProvider");
+export function useScenario(): ScenarioState {
+  const ctx = useContext(ScenarioCtx);
+  if (!ctx) throw new Error("useScenario must be used inside InferProvider");
   return ctx;
+}
+
+export function InferProvider({ children }: { children: ReactNode }) {
+  return (
+    <ViewerPoseProvider>
+      <ViewportProvider>
+        <ModelDataProvider>
+          <ScenarioProvider>{children}</ScenarioProvider>
+        </ModelDataProvider>
+      </ViewportProvider>
+    </ViewerPoseProvider>
+  );
+}
+
+/**
+ * Combined view of every context below ViewerPoseState — kept for the many
+ * lightweight consumers (panels, toolbars, the ingest dialog) where
+ * subscribing to everything costs nothing. Render-heavy consumers
+ * (FloorplanViewer, GraphViewer, InferModelViewport, the workspace route)
+ * call useViewport()/useModelData()/useScenario() directly instead, so a
+ * change in one doesn't re-render a component that only reads another.
+ */
+export function useInfer(): InferState {
+  const viewport = useViewport();
+  const modelData = useModelData();
+  const scenario = useScenario();
+  return useMemo(
+    () => ({ ...viewport, ...modelData, ...scenario }),
+    [viewport, modelData, scenario],
+  );
 }
