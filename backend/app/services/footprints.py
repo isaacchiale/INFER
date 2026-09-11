@@ -18,7 +18,7 @@ else ObjectPlacement axes / OverallWidth×OverallDepth, else a point only.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Iterable
+from typing import Callable, Iterable, TypeVar
 import logging
 import math
 
@@ -823,17 +823,34 @@ def _stair_xy_points(ifc, stair, aggregated_parts: dict) -> list[tuple[float, fl
     return _unique_xy(points)
 
 
-def _stair_footprint(ifc, stair, aggregated_parts: dict) -> StairFootprint:
-    """Stairs stay on hull/bbox for v1 overlay (not full outline)."""
-    gid = _gid(stair)
-    storey = _storey_gid(ifc, stair)
-    name = _name(stair)
+_FootprintT = TypeVar("_FootprintT")
 
-    xy = _stair_xy_points(ifc, stair, aggregated_parts)
+
+def _hull_or_bbox_footprint(
+    gid: str,
+    name: str,
+    storey: str | None,
+    xy: list[tuple[float, float]],
+    bbox_element,
+    model_cls: Callable[..., _FootprintT],
+    min_area: float | None = None,
+) -> _FootprintT | None:
+    """Shared hull -> placement-bbox -> incomplete waterfall behind
+    walls/stairs/furniture footprints (they differ only in how `xy` and
+    `bbox_element` are sourced, and whether tiny hulls should be kept).
+
+    `min_area`, when given (furniture only), drops a hull under that area
+    outright rather than keeping it or re-approximating via the bbox guess —
+    it's a *measured*, small footprint, not a missing one — and skips the
+    final `incomplete=True` placeholder too: nothing here is worth flagging
+    as broken data, just not worth keeping as an obstacle.
+    """
     if len(xy) >= 3:
         hull = _convex_hull(xy)
         if len(hull) >= 3:
-            return StairFootprint(
+            if min_area is not None and abs(_signed_area(hull)) < min_area:
+                return None
+            return model_cls(
                 global_id=gid,
                 name=name,
                 storey_global_id=storey,
@@ -842,9 +859,9 @@ def _stair_footprint(ifc, stair, aggregated_parts: dict) -> StairFootprint:
                 method="ifc_mesh_xy_hull",
             )
 
-    bbox = _bbox_polygon_from_placement(stair)
+    bbox = _bbox_polygon_from_placement(bbox_element)
     if bbox is not None:
-        return StairFootprint(
+        return model_cls(
             global_id=gid,
             name=name,
             storey_global_id=storey,
@@ -853,7 +870,10 @@ def _stair_footprint(ifc, stair, aggregated_parts: dict) -> StairFootprint:
             method="ifc_placement_bbox",
         )
 
-    return StairFootprint(
+    if min_area is not None:
+        return None
+
+    return model_cls(
         global_id=gid,
         name=name,
         storey_global_id=storey,
@@ -863,43 +883,27 @@ def _stair_footprint(ifc, stair, aggregated_parts: dict) -> StairFootprint:
     )
 
 
+def _stair_footprint(ifc, stair, aggregated_parts: dict) -> StairFootprint:
+    """Stairs stay on hull/bbox for v1 overlay (not full outline)."""
+    return _hull_or_bbox_footprint(
+        _gid(stair),
+        _name(stair),
+        _storey_gid(ifc, stair),
+        _stair_xy_points(ifc, stair, aggregated_parts),
+        stair,
+        StairFootprint,
+    )
+
+
 def _wall_footprint(ifc, wall) -> WallFootprint:
     """Walls use convex hull / placement bbox for strip blockage tests."""
-    gid = _gid(wall)
-    storey = _storey_gid(ifc, wall)
-    name = _name(wall)
-
-    xy = _unique_xy(_mesh_xy_points(wall))
-    if len(xy) >= 3:
-        hull = _convex_hull(xy)
-        if len(hull) >= 3:
-            return WallFootprint(
-                global_id=gid,
-                name=name,
-                storey_global_id=storey,
-                polygon=_to_points(hull),
-                incomplete=False,
-                method="ifc_mesh_xy_hull",
-            )
-
-    bbox = _bbox_polygon_from_placement(wall)
-    if bbox is not None:
-        return WallFootprint(
-            global_id=gid,
-            name=name,
-            storey_global_id=storey,
-            polygon=_to_points(bbox),
-            incomplete=False,
-            method="ifc_placement_bbox",
-        )
-
-    return WallFootprint(
-        global_id=gid,
-        name=name,
-        storey_global_id=storey,
-        polygon=[],
-        incomplete=True,
-        method="unavailable",
+    return _hull_or_bbox_footprint(
+        _gid(wall),
+        _name(wall),
+        _storey_gid(ifc, wall),
+        _unique_xy(_mesh_xy_points(wall)),
+        wall,
+        WallFootprint,
     )
 
 
@@ -912,37 +916,15 @@ def _furniture_footprint(ifc, item) -> FurnitureFootprint | None:
     This only applies when the mesh gave us a real (small) measurement; if
     there's no mesh at all we still fall through to the placement-bbox guess,
     same as walls, rather than assuming "no mesh" means "tiny"."""
-    gid = _gid(item)
-    storey = _storey_gid(ifc, item)
-    name = _name(item)
-
-    xy = _unique_xy(_mesh_xy_points(item))
-    if len(xy) >= 3:
-        hull = _convex_hull(xy)
-        if len(hull) >= 3:
-            if abs(_signed_area(hull)) < _MIN_FURNITURE_AREA_M2:
-                return None
-            return FurnitureFootprint(
-                global_id=gid,
-                name=name,
-                storey_global_id=storey,
-                polygon=_to_points(hull),
-                incomplete=False,
-                method="ifc_mesh_xy_hull",
-            )
-
-    bbox = _bbox_polygon_from_placement(item)
-    if bbox is not None:
-        return FurnitureFootprint(
-            global_id=gid,
-            name=name,
-            storey_global_id=storey,
-            polygon=_to_points(bbox),
-            incomplete=False,
-            method="ifc_placement_bbox",
-        )
-
-    return None
+    return _hull_or_bbox_footprint(
+        _gid(item),
+        _name(item),
+        _storey_gid(ifc, item),
+        _unique_xy(_mesh_xy_points(item)),
+        item,
+        FurnitureFootprint,
+        min_area=_MIN_FURNITURE_AREA_M2,
+    )
 
 
 def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
