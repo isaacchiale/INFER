@@ -10,14 +10,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
 import { exportGLB } from "@/lib/export-glb";
 import { buildRouteShareScene } from "@/lib/route-share-scene";
 import { uploadRouteShare } from "@/api/route-shares";
 import type { NavmeshRoute } from "@/state/infer-store";
 import type { FootprintsDocument } from "@/types/footprints";
-
-const GLASS = "rounded-[6px] border border-border bg-background/90 shadow-sm backdrop-blur-[2px]";
 
 /**
  * Exports the current click-to-click navmesh route (plus the rooms it
@@ -103,19 +100,16 @@ export function ShareRouteButton({
 
   return (
     <>
-      <button
-        type="button"
+      <Button
+        variant="destructive"
+        size="sm"
         disabled={!hasRoute}
         onClick={openDialog}
-        className={cn(
-          GLASS,
-          "pointer-events-auto inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40",
-        )}
-        title="Export this route as a 3D file, or share a link/QR to open it on another device"
+        title="Export the current route as a 3D file, or share a link/QR to open it on another device"
       >
         <Share2 className="size-3.5" aria-hidden />
         Share
-      </button>
+      </Button>
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="sm:max-w-md">

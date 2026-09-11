@@ -41,7 +41,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { FloorplanSvgLayers, PORTAL_COLORS, type PlanLayer } from "./FloorplanSvgLayers";
-import { ShareRouteButton } from "./ShareRouteButton";
 import { useNavmeshRouting } from "./useNavmeshRouting";
 
 /** Same canvas colours as Graph Viewer (`graphPalette`). */
@@ -1039,8 +1038,6 @@ export function FloorplanViewer({ className }: { className?: string }) {
                 </button>
               </div>
             ) : null}
-
-            <ShareRouteButton navmeshRoute={navmeshRoute} footprintsDocument={footprintsDocument} />
           </div>
 
           <button

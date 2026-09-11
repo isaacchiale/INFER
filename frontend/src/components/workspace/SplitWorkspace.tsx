@@ -6,8 +6,10 @@ import {
 } from "react-resizable-panels";
 import { Box, GitFork, LayoutGrid, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useModelData } from "@/state/infer-store";
 import { GraphViewer } from "@/components/graph/GraphViewer";
 import { FloorplanViewer } from "@/components/floorplan/FloorplanViewer";
+import { ShareRouteButton } from "@/components/floorplan/ShareRouteButton";
 
 export type PaneId = "model3d" | "floorplan" | "graph";
 
@@ -141,6 +143,7 @@ const PARKED_STYLE: CSSProperties = {
 };
 
 export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
+  const { navmeshRoute, footprintsDocument } = useModelData();
   const [panes, setPanes] = useState<Record<PaneId, PaneState>>({
     model3d: { open: true },
     floorplan: { open: true },
@@ -256,6 +259,10 @@ export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
             </button>
           );
         })}
+
+        <div className="ml-auto flex items-center">
+          <ShareRouteButton navmeshRoute={navmeshRoute} footprintsDocument={footprintsDocument} />
+        </div>
       </div>
 
       <div ref={workspaceRef} className="relative min-h-0 flex-1 overflow-hidden">
