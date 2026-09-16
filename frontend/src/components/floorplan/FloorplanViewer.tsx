@@ -1,18 +1,34 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useTransition,
+} from "react";
 import {
   Box,
   Check,
   ChevronDown,
+  Flame,
   FolderOpen,
+  Layers,
   LogOut,
   Maximize2,
   Network,
   Route as RouteIcon,
 } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { useModelData, useViewport, useViewerPose } from "@/state/infer-store";
+import {
+  useModelData,
+  useViewport,
+  useViewerPose,
+  type EvacuationLoadMarker,
+} from "@/state/infer-store";
 import { continuousPolylineForStorey, pointInPolygon } from "@/lib/geometric-path";
-import { buildStoreyNavmesh, regionAtPoint } from "@/lib/navmesh";
+import { buildStoreyNavmesh, computeBuildingEvacuationLoad, regionAtPoint } from "@/lib/navmesh";
 import {
   elevationsForVerticalRemap,
   normalizeElevationsToMetres,
@@ -45,13 +61,22 @@ import { cn } from "@/lib/utils";
 import { GLASS } from "@/lib/floating-panel";
 import { useAppTheme, type AppTheme } from "@/hooks/use-app-theme";
 import type { FootprintsDocument, Point2D } from "@/types/footprints";
+import type { GraphNode } from "@/types/graph";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { FloorplanSvgLayers, PORTAL_COLORS, type PlanLayer } from "./FloorplanSvgLayers";
+import {
+  evacuationHeatColor,
+  FloorplanSvgLayers,
+  PORTAL_COLORS,
+  type PlanLayer,
+} from "./FloorplanSvgLayers";
 import { useNavmeshRouting } from "./useNavmeshRouting";
 
 /** Same canvas colours as Graph Viewer (`graphPalette`). */
@@ -112,7 +137,7 @@ function spaceAtWorldPoint(
   world: Point2D,
   footprints: FootprintsDocument | null,
   storeyId: string,
-): { global_id: string } | null {
+): { global_id: string; name: string } | null {
   if (!footprints) return null;
   for (const s of footprints.spaces) {
     if (s.incomplete || s.polygon.length < 3) continue;
@@ -127,9 +152,9 @@ function doorAtWorldPoint(
   footprints: FootprintsDocument | null,
   storeyId: string,
   hitR: number,
-): { global_id: string } | null {
+): { global_id: string; name: string } | null {
   if (!footprints) return null;
-  let best: { global_id: string } | null = null;
+  let best: { global_id: string; name: string } | null = null;
   let bestDist = hitR;
   for (const d of footprints.doors) {
     if (d.incomplete || !d.point) continue;
@@ -151,15 +176,38 @@ export function FloorplanViewer({ className }: { className?: string }) {
     connectivityRoute,
     navmeshRoute,
     setNavmeshRoute,
+    setEvacuationLoadMarkers,
+    setViewerFocusRequest,
     excludedNodeIds,
     excludedEdgeIds,
     toggleExcludedNode,
   } = useModelData();
-  const { activeStoreyId, setActiveStoreyId, selectedElementIds, selectElement, setIngestOpen } =
-    useViewport();
+  const {
+    activeStoreyId,
+    setActiveStoreyId,
+    selectedElementIds,
+    selectElement,
+    setIngestOpen,
+    // Shared with InferModelViewport — toggling this also drives the 3D
+    // pane's evacuation-load markers (see setEvacuationLoadMarkers below),
+    // not just this pane's own heat map.
+    showEvacuationLoad,
+    setShowEvacuationLoad,
+  } = useViewport();
   const { viewerCameraPose, viewerModelBounds, viewerCoordInverse } = useViewerPose();
   const theme = useAppTheme();
   const palette = useMemo(() => floorplanPalette(theme), [theme]);
+
+  // computeBuildingEvacuationLoad (a Dijkstra over the whole building) runs
+  // synchronously inside the buildingEvacuationLoad useMemo below, which
+  // means it runs during render and blocks paint/input for however long it
+  // takes — a real, measured cost on a large building (see navmesh.test.ts's
+  // "stays fast for a tall building" perf test). Toggling the heat map and
+  // blocking a portal (the two interactions that trigger a recompute) both
+  // go through startTransition so React keeps the rest of the UI responsive
+  // and can report isEvacuationLoadPending, instead of the click just
+  // freezing until the computation finishes.
+  const [isEvacuationLoadPending, startEvacuationLoadTransition] = useTransition();
 
   const [planDisplayMode, setPlanDisplayMode] = useState<PlanDisplayMode>("ifc");
   /** "route": click two points. "exit": click one point, auto-route to the nearest exit. */
@@ -586,6 +634,201 @@ export function FloorplanViewer({ className }: { className?: string }) {
     excludedEdgeIds,
   ]);
 
+  // Only computed while the overlay is actually on — it's a Dijkstra run
+  // over the *whole building's* portal graph, not a one-off route. Shares
+  // blockedPortalIds with the hazard what-if state on purpose: blocking a
+  // door as a "what if this exit failed" test should shift the bottleneck
+  // heat map too, not require a second, disconnected control.
+  //
+  // Building-wide (computeBuildingEvacuationLoad over every storey), not
+  // per-storey (computeEvacuationLoad) — a room upstairs that reaches a
+  // stairwell has its route actually continue down through it to a real
+  // exit, so a ground-floor lobby door's count reflects everyone funnelling
+  // through it from upper floors too, not just that floor's own rooms.
+  const buildingEvacuationLoad = useMemo(() => {
+    if (!showEvacuationLoad || !allStoreyNavmeshes.length) return null;
+    return computeBuildingEvacuationLoad(allStoreyNavmeshes, footprintsDocument, connectivityGraph, {
+      blockedPortalIds,
+    });
+  }, [showEvacuationLoad, allStoreyNavmeshes, footprintsDocument, connectivityGraph, blockedPortalIds]);
+
+  // The floorplan pane only ever shows one storey's plan at a time, so
+  // stair markers (which carry a storeyId, unlike real portals which are
+  // already storey-scoped via storeyNavmesh.portals itself) and the
+  // unreachable-room count need filtering down to *this* storey for
+  // display — the underlying load numbers still reflect the whole building,
+  // only which markers get drawn on this one plan is scoped.
+  const evacuationLoad = useMemo(() => {
+    if (!buildingEvacuationLoad || !storeyNavmesh) return null;
+    const regionIdsHere = new Set(storeyNavmesh.regions.map((r) => r.spaceId));
+    return {
+      portalLoad: buildingEvacuationLoad.portalLoad,
+      stairNodes: buildingEvacuationLoad.stairNodes.filter((n) => n.storeyId === storeyNavmesh.storeyId),
+      unreachableSpaceIds: buildingEvacuationLoad.unreachableSpaceIds.filter((id) =>
+        regionIdsHere.has(id),
+      ),
+      skippedSpaceIds: buildingEvacuationLoad.skippedSpaceIds.filter((id) => regionIdsHere.has(id)),
+    };
+  }, [buildingEvacuationLoad, storeyNavmesh]);
+
+  const storeyNameById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const s of storeys) {
+      map.set(
+        s.global_id,
+        s.name?.trim() || (s.elevation != null ? `E${s.elevation}` : s.global_id.slice(0, 8)),
+      );
+    }
+    return map;
+  }, [storeys]);
+
+  /** Real (non-vertical-connector) portal ids only exist per-storey on `mesh.portals` — pool them across every storey so building-wide load entries can be labelled regardless of which storey is on screen. */
+  const portalInfoById = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        storeyId: string;
+        kind: "door" | "space" | "exit";
+        doorGlobalId: string | null;
+        point: Point2D;
+      }
+    >();
+    for (const mesh of allStoreyNavmeshes) {
+      for (const p of mesh.portals) {
+        map.set(p.id, {
+          storeyId: mesh.storeyId,
+          kind: p.kind,
+          doorGlobalId: p.doorGlobalId,
+          point: p.point,
+        });
+      }
+    }
+    return map;
+  }, [allStoreyNavmeshes]);
+
+  type BottleneckEntry = {
+    id: string;
+    storeyId: string;
+    storeyName: string;
+    kind: "exit" | "door" | "space" | "stair" | "lift";
+    label: string;
+    load: number;
+    point: Point2D;
+  };
+
+  // O(1) lookups for the two loops below instead of Array.find() inside
+  // them — cheap at today's test-model scale (a handful of stairs) but a
+  // real quadratic cost once a building has hundreds of portals crossed
+  // against hundreds of stairs/graph nodes.
+  const stairNodesById = useMemo(() => {
+    const map = new Map<string, { id: string; storeyId: string; point: Point2D }>();
+    if (buildingEvacuationLoad) {
+      for (const n of buildingEvacuationLoad.stairNodes) map.set(n.id, n);
+    }
+    return map;
+  }, [buildingEvacuationLoad]);
+
+  const graphNodesById = useMemo(() => {
+    const map = new Map<string, GraphNode>();
+    if (connectivityGraph) {
+      for (const n of connectivityGraph.nodes) map.set(n.id, n);
+    }
+    return map;
+  }, [connectivityGraph]);
+
+  // Ranked view of the same `buildingEvacuationLoad.portalLoad` map the heat
+  // colors already use — a scannable top-N list next to the color dots,
+  // resolved back to a human label (door name / stair name / storey) instead
+  // of raw portal ids. Carries each entry's plan point too, so clicking one
+  // can fly the 3D camera there (see viewerFocusRequest), not just switch
+  // the 2D storey.
+  const worstBottlenecks = useMemo<BottleneckEntry[]>(() => {
+    if (!buildingEvacuationLoad) return [];
+    const entries: BottleneckEntry[] = [];
+    for (const [id, load] of buildingEvacuationLoad.portalLoad) {
+      if (id.startsWith("vlink-evac:")) {
+        const rest = id.slice("vlink-evac:".length);
+        const at = rest.lastIndexOf("@");
+        if (at < 0) continue;
+        const linkId = rest.slice(0, at);
+        const storeyId = rest.slice(at + 1);
+        const stair = stairNodesById.get(id);
+        if (!stair) continue;
+        const isLift = linkId.startsWith("lift:");
+        const graphNode = graphNodesById.get(linkId);
+        const fallback = `${isLift ? "Lift" : "Stair"} ${linkId.split(":")[1]?.slice(0, 8) ?? ""}`;
+        entries.push({
+          id,
+          storeyId,
+          storeyName: storeyNameById.get(storeyId) ?? storeyId,
+          kind: isLift ? "lift" : "stair",
+          label: graphNode?.name?.trim() || fallback,
+          load,
+          point: stair.point,
+        });
+      } else {
+        const info = portalInfoById.get(id);
+        if (!info) continue;
+        const door = info.doorGlobalId ? doorsByGlobalId.get(info.doorGlobalId) : null;
+        const fallback = info.kind === "exit" ? "Exit" : info.kind === "door" ? "Door" : "Passage";
+        entries.push({
+          id,
+          storeyId: info.storeyId,
+          storeyName: storeyNameById.get(info.storeyId) ?? info.storeyId,
+          kind: info.kind,
+          label: door?.name?.trim() || fallback,
+          load,
+          point: info.point,
+        });
+      }
+    }
+    entries.sort((a, b) => b.load - a.load);
+    return entries.slice(0, 8);
+  }, [buildingEvacuationLoad, stairNodesById, graphNodesById, storeyNameById, portalInfoById, doorsByGlobalId]);
+
+  const hotspotIds = useMemo(
+    () => new Set(worstBottlenecks.map((b) => b.id)),
+    [worstBottlenecks],
+  );
+
+  // Every loaded door/exit/stair/lift with nonzero load, in plan space —
+  // the full building, not just the top 8 shown in the ranked list. Published
+  // to the shared store (see EvacuationLoadMarker) so InferModelViewport can
+  // lift each point into Three coordinates and render its own 3D markers,
+  // the same way it already builds its own navmesh overlay from shared
+  // footprints/graph state instead of receiving pre-built Three.js geometry.
+  const evacuationLoadMarkersForViewer = useMemo(() => {
+    if (!buildingEvacuationLoad) return null;
+    const markers: EvacuationLoadMarker[] = [];
+    for (const [id, load] of buildingEvacuationLoad.portalLoad) {
+      if (id.startsWith("vlink-evac:")) {
+        const rest = id.slice("vlink-evac:".length);
+        const at = rest.lastIndexOf("@");
+        if (at < 0) continue;
+        const linkId = rest.slice(0, at);
+        const storeyId = rest.slice(at + 1);
+        const stair = stairNodesById.get(id);
+        if (!stair) continue;
+        markers.push({
+          id,
+          storeyId,
+          point: stair.point,
+          kind: linkId.startsWith("lift:") ? "lift" : "stair",
+          load,
+        });
+      } else {
+        const info = portalInfoById.get(id);
+        if (!info) continue;
+        markers.push({ id, storeyId: info.storeyId, point: info.point, kind: info.kind, load });
+      }
+    }
+    return markers;
+  }, [buildingEvacuationLoad, stairNodesById, portalInfoById]);
+
+  useEffect(() => {
+    setEvacuationLoadMarkers(evacuationLoadMarkersForViewer);
+  }, [evacuationLoadMarkersForViewer, setEvacuationLoadMarkers]);
+
   const navmeshStart =
     navmeshRoute && navmeshRoute.storeyId === displayStoreyId ? navmeshRoute.start : null;
   const navmeshEnd =
@@ -676,6 +919,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
   selectElementRef.current = selectElement;
   const toggleExcludedNodeRef = useRef(toggleExcludedNode);
   toggleExcludedNodeRef.current = toggleExcludedNode;
+  const excludedNodeIdsRef = useRef(excludedNodeIds);
+  excludedNodeIdsRef.current = excludedNodeIds;
 
   const incompleteCount =
     footprintsDocument?.spaces.filter((s) => s.incomplete).length ?? 0;
@@ -833,6 +1078,9 @@ export function FloorplanViewer({ className }: { className?: string }) {
      * Graph Viewer's right-click already writes, so it affects routing and
      * rendering everywhere, not just this pane. A portal with no real IFC
      * door behind it (an inferred space-space heal) has nothing to exclude.
+     * Excluding (not restoring) toasts with an Undo action — this silently
+     * removes a room/door from evacuation routing otherwise, which is a real
+     * liability on a safety-adjacent feature, not just a UX nicety.
      */
     const toggleExcludeAt = (clientX: number, clientY: number) => {
       const pick = navmeshPickRef.current;
@@ -843,12 +1091,26 @@ export function FloorplanViewer({ className }: { className?: string }) {
       const world = clientToView(clientX, clientY, svg, bounds, cameraRef.current);
       const door = doorAtWorldPoint(world, pick.footprints, pick.storeyId, pick.portalHitR);
       if (door) {
-        toggleExcludedNodeRef.current(`door:${door.global_id}`);
+        const nodeId = `door:${door.global_id}`;
+        const wasExcluded = excludedNodeIdsRef.current.has(nodeId);
+        toggleExcludedNodeRef.current(nodeId);
+        if (!wasExcluded) {
+          toast(`${door.name?.trim() || "Door"} excluded from routing`, {
+            action: { label: "Undo", onClick: () => toggleExcludedNodeRef.current(nodeId) },
+          });
+        }
         return;
       }
       const space = spaceAtWorldPoint(world, pick.footprints, pick.storeyId);
       if (!space) return;
-      toggleExcludedNodeRef.current(`space:${space.global_id}`);
+      const nodeId = `space:${space.global_id}`;
+      const wasExcluded = excludedNodeIdsRef.current.has(nodeId);
+      toggleExcludedNodeRef.current(nodeId);
+      if (!wasExcluded) {
+        toast(`${space.name?.trim() || "Room"} excluded from routing`, {
+          action: { label: "Undo", onClick: () => toggleExcludedNodeRef.current(nodeId) },
+        });
+      }
     };
 
     const onPointerDown = (e: PointerEvent) => {
@@ -980,11 +1242,13 @@ export function FloorplanViewer({ className }: { className?: string }) {
         const world = clientToView(e.clientX, e.clientY, svg, bounds, cameraRef.current);
         const portal = nearestPortalWithin(pick.mesh.portals, world, pick.portalHitR);
         if (portal) {
-          setBlockedPortalIds((prev) => {
-            const next = new Set(prev);
-            if (next.has(portal.id)) next.delete(portal.id);
-            else next.add(portal.id);
-            return next;
+          startEvacuationLoadTransition(() => {
+            setBlockedPortalIds((prev) => {
+              const next = new Set(prev);
+              if (next.has(portal.id)) next.delete(portal.id);
+              else next.add(portal.id);
+              return next;
+            });
           });
           return;
         }
@@ -1118,6 +1382,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
             </DropdownMenu>
 
             {planDisplayMode === "navmesh" ? (
+              <>
               <div className={cn(GLASS, "flex overflow-hidden")} role="tablist" aria-label="Navmesh pick mode">
                 <button
                   type="button"
@@ -1158,6 +1423,34 @@ export function FloorplanViewer({ className }: { className?: string }) {
                   Nearest exit
                 </button>
               </div>
+              <button
+                type="button"
+                aria-pressed={showEvacuationLoad}
+                onClick={() => {
+                  const next = !showEvacuationLoad;
+                  startEvacuationLoadTransition(() => setShowEvacuationLoad(next));
+                }}
+                className={cn(
+                  GLASS,
+                  "pointer-events-auto inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                  showEvacuationLoad
+                    ? "bg-muted text-foreground"
+                    : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                )}
+                title="Simulate every room's route to its nearest exit and heat-map which doors carry the most traffic"
+              >
+                <Flame
+                  className={cn("size-3.5", isEvacuationLoadPending && "animate-pulse")}
+                  aria-hidden
+                />
+                Evacuation load
+                {isEvacuationLoadPending ? (
+                  <span className="text-[10px] font-normal text-muted-foreground">
+                    computing…
+                  </span>
+                ) : null}
+              </button>
+              </>
             ) : null}
           </div>
 
@@ -1213,6 +1506,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     navmeshEnd={navmeshEnd}
                     isExitRoute={isExitRoute}
                     blockedPortalIds={blockedPortalIds}
+                    evacuationLoad={evacuationLoad ?? null}
+                    hotspotIds={showEvacuationLoad ? hotspotIds : null}
                     doorsByGlobalId={doorsByGlobalId}
                     palette={palette}
                     selectedSpaces={selectedSpaces}
@@ -1243,7 +1538,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                             cameraR * 4.2,
                             (58 * Math.PI) / 180,
                           )}
-                          fill="rgba(66,133,244,0.38)"
+                          fill="color-mix(in oklch, var(--primary) 38%, transparent)"
                           stroke="none"
                         />
                         <circle
@@ -1257,7 +1552,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                           cx={0}
                           cy={0}
                           r={cameraR}
-                          fill="#4285F4"
+                          fill="var(--primary)"
                           stroke="#ffffff"
                           strokeWidth={doorStroke * 0.6}
                         >
@@ -1278,13 +1573,13 @@ export function FloorplanViewer({ className }: { className?: string }) {
                           cy={0}
                           r={portalR * 1.8}
                           fill="none"
-                          stroke="#ef4444"
+                          stroke="var(--destructive)"
                           strokeWidth={doorStroke * 0.7}
                           opacity={0.85}
                         />
                         <path
                           d={`M${-portalR * 0.9} ${-portalR * 0.9} L${portalR * 0.9} ${portalR * 0.9} M${-portalR * 0.9} ${portalR * 0.9} L${portalR * 0.9} ${-portalR * 0.9}`}
-                          stroke="#ef4444"
+                          stroke="var(--destructive)"
                           strokeWidth={doorStroke * 0.9}
                           strokeLinecap="round"
                         >
@@ -1317,165 +1612,282 @@ export function FloorplanViewer({ className }: { className?: string }) {
               </div>
             )}
 
-            <div className="pointer-events-none absolute bottom-2 left-2 right-2 z-20 flex flex-wrap items-center gap-1.5 rounded-md border border-border/80 bg-background/90 px-2 py-1.5 text-[11px] text-muted-foreground backdrop-blur-sm">
-              {planDisplayMode === "navmesh" ? (
-                <>
-                  <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground">
-                    <span
-                      className="inline-block size-2.5 border border-[#64748b]"
-                      style={{ background: "rgba(148,163,184,0.35)" }}
-                    />
-                    Region
-                  </span>
-                  <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground">
-                    <span
-                      className="inline-block size-2 rounded-full"
-                      style={{ background: PORTAL_COLORS.door }}
-                    />
-                    IFC door
-                  </span>
-                  <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground">
-                    <span
-                      className="inline-block size-2 rounded-full"
-                      style={{ background: PORTAL_COLORS.doorHeal }}
-                    />
-                    Door heal
-                  </span>
-                  <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground">
-                    <span
-                      className="inline-block size-2 rounded-full"
-                      style={{ background: PORTAL_COLORS.spacePortal }}
-                    />
-                    Space portal
-                  </span>
-                  <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground">
-                    <span
-                      className="inline-block size-2 rounded-full"
-                      style={{ background: PORTAL_COLORS.exit }}
-                    />
-                    Exit
-                  </span>
-                </>
-              ) : null}
-              {(
-                (
-                  planDisplayMode === "ifc"
-                    ? ([
-                        {
-                          key: "route" as const,
-                          label: "Route",
-                          swatch: <span className="inline-block h-0.5 w-4 bg-[#1d4ed8]" />,
-                        },
-                        {
-                          key: "spaces" as const,
-                          label: "Space",
-                          swatch: (
+            <div className="pointer-events-none absolute bottom-2 left-2 right-2 z-20 flex flex-col items-start gap-1">
+              <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-border/80 bg-background/90 px-2 py-1.5 text-[11px] text-muted-foreground backdrop-blur-sm">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      className="pointer-events-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground transition-colors hover:bg-muted"
+                    >
+                      <Layers className="size-3" aria-hidden />
+                      Legend
+                      <ChevronDown className="size-3 text-muted-foreground" aria-hidden />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-60 text-[12px]">
+                    {planDisplayMode === "navmesh" ? (
+                      <>
+                        <DropdownMenuLabel className="text-[11px] text-muted-foreground">
+                          Legend
+                        </DropdownMenuLabel>
+                        <div className="flex flex-col gap-1.5 px-2 pb-2">
+                          <div className="flex items-center gap-1.5 text-foreground">
                             <span
-                              className="inline-block size-2.5 border border-[#64748b]"
+                              className="inline-block size-2.5 shrink-0 border border-[#64748b]"
                               style={{ background: "rgba(148,163,184,0.35)" }}
                             />
-                          ),
-                        },
-                        {
-                          key: "walls" as const,
-                          label: "Wall",
-                          swatch: (
-                            <span
-                              className="inline-block size-2.5 border"
-                              style={{
-                                background: palette.wall,
-                                borderColor: palette.wallStroke,
-                              }}
-                            />
-                          ),
-                        },
-                        {
-                          key: "doors" as const,
-                          label: "Door",
-                          swatch: (
-                            <span className="inline-block h-1.5 w-3 rounded-[1px] bg-[#f59e0b]" />
-                          ),
-                        },
-                        {
-                          key: "stairs" as const,
-                          label: "Stair",
-                          swatch: (
-                            <span
-                              className="inline-block h-0.5 w-4 border-t-2 border-dashed"
-                              style={{ borderColor: "#7c3aed" }}
-                            />
-                          ),
-                        },
-                        {
-                          key: "furniture" as const,
-                          label: "Furniture",
-                          swatch: (
-                            <span
-                              className="inline-block size-2.5 border"
-                              style={{ background: "#0d9488", borderColor: "#0f766e" }}
-                            />
-                          ),
-                        },
-                      ] as const)
-                    : ([
-                        {
-                          key: "route" as const,
-                          label: "Route",
-                          swatch: <span className="inline-block h-0.5 w-4 bg-[#1d4ed8]" />,
-                        },
-                      ] as const)
-                )
-              ).map((item) => {
-                const on = layers[item.key];
-                return (
+                            Region
+                          </div>
+                          {showEvacuationLoad ? (
+                            <>
+                              <div className="flex items-center gap-1.5 text-foreground">
+                                <span
+                                  className="inline-block size-2 shrink-0 rounded-full"
+                                  style={{ background: evacuationHeatColor(0.1) }}
+                                />
+                                Low evacuation load
+                              </div>
+                              <div className="flex items-center gap-1.5 text-foreground">
+                                <span
+                                  className="inline-block size-3 shrink-0 rounded-full"
+                                  style={{ background: evacuationHeatColor(1) }}
+                                />
+                                High evacuation load
+                              </div>
+                              {hotspotIds.size > 0 ? (
+                                <div className="flex items-center gap-1.5 text-foreground">
+                                  <span
+                                    className="hazard-pulse inline-block size-2.5 shrink-0 rounded-full border-2"
+                                    style={{ borderColor: evacuationHeatColor(1) }}
+                                  />
+                                  Glowing = top {Math.min(hotspotIds.size, 8)} worst building-wide
+                                </div>
+                              ) : null}
+                              {evacuationLoad && evacuationLoad.stairNodes.length > 0 ? (
+                                <div className="flex items-center gap-1.5 text-foreground">
+                                  <span
+                                    className="inline-block size-2.5 shrink-0"
+                                    style={{ background: evacuationHeatColor(0.5) }}
+                                  />
+                                  Stair/lift landing (square)
+                                </div>
+                              ) : null}
+                            </>
+                          ) : (
+                            <>
+                              <div className="flex items-center gap-1.5 text-foreground">
+                                <span
+                                  className="inline-block size-2 shrink-0 rounded-full"
+                                  style={{ background: PORTAL_COLORS.door }}
+                                />
+                                IFC door
+                              </div>
+                              <div className="flex items-center gap-1.5 text-foreground">
+                                <span
+                                  className="inline-block size-2 shrink-0 rounded-full"
+                                  style={{ background: PORTAL_COLORS.doorHeal }}
+                                />
+                                Door heal
+                              </div>
+                              <div className="flex items-center gap-1.5 text-foreground">
+                                <span
+                                  className="inline-block size-2 shrink-0 rounded-full"
+                                  style={{ background: PORTAL_COLORS.spacePortal }}
+                                />
+                                Space portal
+                              </div>
+                              <div className="flex items-center gap-1.5 text-foreground">
+                                <span
+                                  className="inline-block size-2 shrink-0 rounded-full"
+                                  style={{ background: PORTAL_COLORS.exit }}
+                                />
+                                Exit
+                              </div>
+                            </>
+                          )}
+                        </div>
+                        <DropdownMenuSeparator />
+                      </>
+                    ) : null}
+                    <DropdownMenuLabel className="text-[11px] text-muted-foreground">
+                      Layers
+                    </DropdownMenuLabel>
+                    {(
+                      planDisplayMode === "ifc"
+                        ? ([
+                            {
+                              key: "route" as const,
+                              label: "Route",
+                              swatch: <span className="inline-block h-0.5 w-4 bg-route-normal" />,
+                            },
+                            {
+                              key: "spaces" as const,
+                              label: "Space",
+                              swatch: (
+                                <span
+                                  className="inline-block size-2.5 border border-[#64748b]"
+                                  style={{ background: "rgba(148,163,184,0.35)" }}
+                                />
+                              ),
+                            },
+                            {
+                              key: "walls" as const,
+                              label: "Wall",
+                              swatch: (
+                                <span
+                                  className="inline-block size-2.5 border"
+                                  style={{
+                                    background: palette.wall,
+                                    borderColor: palette.wallStroke,
+                                  }}
+                                />
+                              ),
+                            },
+                            {
+                              key: "doors" as const,
+                              label: "Door",
+                              swatch: (
+                                <span className="inline-block h-1.5 w-3 rounded-[1px] bg-door-glyph" />
+                              ),
+                            },
+                            {
+                              key: "stairs" as const,
+                              label: "Stair",
+                              swatch: (
+                                <span className="inline-block h-0.5 w-4 border-t-2 border-dashed border-stair-glyph" />
+                              ),
+                            },
+                            {
+                              key: "furniture" as const,
+                              label: "Furniture",
+                              swatch: (
+                                <span className="inline-block size-2.5 border bg-furniture-fill border-furniture-stroke" />
+                              ),
+                            },
+                          ] as const)
+                        : ([
+                            {
+                              key: "route" as const,
+                              label: "Route",
+                              swatch: <span className="inline-block h-0.5 w-4 bg-route-normal" />,
+                            },
+                          ] as const)
+                    ).map((item) => (
+                      <DropdownMenuCheckboxItem
+                        key={item.key}
+                        checked={layers[item.key]}
+                        onCheckedChange={() => toggleLayer(item.key)}
+                        onSelect={(e) => e.preventDefault()}
+                      >
+                        <span className="mr-1.5 inline-flex items-center">{item.swatch}</span>
+                        {item.label}
+                      </DropdownMenuCheckboxItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+
+                <span
+                  className={cn(
+                    "inline-flex items-center gap-1 rounded px-1.5 py-0.5",
+                    cameraDot ? "text-foreground" : "text-muted-foreground/50",
+                  )}
+                  title={cameraDotInfo.reason}
+                >
+                  <span className="inline-block size-2 rounded-full bg-primary" />
+                  Camera
+                  {!cameraDot ? (
+                    <span className="max-w-[14rem] truncate text-[10px] font-normal opacity-80">
+                      ({cameraDotInfo.reason})
+                    </span>
+                  ) : null}
+                </span>
+                {planDisplayMode === "navmesh" && blockedPortalIds.size > 0 ? (
                   <button
-                    key={item.key}
                     type="button"
-                    className={cn(
-                      "pointer-events-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors",
-                      on
-                        ? "text-foreground hover:bg-muted"
-                        : "text-muted-foreground/50 line-through hover:bg-muted/60",
-                    )}
-                    aria-pressed={on}
-                    title={on ? `Hide ${item.label}` : `Show ${item.label}`}
-                    onClick={() => toggleLayer(item.key)}
+                    className="pointer-events-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground transition-colors hover:bg-muted"
+                    title="Clear all blocked portals"
+                    onClick={() => startEvacuationLoadTransition(() => setBlockedPortalIds(new Set()))}
                   >
-                    {item.swatch}
-                    {item.label}
+                    <span className="inline-block size-2 rounded-full bg-portal-blocked" />
+                    {blockedPortalIds.size} blocked · clear
                   </button>
-                );
-              })}
-              <span
-                className={cn(
-                  "inline-flex items-center gap-1 rounded px-1.5 py-0.5",
-                  cameraDot ? "text-foreground" : "text-muted-foreground/50",
-                )}
-                title={cameraDotInfo.reason}
-              >
-                <span className="inline-block size-2 rounded-full bg-[#2563eb]" />
-                Camera
-                {!cameraDot ? (
-                  <span className="max-w-[14rem] truncate text-[10px] font-normal opacity-80">
-                    ({cameraDotInfo.reason})
+                ) : null}
+                {planDisplayMode === "navmesh" &&
+                evacuationLoad &&
+                evacuationLoad.unreachableSpaceIds.length > 0 ? (
+                  <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-destructive">
+                    {evacuationLoad.unreachableSpaceIds.length} room
+                    {evacuationLoad.unreachableSpaceIds.length === 1 ? "" : "s"} with no reachable exit
                   </span>
                 ) : null}
-              </span>
-              {planDisplayMode === "navmesh" && blockedPortalIds.size > 0 ? (
-                <button
-                  type="button"
-                  className="pointer-events-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground transition-colors hover:bg-muted"
-                  title="Clear all blocked portals"
-                  onClick={() => setBlockedPortalIds(new Set())}
+              </div>
+
+              {navmeshStatusMessage ? (
+                <div
+                  className="max-w-full truncate rounded-md border border-border/80 bg-background/90 px-2 py-1 text-[11px] text-foreground backdrop-blur-sm"
+                  title={navmeshStatusMessage}
                 >
-                  <span className="inline-block size-2 rounded-full bg-[#94a3b8]" />
-                  {blockedPortalIds.size} blocked · clear
-                </button>
+                  {navmeshStatusMessage}
+                </div>
               ) : null}
-              <span className="min-w-0 basis-full px-1" title={navmeshStatusMessage || undefined}>
-                {navmeshStatusMessage}
-              </span>
             </div>
+
+            {showEvacuationLoad && worstBottlenecks.length > 0 ? (
+              <div
+                className={cn(
+                  GLASS,
+                  "pointer-events-auto absolute right-2 top-2 z-20 w-56 overflow-hidden text-[11px]",
+                )}
+              >
+                <div
+                  className="flex items-center gap-1.5 border-b border-border/80 px-2.5 py-1.5 font-medium text-foreground"
+                  title="Estimated occupants whose shortest route to an exit passes through each door or stair — area-weighted (assumes ~10 m² per occupant), not a formal fire-egress calculation"
+                >
+                  <Flame className="size-3 text-muted-foreground" aria-hidden />
+                  Worst bottlenecks
+                  <span className="ml-auto text-[10px] font-normal text-muted-foreground">est. occ.</span>
+                </div>
+                <ol className="max-h-64 overflow-y-auto py-1">
+                  {worstBottlenecks.map((entry, i) => (
+                    <li key={entry.id}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveStoreyId(entry.storeyId);
+                          // Fly the 3D camera there too — the whole point of
+                          // a ranked list is to jump straight to the worst
+                          // spot, not just switch which 2D plan is showing.
+                          setViewerFocusRequest({ point: entry.point, storeyId: entry.storeyId });
+                        }}
+                        className={cn(
+                          "flex w-full items-center gap-2 px-2.5 py-1 text-left transition-colors hover:bg-muted",
+                          entry.storeyId === displayStoreyId ? "bg-muted/50" : "",
+                        )}
+                        title={`${entry.label} — ${entry.storeyName} — ~${Math.round(entry.load)} occupants estimated`}
+                      >
+                        <span className="w-3.5 shrink-0 text-right text-muted-foreground">{i + 1}</span>
+                        <span
+                          className="size-2.5 shrink-0 rounded-full"
+                          style={{
+                            background: evacuationHeatColor(
+                              worstBottlenecks[0] ? entry.load / worstBottlenecks[0].load : 0,
+                            ),
+                          }}
+                        />
+                        <span className="min-w-0 flex-1 truncate text-foreground">{entry.label}</span>
+                        <span className="shrink-0 truncate text-[10px] text-muted-foreground">
+                          {entry.storeyName}
+                        </span>
+                        <span className="shrink-0 tabular-nums font-medium text-foreground">
+                          {Math.round(entry.load)} occ.
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            ) : null}
           </>
         )}
       </div>

@@ -1,8 +1,20 @@
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import type { ConnectivityGraph, RouteResult } from "@/types/graph";
 import type { EntitiesExtract } from "@/api/models";
 import type { FootprintsDocument, Point2D } from "@/types/footprints";
 import type { ViewerCameraPose, ThreeAabb, Mat4Elements } from "@/lib/viewer-camera-pose";
+import type { ExportableGeometrySource } from "@/lib/live-scene-export";
+
+/** Pulls the live 3D pane's currently loaded geometry for a faithful export; see ThatOpenRuntime.getExportableObjects. */
+type ViewerExportFn = () => ExportableGeometrySource | null;
 
 /**
  * Floorplan click-to-click route (pins + A* polyline). Survives IFC/navmesh
@@ -23,6 +35,24 @@ export type NavmeshRoute = {
 };
 
 /**
+ * One door/exit/stair/lift's evacuation-load result, in plan space —
+ * FloorplanViewer computes the full building-wide load (it already owns the
+ * "what-if block this door" state the calculation depends on) and publishes
+ * this flattened, storey-tagged list so InferModelViewport can lift each
+ * point into Three coordinates and render its own 3D markers, the same way
+ * the two panes already each build their own navmesh overlay from shared
+ * footprints/graph state rather than one pane pushing the other's computed
+ * Three.js geometry.
+ */
+export type EvacuationLoadMarker = {
+  id: string;
+  storeyId: string;
+  point: Point2D;
+  kind: "door" | "exit" | "space" | "stair" | "lift";
+  load: number;
+};
+
+/**
  * The store is split into several contexts by how often each group changes
  * and who actually reads it, instead of one big InferState — bundling
  * everything meant e.g. a selection-driven update re-rendering every part of
@@ -36,6 +66,10 @@ export type NavmeshRoute = {
 interface ViewportState {
   activeStoreyId: string | "all";
   setActiveStoreyId: (id: string | "all") => void;
+
+  /** Evacuation-load heat map toggle — shared so the 3D pane's markers (see EvacuationLoadMarker) turn on with the same control as the floorplan's. */
+  showEvacuationLoad: boolean;
+  setShowEvacuationLoad: (v: boolean) => void;
 
   selectedElementIds: string[];
   selectElement: (id: string | null) => void;
@@ -69,6 +103,17 @@ interface ModelDataState {
   /** Click-to-click navmesh path (floorplan + 3D tube). */
   navmeshRoute: NavmeshRoute | null;
   setNavmeshRoute: (route: NavmeshRoute | null) => void;
+  /** Building-wide evacuation load, in plan space — null when the heat map is off or nothing's loaded. See EvacuationLoadMarker. */
+  evacuationLoadMarkers: EvacuationLoadMarker[] | null;
+  setEvacuationLoadMarkers: (markers: EvacuationLoadMarker[] | null) => void;
+  /**
+   * One-shot "fly the 3D camera here" command — set by the floorplan pane's
+   * ranked bottleneck list on click, consumed by InferModelViewport (lifts
+   * the point into Three coordinates and calls the runtime's flyToCamera),
+   * then reset back to null so an identical repeat click still fires.
+   */
+  viewerFocusRequest: { point: Point2D; storeyId: string } | null;
+  setViewerFocusRequest: (request: { point: Point2D; storeyId: string } | null) => void;
   /** Swap graph variant (IFC / geometry / topologic) without clearing entities/footprints. */
   setConnectivityGraphOnly: (graph: ConnectivityGraph) => void;
   /** Graph node ids temporarily removed from the live network (right-click toggle). */
@@ -114,6 +159,15 @@ interface ViewerPoseState {
    */
   viewerCoordInverse: Mat4Elements | null;
   setViewerCoordInverse: (m: Mat4Elements | null) => void;
+  /**
+   * Bridge into the live 3D pane's ThatOpenRuntime for a faithful Share
+   * export — a ref, not state: InferModelViewport writes it on load/unload,
+   * and a Three.js Object3D graph isn't something React should re-render
+   * over. `.current` is null whenever no IFC model has live geometry (not
+   * loaded yet, or the 3D pane isn't mounted at all — e.g. an IndoorGML
+   * model, or the pane closed).
+   */
+  viewerExportRef: { current: ViewerExportFn | null };
 }
 
 const ViewerPoseCtx = createContext<ViewerPoseState | null>(null);
@@ -122,6 +176,7 @@ function ViewerPoseProvider({ children }: { children: ReactNode }) {
   const [viewerCameraPose, setViewerCameraPose] = useState<ViewerCameraPose | null>(null);
   const [viewerModelBounds, setViewerModelBounds] = useState<ThreeAabb | null>(null);
   const [viewerCoordInverse, setViewerCoordInverse] = useState<Mat4Elements | null>(null);
+  const viewerExportRef = useRef<ViewerExportFn | null>(null);
 
   const value = useMemo<ViewerPoseState>(
     () => ({
@@ -131,8 +186,9 @@ function ViewerPoseProvider({ children }: { children: ReactNode }) {
       setViewerModelBounds,
       viewerCoordInverse,
       setViewerCoordInverse,
+      viewerExportRef,
     }),
-    [viewerCameraPose, viewerModelBounds, viewerCoordInverse],
+    [viewerCameraPose, viewerModelBounds, viewerCoordInverse, viewerExportRef],
   );
 
   return <ViewerPoseCtx.Provider value={value}>{children}</ViewerPoseCtx.Provider>;
@@ -148,6 +204,7 @@ const ViewportCtx = createContext<ViewportState | null>(null);
 
 function ViewportProvider({ children }: { children: ReactNode }) {
   const [activeStoreyId, setActiveStoreyId] = useState<string | "all">("all");
+  const [showEvacuationLoad, setShowEvacuationLoad] = useState(false);
   const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
   const [ingestOpen, setIngestOpen] = useState(false);
   const [pendingIfc, setPendingIfc] = useState<{ name: string; buffer: Uint8Array } | null>(
@@ -188,6 +245,8 @@ function ViewportProvider({ children }: { children: ReactNode }) {
     () => ({
       activeStoreyId,
       setActiveStoreyId,
+      showEvacuationLoad,
+      setShowEvacuationLoad,
       selectedElementIds,
       selectElement,
       setSelectedElementIds,
@@ -202,6 +261,7 @@ function ViewportProvider({ children }: { children: ReactNode }) {
     }),
     [
       activeStoreyId,
+      showEvacuationLoad,
       selectedElementIds,
       selectElement,
       ingestOpen,
@@ -236,6 +296,13 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
   const [footprintsDocument, setFootprintsDocument] = useState<FootprintsDocument | null>(null);
   const [connectivityRoute, setConnectivityRoute] = useState<RouteResult | null>(null);
   const [navmeshRoute, setNavmeshRoute] = useState<NavmeshRoute | null>(null);
+  const [evacuationLoadMarkers, setEvacuationLoadMarkers] = useState<
+    EvacuationLoadMarker[] | null
+  >(null);
+  const [viewerFocusRequest, setViewerFocusRequest] = useState<{
+    point: Point2D;
+    storeyId: string;
+  } | null>(null);
   const [excludedNodeIds, setExcludedNodeIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -291,6 +358,8 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
       setFootprintsDocument(payload.footprints ?? null);
       setConnectivityRoute(null);
       setNavmeshRoute(null);
+      setEvacuationLoadMarkers(null);
+      setViewerFocusRequest(null);
       setExcludedNodeIds(new Set());
       setExcludedEdgeIds(new Set());
       const firstStorey =
@@ -308,6 +377,8 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
     setFootprintsDocument(null);
     setConnectivityRoute(null);
     setNavmeshRoute(null);
+    setEvacuationLoadMarkers(null);
+    setViewerFocusRequest(null);
     setExcludedNodeIds(new Set());
     setExcludedEdgeIds(new Set());
     setViewerCameraPose(null);
@@ -331,6 +402,10 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
       setConnectivityRoute,
       navmeshRoute,
       setNavmeshRoute,
+      evacuationLoadMarkers,
+      setEvacuationLoadMarkers,
+      viewerFocusRequest,
+      setViewerFocusRequest,
       setConnectivityGraphOnly,
       excludedNodeIds,
       toggleExcludedNode,
@@ -350,6 +425,8 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
       footprintsDocument,
       connectivityRoute,
       navmeshRoute,
+      evacuationLoadMarkers,
+      viewerFocusRequest,
       setConnectivityGraphOnly,
       excludedNodeIds,
       toggleExcludedNode,

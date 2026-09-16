@@ -22,6 +22,7 @@ import {
 import { useModelData, useViewport, useViewerPose, type NavmeshRoute } from "@/state/infer-store";
 import {
   createThatOpenRuntime,
+  type EvacuationLoadMarker3D,
   type GeometryDisplayMode,
   type NavMode,
   type StoreyFilter,
@@ -109,6 +110,9 @@ function InferModelViewportImpl({
     backendModelId,
     connectivityRoute,
     navmeshRoute,
+    evacuationLoadMarkers,
+    viewerFocusRequest,
+    setViewerFocusRequest,
     footprintsDocument,
     connectivityGraph,
     excludedNodeIds,
@@ -123,6 +127,7 @@ function InferModelViewportImpl({
     // isolates the same floor in both, instead of two independent filters.
     activeStoreyId: viewerStoreyId,
     setActiveStoreyId: setViewerStoreyId,
+    showEvacuationLoad,
   } = useViewport();
   const {
     setViewerCameraPose,
@@ -130,6 +135,7 @@ function InferModelViewportImpl({
     setViewerCoordInverse,
     viewerCoordInverse,
     viewerModelBounds,
+    viewerExportRef,
   } = useViewerPose();
 
   // Latest route inputs for post-load tube restore (avoid reloading IFC on route change).
@@ -327,6 +333,7 @@ function InferModelViewportImpl({
           return;
         }
         runtimeRef.current = runtime;
+        viewerExportRef.current = runtime.getExportableObjects;
         setEngineReady(true);
         setEngineError(null);
         setNavMode(runtime.getNavMode());
@@ -348,6 +355,7 @@ function InferModelViewportImpl({
       disposed = true;
       runtimeRef.current?.dispose();
       runtimeRef.current = null;
+      viewerExportRef.current = null;
       setEngineReady(false);
       setViewerCameraPose(null);
       setViewerModelBounds(null);
@@ -360,6 +368,7 @@ function InferModelViewportImpl({
     setViewerCameraPose,
     setViewerModelBounds,
     setViewerCoordInverse,
+    viewerExportRef,
   ]);
 
   // Load / reload IFC retained in the store. Closing the 3D pane disposes the
@@ -492,6 +501,10 @@ function InferModelViewportImpl({
       global_id: s.global_id,
       elevation: metres[i]!,
     }));
+    // O(1) elevation lookup below instead of storeysM.find() inside the
+    // per-mesh loop — storey counts stay small in practice, but this is
+    // free to fix and keeps it from becoming O(storeys²) on a large campus.
+    const storeyElevationByGlobalId = new Map(storeysM.map((s) => [s.global_id, s.elevation]));
     const spaceIds = footprintsDocument.spaces
       .filter((s) => !s.incomplete && s.storey_global_id)
       .map((s) => s.storey_global_id!);
@@ -543,8 +556,7 @@ function InferModelViewportImpl({
       point: { x: number; y: number; z: number };
     }> = [];
     for (const mesh of meshes) {
-      const elevation =
-        storeysM.find((s) => s.global_id === mesh.storeyId)?.elevation ?? 0;
+      const elevation = storeyElevationByGlobalId.get(mesh.storeyId) ?? 0;
       for (const r of mesh.regions) {
         regions.push({
           id: `${mesh.storeyId}:${r.spaceId}`,
@@ -578,6 +590,160 @@ function InferModelViewportImpl({
     excludedEdgeIds,
     viewerModelBounds,
     viewerCoordInverse,
+  ]);
+
+  // Evacuation-load markers (building-wide) — independent of geometryMode,
+  // same elevation-lift approach as the navmesh effect above, but bounded by
+  // the markers' own plan extent since there's no region polygon here to
+  // derive it from. Phase 1: only forwards lifted points; setEvacuationMarkers
+  // itself doesn't render anything yet (see its doc comment).
+  useEffect(() => {
+    const runtime = runtimeRef.current;
+    if (!engineReady || !runtime) return;
+
+    if (!showEvacuationLoad || !evacuationLoadMarkers?.length || !footprintsDocument) {
+      runtime.setEvacuationMarkers(null);
+      return;
+    }
+
+    const bounds = runtime.getModelBounds() ?? viewerModelBounds;
+    if (!bounds) {
+      runtime.setEvacuationMarkers(null);
+      return;
+    }
+
+    const raw = (footprintsDocument.storeys ?? []).filter(
+      (s): s is { global_id: string; name: string; elevation: number } =>
+        s.elevation != null && Number.isFinite(s.elevation),
+    );
+    const modelHeightM = bounds.maxY - bounds.minY;
+    const { metres } = normalizeElevationsToMetres(raw.map((s) => s.elevation), modelHeightM);
+    const storeysM = raw.map((s, i) => ({ global_id: s.global_id, elevation: metres[i]! }));
+    const storeyElevationByGlobalId = new Map(storeysM.map((s) => [s.global_id, s.elevation]));
+    const spaceIds = footprintsDocument.spaces
+      .filter((s) => !s.incomplete && s.storey_global_id)
+      .map((s) => s.storey_global_id!);
+    const storeyElevationsM = elevationsForVerticalRemap(storeysM, spaceIds);
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const m of evacuationLoadMarkers) {
+      minX = Math.min(minX, m.point.x);
+      minY = Math.min(minY, m.point.y);
+      maxX = Math.max(maxX, m.point.x);
+      maxY = Math.max(maxY, m.point.y);
+    }
+    if (!Number.isFinite(minX)) {
+      runtime.setEvacuationMarkers(null);
+      return;
+    }
+
+    const liftOpts = {
+      ...resolveRouteTubeLiftOptions({
+        planBounds: { minX, maxX, minY, maxY },
+        probeElevationM: storeyElevationsM.length
+          ? Math.min(...storeyElevationsM)
+          : storeysM.length
+            ? Math.min(...storeysM.map((s) => s.elevation))
+            : 0,
+        modelBounds: bounds,
+        storeyElevationsM,
+        coordInverse: runtime.getCoordinationInverse() ?? viewerCoordInverse,
+      }),
+      heightOffsetM: NAVMESH_HEIGHT_OFFSET_M,
+    };
+
+    const markers3D: EvacuationLoadMarker3D[] = [];
+    for (const m of evacuationLoadMarkers) {
+      const elevation = storeyElevationByGlobalId.get(m.storeyId) ?? 0;
+      const point = liftPlanPolylineToThree([m.point], elevation, liftOpts)[0];
+      if (!point) continue;
+      markers3D.push({ id: m.id, kind: m.kind, point, load: m.load });
+    }
+    runtime.setEvacuationMarkers(markers3D);
+  }, [
+    engineReady,
+    showEvacuationLoad,
+    evacuationLoadMarkers,
+    footprintsDocument,
+    viewerModelBounds,
+    viewerCoordInverse,
+  ]);
+
+  // One-shot "fly the camera here" command from the floorplan pane's ranked
+  // bottleneck list (see viewerFocusRequest) — lift its plan point into
+  // Three coordinates with the same elevation pipeline as the effects
+  // above, fly there, then clear the request so an identical repeat click
+  // still fires.
+  useEffect(() => {
+    const runtime = runtimeRef.current;
+    if (!engineReady || !runtime || !viewerFocusRequest || !footprintsDocument) return;
+
+    const bounds = runtime.getModelBounds() ?? viewerModelBounds;
+    if (!bounds) {
+      setViewerFocusRequest(null);
+      return;
+    }
+
+    const raw = (footprintsDocument.storeys ?? []).filter(
+      (s): s is { global_id: string; name: string; elevation: number } =>
+        s.elevation != null && Number.isFinite(s.elevation),
+    );
+    const modelHeightM = bounds.maxY - bounds.minY;
+    const { metres } = normalizeElevationsToMetres(raw.map((s) => s.elevation), modelHeightM);
+    const storeysM = raw.map((s, i) => ({ global_id: s.global_id, elevation: metres[i]! }));
+    const storeyElevationByGlobalId = new Map(storeysM.map((s) => [s.global_id, s.elevation]));
+    const spaceIds = footprintsDocument.spaces
+      .filter((s) => !s.incomplete && s.storey_global_id)
+      .map((s) => s.storey_global_id!);
+    const storeyElevationsM = elevationsForVerticalRemap(storeysM, spaceIds);
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const s of footprintsDocument.spaces) {
+      if (s.incomplete) continue;
+      for (const p of s.polygon) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
+    }
+    if (!Number.isFinite(minX)) {
+      setViewerFocusRequest(null);
+      return;
+    }
+
+    const liftOpts = {
+      ...resolveRouteTubeLiftOptions({
+        planBounds: { minX, maxX, minY, maxY },
+        probeElevationM: storeyElevationsM.length
+          ? Math.min(...storeyElevationsM)
+          : storeysM.length
+            ? Math.min(...storeysM.map((s) => s.elevation))
+            : 0,
+        modelBounds: bounds,
+        storeyElevationsM,
+        coordInverse: runtime.getCoordinationInverse() ?? viewerCoordInverse,
+      }),
+      heightOffsetM: NAVMESH_HEIGHT_OFFSET_M,
+    };
+
+    const elevation = storeyElevationByGlobalId.get(viewerFocusRequest.storeyId) ?? 0;
+    const point = liftPlanPolylineToThree([viewerFocusRequest.point], elevation, liftOpts)[0];
+    setViewerFocusRequest(null);
+    if (point) void runtime.flyToCamera(point);
+  }, [
+    engineReady,
+    viewerFocusRequest,
+    footprintsDocument,
+    viewerModelBounds,
+    viewerCoordInverse,
+    setViewerFocusRequest,
   ]);
 
   return (
@@ -625,7 +791,7 @@ function InferModelViewportImpl({
                   ? "bg-muted text-foreground"
                   : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
               )}
-              title="First-person fly (WASD, Space, Shift)"
+              title="First-person fly (WASD move, Space up, Shift down, hold Ctrl to go faster)"
             >
               <PersonStanding className="size-3.5" aria-hidden />
               Fly

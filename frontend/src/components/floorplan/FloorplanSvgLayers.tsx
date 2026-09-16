@@ -8,7 +8,7 @@ import type {
   StairFootprint,
   WallFootprint,
 } from "@/types/footprints";
-import type { NavmeshPortal, NavmeshRegion, StoreyNavmesh } from "@/lib/navmesh";
+import type { EvacuationLoadResult, NavmeshPortal, NavmeshRegion, StoreyNavmesh } from "@/lib/navmesh";
 
 /**
  * Navmesh portal kind colours — picked from the Okabe–Ito colorblind-safe
@@ -16,19 +16,59 @@ import type { NavmeshPortal, NavmeshRegion, StoreyNavmesh } from "@/lib/navmesh"
  * put both a red↔green pair and an orange↔yellow pair in the same legend,
  * the two classic confusable pairs under red-green color blindness. Blocked
  * stays gray with its own slash mark, which doesn't rely on hue at all.
+ * Values live in styles.css (`--portal-*`) so this is the app's real design
+ * token system, not a second palette maintained by hand in this file.
  */
 export const PORTAL_COLORS = {
-  door: "#0072B2", // blue
-  doorHeal: "#eab308", // yellow
-  spacePortal: "#CC79A7", // reddish purple
-  exit: "#ef4444", // red — safe on its own once nothing else in the set is green
-  blocked: "#94a3b8", // gray
+  door: "var(--portal-door)", // blue
+  doorHeal: "var(--portal-door-heal)", // yellow
+  spacePortal: "var(--portal-space)", // reddish purple
+  exit: "var(--hazard)", // red — same "danger" token the rest of the app uses
+  blocked: "var(--portal-blocked)", // gray
 } as const;
+
+/**
+ * Sequential (not diverging) heat scale for the evacuation-load overlay —
+ * pale amber at t=0 up through orange to --hazard red at t=1. Deliberately
+ * avoids a green↔red gradient: that's the same classic colorblind-confusable
+ * pair the rest of this file's palette (see PORTAL_COLORS' comment) already
+ * steers clear of, and green would also misleadingly read as "safe/low" at
+ * one end of a scale that's never actually indicating safety. The top of the
+ * scale reuses the app's real --hazard token (theme-aware) instead of a
+ * fourth fixed stop, so "worst bottleneck" here means the same severity as
+ * everywhere else in the app.
+ */
+const EVACUATION_HEAT_STOPS: [number, string][] = [
+  [0, "var(--evac-heat-low)"],
+  [0.5, "var(--evac-heat-mid)"],
+  [1, "var(--hazard)"],
+];
+
+export function evacuationHeatColor(t: number): string {
+  const clamped = Math.max(0, Math.min(1, t));
+  let lo = EVACUATION_HEAT_STOPS[0]!;
+  let hi = EVACUATION_HEAT_STOPS[EVACUATION_HEAT_STOPS.length - 1]!;
+  for (let i = 0; i < EVACUATION_HEAT_STOPS.length - 1; i++) {
+    const a = EVACUATION_HEAT_STOPS[i]!;
+    const b = EVACUATION_HEAT_STOPS[i + 1]!;
+    if (clamped >= a[0] && clamped <= b[0]) {
+      lo = a;
+      hi = b;
+      break;
+    }
+  }
+  const span = hi[0] - lo[0] || 1;
+  const localT = (clamped - lo[0]) / span;
+  const hiPct = Math.round(localT * 100);
+  // Native browser-side OKLCH blend between the two active token stops —
+  // no manual RGB math, and it stays in sync if either token is retuned.
+  return `color-mix(in oklch, ${hi[1]} ${hiPct}%, ${lo[1]})`;
+}
 
 /** Fixed regardless of theme, like doors' amber — furniture obstacles need
  * to read distinctly from both wall poché shades (light and dark). */
-const FURNITURE_FILL = "#0d9488"; // teal-600
-const FURNITURE_STROKE = "#0f766e"; // teal-700
+const FURNITURE_FILL = "var(--furniture-fill)"; // teal
+const FURNITURE_STROKE = "var(--furniture-stroke)"; // teal, darker
 
 /** Typical tread depth (metres) — world-space, same units as the footprint geometry. */
 const STAIR_TREAD_SPACING_M = 0.28;
@@ -138,7 +178,7 @@ export function MapPin({
   scale,
   strokeW,
   label,
-  color = "#2563eb",
+  color = "var(--route-normal)",
 }: {
   x: number;
   y: number;
@@ -193,6 +233,10 @@ export type FloorplanSvgLayersProps = {
   navmeshEnd: Point2 | null;
   isExitRoute: boolean;
   blockedPortalIds: Set<string>;
+  /** Evacuation-bottleneck overlay. When set, portal markers are heat-colored/sized by load instead of by kind, and stairNodes render as additional square markers (stairs aren't part of storeyNavmesh.portals at all). Null/omitted leaves the normal kind-colored markers. */
+  evacuationLoad?: EvacuationLoadResult | null;
+  /** Portal/stair-node ids in the building-wide top-N worst bottlenecks (see FloorplanViewer's `worstBottlenecks`) — these get an animated glow ring on top of the normal heat styling. Everything else stays static; motion is reserved for what actually matters. */
+  hotspotIds?: ReadonlySet<string> | null;
   doorsByGlobalId: Map<string, DoorPortal>;
   palette: FloorplanPalette;
   selectedSpaces: SpaceFootprint[];
@@ -233,6 +277,8 @@ function FloorplanSvgLayersImpl({
   navmeshEnd,
   isExitRoute,
   blockedPortalIds,
+  evacuationLoad,
+  hotspotIds,
   doorsByGlobalId,
   palette,
   selectedSpaces,
@@ -248,6 +294,14 @@ function FloorplanSvgLayersImpl({
   selectedStroke,
 }: FloorplanSvgLayersProps) {
   const routeD = smoothPolylinePathD(pathPoints);
+  const portalLoad = evacuationLoad?.portalLoad ?? null;
+  const stairNodes = evacuationLoad?.stairNodes ?? [];
+  // Cheap (portals per storey is small) and this component only re-runs when
+  // memo() sees a real prop change anyway — no useMemo needed for an O(n) scan.
+  let maxPortalLoad = 0;
+  if (portalLoad) {
+    for (const v of portalLoad.values()) if (v > maxPortalLoad) maxPortalLoad = v;
+  }
   return (
     <>
       {planDisplayMode === "ifc" ? (
@@ -327,7 +381,7 @@ function FloorplanSvgLayersImpl({
                   <path
                     d={polygonPathD(s.polygon)}
                     fill="none"
-                    stroke="#7c3aed"
+                    stroke="var(--stair-glyph)"
                     strokeWidth={roomStroke * 1.4}
                   >
                     <title>{s.name ? `Stair: ${s.name}` : "Stair"}</title>
@@ -335,7 +389,7 @@ function FloorplanSvgLayersImpl({
                   <path
                     d={stairTreadLinesD(s.polygon, STAIR_TREAD_SPACING_M)}
                     fill="none"
-                    stroke="#7c3aed"
+                    stroke="var(--stair-glyph)"
                     strokeWidth={roomStroke * 0.8}
                     className="pointer-events-none"
                   />
@@ -370,7 +424,7 @@ function FloorplanSvgLayersImpl({
                           key={`arc:${i}`}
                           d={arc}
                           fill="none"
-                          stroke="#f59e0b"
+                          stroke="var(--door-glyph)"
                           strokeWidth={doorGlyphStroke}
                           strokeDasharray={`${markerBase * 0.0025} ${markerBase * 0.002}`}
                         />
@@ -380,7 +434,7 @@ function FloorplanSvgLayersImpl({
                           key={`leaf:${i}`}
                           d={leaf}
                           fill="none"
-                          stroke="#f59e0b"
+                          stroke="var(--door-glyph)"
                           strokeWidth={doorGlyphStroke}
                           strokeLinecap="round"
                         />
@@ -401,7 +455,7 @@ function FloorplanSvgLayersImpl({
                     <path
                       key={d.global_id}
                       d={dPath}
-                      fill="#f59e0b"
+                      fill="var(--door-glyph)"
                       fillOpacity={0.85}
                       stroke="none"
                     >
@@ -416,7 +470,7 @@ function FloorplanSvgLayersImpl({
                     cx={d.point.x}
                     cy={d.point.y}
                     r={doorR}
-                    fill="#f59e0b"
+                    fill="var(--door-glyph)"
                     stroke="none"
                   >
                     <title>{d.name || d.global_id}</title>
@@ -460,6 +514,8 @@ function FloorplanSvgLayersImpl({
           })}
           {storeyNavmesh?.portals.map((p: NavmeshPortal) => {
             const blocked = blockedPortalIds.has(p.id);
+            const load = portalLoad?.get(p.id) ?? 0;
+            const heat = portalLoad ? (maxPortalLoad > 0 ? load / maxPortalLoad : 0) : null;
             const door = p.doorGlobalId ? doorsByGlobalId.get(p.doorGlobalId) : null;
             const glyph =
               door && door.segment.length === 2 && door.normal
@@ -494,36 +550,66 @@ function FloorplanSvgLayersImpl({
                     ))}
                   </g>
                 ) : null}
+                {heat != null ? (
+                  // Soft under-glow instead of a flat filled dot — reads as
+                  // a heat source with real depth, not a scatter-plot point.
+                  <circle
+                    cx={p.point.x}
+                    cy={p.point.y}
+                    r={portalR * (2.2 + heat * 1.6)}
+                    fill={evacuationHeatColor(heat)}
+                    opacity={0.14 + heat * 0.22}
+                    className="pointer-events-none"
+                  />
+                ) : null}
+                {heat != null && hotspotIds?.has(p.id) ? (
+                  // Reserved for the building-wide top-N worst nodes only —
+                  // motion draws the eye to what actually matters instead of
+                  // every marker pulsing at once.
+                  <circle
+                    cx={p.point.x}
+                    cy={p.point.y}
+                    r={portalR * (2.6 + heat * 1.6)}
+                    fill="none"
+                    stroke={evacuationHeatColor(heat)}
+                    strokeWidth={doorStroke * 0.8}
+                    className="hazard-pulse pointer-events-none"
+                  />
+                ) : null}
                 <circle
                   cx={p.point.x}
                   cy={p.point.y}
-                  r={portalR}
+                  r={heat != null ? portalR * (1 + heat * 1.4) : portalR}
                   fill={
-                    blocked
-                      ? PORTAL_COLORS.blocked
-                      : p.kind === "exit"
-                        ? PORTAL_COLORS.exit
-                        : p.kind === "space"
-                          ? PORTAL_COLORS.spacePortal
-                          : p.inferred
-                            ? PORTAL_COLORS.doorHeal
-                            : PORTAL_COLORS.door
+                    heat != null
+                      ? evacuationHeatColor(heat)
+                      : blocked
+                        ? PORTAL_COLORS.blocked
+                        : p.kind === "exit"
+                          ? PORTAL_COLORS.exit
+                          : p.kind === "space"
+                            ? PORTAL_COLORS.spacePortal
+                            : p.inferred
+                              ? PORTAL_COLORS.doorHeal
+                              : PORTAL_COLORS.door
                   }
                   stroke="#0f172a"
                   strokeWidth={doorStroke * 0.4}
                 >
                   <title>
-                    {blocked
-                      ? "Blocked — click to unblock"
-                      : `${
-                          p.kind === "exit"
-                            ? "Exit"
-                            : p.kind === "space"
-                              ? "Space portal"
-                              : p.inferred
-                                ? "Door heal"
-                                : "IFC door"
-                        } — click to block`}
+                    {heat != null
+                      ? `${load} evacuation route${load === 1 ? "" : "s"} cross this portal`
+                      : blocked
+                        ? "Blocked — click to unblock"
+                        : `${
+                            p.kind === "exit"
+                              ? "Exit"
+                              : p.kind === "space"
+                                ? "Space portal"
+                                : p.inferred
+                                  ? "Door heal"
+                                  : "IFC door"
+                          } — click to block`}
                     : {p.spaceA}
                     {p.spaceB ? ` ↔ ${p.spaceB}` : ""}
                   </title>
@@ -542,6 +628,55 @@ function FloorplanSvgLayersImpl({
               </g>
             );
           })}
+          {stairNodes.map((s) => {
+            // Square, not a circle — stairs aren't a StoreyNavmesh.portal at
+            // all (see computeEvacuationLoad's doc comment on why they're
+            // treated as exits here), so this needs to read as visually
+            // distinct from a real door/exit portal, not just another dot.
+            const load = portalLoad?.get(s.id) ?? 0;
+            const heat = maxPortalLoad > 0 ? load / maxPortalLoad : 0;
+            const size = portalR * 1.6 * (1 + heat * 1.4);
+            const glowSize = portalR * 1.6 * (3.4 + heat * 2.2);
+            const isHotspot = hotspotIds?.has(s.id);
+            return (
+              <g key={s.id}>
+                <rect
+                  x={s.point.x - glowSize / 2}
+                  y={s.point.y - glowSize / 2}
+                  width={glowSize}
+                  height={glowSize}
+                  fill={evacuationHeatColor(heat)}
+                  opacity={0.14 + heat * 0.22}
+                  className="pointer-events-none"
+                />
+                {isHotspot ? (
+                  <rect
+                    x={s.point.x - glowSize / 2 - portalR * 0.3}
+                    y={s.point.y - glowSize / 2 - portalR * 0.3}
+                    width={glowSize + portalR * 0.6}
+                    height={glowSize + portalR * 0.6}
+                    fill="none"
+                    stroke={evacuationHeatColor(heat)}
+                    strokeWidth={doorStroke * 0.8}
+                    className="hazard-pulse pointer-events-none"
+                  />
+                ) : null}
+                <rect
+                  x={s.point.x - size / 2}
+                  y={s.point.y - size / 2}
+                  width={size}
+                  height={size}
+                  fill={evacuationHeatColor(heat)}
+                  stroke="#0f172a"
+                  strokeWidth={doorStroke * 0.4}
+                >
+                  <title>
+                    {`${load} evacuation route${load === 1 ? "" : "s"} reach this stair/lift landing`}
+                  </title>
+                </rect>
+              </g>
+            );
+          })}
         </>
       )}
 
@@ -549,7 +684,7 @@ function FloorplanSvgLayersImpl({
         <path
           d={routeD}
           fill="none"
-          stroke="#93c5fd"
+          stroke={`color-mix(in oklch, var(${isExitRoute ? "--route-emergency" : "--route-normal"}) 55%, var(--background))`}
           strokeWidth={routeHalo}
           strokeLinecap="round"
           strokeLinejoin="round"
@@ -557,13 +692,20 @@ function FloorplanSvgLayersImpl({
         />
       ) : null}
       {layers.route && routeD ? (
+        // Marching dashes instead of a solid line — the route overlay is a
+        // real computed path with a real direction (start → end / toward
+        // the exit), so it can show that honestly instead of the heat
+        // markers guessing at flow direction they don't actually have.
         <path
           d={routeD}
           fill="none"
-          stroke="#1d4ed8"
+          stroke={isExitRoute ? "var(--route-emergency)" : "var(--route-normal)"}
           strokeWidth={routeStroke}
           strokeLinecap="round"
           strokeLinejoin="round"
+          strokeDasharray={`${routeStroke * 2.2} ${routeStroke * 2.2}`}
+          className="route-flow"
+          style={{ "--route-flow-distance": `${-routeStroke * 4.4}` } as React.CSSProperties}
         />
       ) : null}
 
@@ -583,7 +725,7 @@ function FloorplanSvgLayersImpl({
           scale={pinScale}
           strokeW={doorStroke * 0.45}
           label={isExitRoute ? "Exit" : "End"}
-          color={isExitRoute ? "#ef4444" : "#2563eb"}
+          color={isExitRoute ? "var(--route-emergency)" : "var(--route-normal)"}
         />
       ) : null}
 
@@ -591,9 +733,9 @@ function FloorplanSvgLayersImpl({
         <path
           key={`sel:${space.global_id}`}
           d={spacePathD(space.polygon, space.holes)}
-          fill="rgba(37,99,235,0.28)"
+          fill="color-mix(in oklch, var(--ring) 28%, transparent)"
           fillRule="evenodd"
-          stroke="#2563eb"
+          stroke="var(--ring)"
           strokeWidth={selectedStroke}
         >
           <title>Selected: {space.name || space.global_id}</title>

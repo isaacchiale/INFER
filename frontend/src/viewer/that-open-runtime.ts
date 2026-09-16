@@ -20,9 +20,11 @@ import {
 // as a type namespace, which TS doesn't support.
 import type {
   OrthoPerspectiveCamera,
+  ShadowedScene,
   SimpleRenderer,
-  SimpleScene,
 } from "@thatopen/components";
+import type { FragmentsModel } from "@thatopen/fragments";
+import type { ExportableGeometrySource } from "@/lib/live-scene-export";
 
 export type ViewerStatusKind = "info" | "error" | "loading";
 
@@ -44,6 +46,13 @@ export type NavmeshThreePortal = {
   /** Door: false = IFC, true = geometry heal. */
   inferred?: boolean;
   point: { x: number; y: number; z: number };
+};
+
+export type EvacuationLoadMarker3D = {
+  id: string;
+  kind: "door" | "exit" | "space" | "stair" | "lift";
+  point: { x: number; y: number; z: number };
+  load: number;
 };
 
 export type ThatOpenRuntime = {
@@ -84,10 +93,34 @@ export type ThatOpenRuntime = {
       | null,
   ) => void;
   /**
+   * Building-wide evacuation-load markers (Three world metres) — one entry
+   * per door/exit/stair/lift with nonzero load. Pass null or [] to clear.
+   * Renders as glowing additive sprites, sized/colored by load on the same
+   * heat scale the floorplan pane uses (circle = door/exit, square = stair/lift).
+   */
+  setEvacuationMarkers: (markers: EvacuationLoadMarker3D[] | null) => void;
+  /**
+   * Smoothly fly the camera to look at a point (Three world metres) — used
+   * by the floorplan pane's ranked bottleneck list so clicking an entry
+   * jumps the 3D view there, not just the 2D storey.
+   */
+  flyToCamera: (point: { x: number; y: number; z: number }) => Promise<void>;
+  /**
    * Clip / restore IFC geometry by a vertical band in Three.js world Y,
    * or show the full building.
    */
   setStoreyFilter: (filter: StoreyFilter) => Promise<void>;
+  /**
+   * What the Share flow needs to build a faithful GLB/USDZ export: the
+   * loaded fragments models (their geometry has to be re-fetched live and
+   * async — see live-scene-export.ts for why reading it off the live
+   * Three.js scene doesn't work), the active route tube (a plain Three.js
+   * object that doesn't need that), and the current storey clip band, so
+   * the export can be cropped to match what the live band-filtered view
+   * actually shows instead of always including whole multi-storey items.
+   * Null when no model has loaded yet.
+   */
+  getExportableObjects: () => ExportableGeometrySource | null;
   dispose: () => void;
 };
 
@@ -126,6 +159,96 @@ const ROUTE_TUBE_TUBULAR_PER_M = 4;
 /** Cap polyline density for TubeGeometry cost. */
 const ROUTE_TUBE_MAX_POINTS = 400;
 
+/**
+ * Small vertical-gradient canvas texture for the 3D viewport background —
+ * exact hex conversions of styles.css's --viewport-grid-strong (top) down
+ * to --viewport (bottom), so the void around/under the model reads as an
+ * intentional graphite atmosphere instead of flat black. One-time cost (a
+ * few KB canvas → texture), not a per-frame one.
+ */
+function createViewportBackgroundTexture(): THREE.Texture {
+  const canvas = document.createElement("canvas");
+  canvas.width = 1;
+  canvas.height = 256;
+  const ctx = canvas.getContext("2d")!;
+  const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+  gradient.addColorStop(0, "#34383d"); // --viewport-grid-strong
+  gradient.addColorStop(0.55, "#111315"); // --viewport
+  gradient.addColorStop(1, "#0a0b0c"); // slightly darker still at the floor
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+/**
+ * Same sequential heat scale as the floorplan pane's evacuationHeatColor
+ * (FloorplanSvgLayers.tsx) — pale amber up through orange to the app's real
+ * --hazard token, so "worst bottleneck" means the same severity in both
+ * panes. Exact oklch→sRGB conversions of --evac-heat-low/-mid and the
+ * *dark-theme* --hazard value specifically: the 3D viewport is always dark
+ * (see styles.css's "Viewport stays graphite-dark in both themes" comment),
+ * so it always wants the dark-theme anchor regardless of the app's own
+ * light/dark toggle. Plain RGB lerp, not color-mix(in oklch) like the SVG
+ * version — this only ever tints a small glow sprite, not a large flat
+ * fill, so the perceptual-uniformity difference isn't visible.
+ */
+const EVAC_HEAT_LOW = new THREE.Color(0xfef3c7);
+const EVAC_HEAT_MID = new THREE.Color(0xf97316);
+const EVAC_HEAT_HIGH = new THREE.Color(0xec5a5e);
+
+function evacuationMarkerHeatColor(t: number): THREE.Color {
+  const clamped = Math.max(0, Math.min(1, t));
+  const color = new THREE.Color();
+  if (clamped <= 0.5) {
+    color.lerpColors(EVAC_HEAT_LOW, EVAC_HEAT_MID, clamped / 0.5);
+  } else {
+    color.lerpColors(EVAC_HEAT_MID, EVAC_HEAT_HIGH, (clamped - 0.5) / 0.5);
+  }
+  return color;
+}
+
+/**
+ * Colorless (white) glow sprite texture — a soft blurred halo plus a
+ * sharper bright core baked into one canvas, tinted per-marker via
+ * SpriteMaterial.color rather than baked in, so every marker shares just
+ * two textures (one per shape) regardless of how many markers exist.
+ * "circle" for doors/exits, "square" for stairs/lifts — same shape
+ * convention the 2D plan uses to distinguish portal kinds without relying
+ * on color alone.
+ */
+function createGlowSpriteTexture(shape: "circle" | "square"): THREE.Texture {
+  const size = 128;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  const center = size / 2;
+
+  const fillShape = (radiusPad: number) => {
+    if (shape === "circle") {
+      ctx.beginPath();
+      ctx.arc(center, center, center - radiusPad, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillRect(radiusPad, radiusPad, size - radiusPad * 2, size - radiusPad * 2);
+    }
+  };
+
+  ctx.filter = "blur(20px)";
+  ctx.fillStyle = "#ffffff";
+  fillShape(size * 0.28);
+
+  ctx.filter = "none";
+  ctx.globalAlpha = 0.9;
+  fillShape(size * 0.4);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
 export async function createThatOpenRuntime(
   container: HTMLElement,
   onStatus?: StatusFn,
@@ -140,20 +263,65 @@ export async function createThatOpenRuntime(
 
   const components = new OBC.Components();
   const worlds = components.get(OBC.Worlds);
-  const world = worlds.create<SimpleScene, OrthoPerspectiveCamera, SimpleRenderer>();
+  const world = worlds.create<ShadowedScene, OrthoPerspectiveCamera, SimpleRenderer>();
 
-  world.scene = new OBC.SimpleScene(components);
-  world.scene.setup();
-  world.scene.three.background = null;
+  // Construction only, no .setup() yet — ShadowedScene.setup() builds a
+  // DistanceRenderer internally that reads both world.renderer and
+  // world.camera.three, and throws if either isn't assigned yet — so scene
+  // setup has to happen last, after renderer and camera both exist.
+  world.scene = new OBC.ShadowedScene(components);
 
   world.renderer = new OBC.SimpleRenderer(components, container);
   world.renderer.showLogo = false;
+  const rawRenderer = (world.renderer as { three?: THREE.WebGLRenderer } | null)?.three;
+  if (rawRenderer) {
+    rawRenderer.shadowMap.enabled = true;
+    rawRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  }
+
   world.camera = new OBC.OrthoPerspectiveCamera(components);
   // That Open defaults: dollyToCursor=true, infinityDolly=true, maxDistance≈300.
   // infinityDolly lets you zoom *through* the orbit target; past the pivot the
   // controls collapse (dolly dead / weird FP-like state). Keep classic orbit.
   const controls = world.camera.controls;
   applyOrbitControlTuning(controls);
+
+  // A single warm directional "sun" + a dialed-down flat ambient (the
+  // library's stock config is flat-white 1.5/1, which washes out any
+  // directional shading) — ShadowedScene also lets this same light cast real
+  // shadows (wired below via updateShadows/model traversal), which the
+  // plain SimpleScene the viewer used before could not do at all.
+  world.scene.setup({
+    ambientLight: { color: new THREE.Color(0xffffff), intensity: 0.6 },
+    directionalLight: {
+      color: new THREE.Color(0xfff1de),
+      intensity: 2.4,
+      position: new THREE.Vector3(14, 22, 10),
+    },
+  });
+  // Two-tone sky/ground bounce on top of the flat ambient above — the
+  // single biggest cheap fix for a CG scene reading as shadeless/flat.
+  world.scene.three.add(new THREE.HemisphereLight(0x8fb2d9, 0x2b2620, 0.55));
+  // Subtle vertical falloff instead of a flat/void background, built from
+  // the app's own --viewport design tokens (see styles.css) rather than an
+  // arbitrary color — same "route through the real token system" fix
+  // applied to the floorplan pane's marker colors.
+  world.scene.three.background = createViewportBackgroundTexture();
+  // Invisible except where a shadow actually falls on it — the model's own
+  // self-shadowing (wall-on-wall, furniture-on-floor) reads fine up close,
+  // but the classic "grounded" contact-shadow look needs a receiver under
+  // the whole building, not just whatever floor slab geometry happens to be
+  // there. Sits a hair below the grid's own y=0 plane to avoid z-fighting
+  // with any real floor mesh that lands exactly on it.
+  const shadowGround = new THREE.Mesh(
+    new THREE.PlaneGeometry(400, 400),
+    new THREE.ShadowMaterial({ opacity: 0.28 }),
+  );
+  shadowGround.name = "infer-shadow-ground";
+  shadowGround.rotation.x = -Math.PI / 2;
+  shadowGround.position.y = -0.02;
+  shadowGround.receiveShadow = true;
+  world.scene.three.add(shadowGround);
   await controls.setLookAt(20, 15, 20, 0, 0, 0);
 
   components.init();
@@ -161,6 +329,23 @@ export async function createThatOpenRuntime(
 
   const fragments = components.get(OBC.FragmentsManager);
   fragments.init("/worker.mjs");
+
+  const evacuationMarkersGroup = new THREE.Group();
+  evacuationMarkersGroup.name = "infer-evacuation-markers";
+  evacuationMarkersGroup.visible = false;
+  world.scene.three.add(evacuationMarkersGroup);
+  const evacuationGlowTextures = {
+    circle: createGlowSpriteTexture("circle"),
+    square: createGlowSpriteTexture("square"),
+  };
+
+  const clearEvacuationMarkerMeshes = () => {
+    while (evacuationMarkersGroup.children.length) {
+      const child = evacuationMarkersGroup.children[0]!;
+      evacuationMarkersGroup.remove(child);
+      if (child instanceof THREE.Sprite) child.material.dispose();
+    }
+  };
 
   const routeTubeGroup = new THREE.Group();
   routeTubeGroup.name = "infer-route-tube";
@@ -241,6 +426,68 @@ export async function createThatOpenRuntime(
       if (pts.length >= 2) addTubeMesh(pts);
     }
     routeTubeGroup.visible = routeTubeGroup.children.length > 0;
+  };
+
+  let evacuationMarkers: EvacuationLoadMarker3D[] = [];
+  const setEvacuationMarkers = (markers: EvacuationLoadMarker3D[] | null) => {
+    evacuationMarkers = markers ?? [];
+    clearEvacuationMarkerMeshes();
+    if (!evacuationMarkers.length) {
+      evacuationMarkersGroup.visible = false;
+      return;
+    }
+    let maxLoad = 0;
+    for (const m of evacuationMarkers) if (m.load > maxLoad) maxLoad = m.load;
+    for (const m of evacuationMarkers) {
+      const heat = maxLoad > 0 ? m.load / maxLoad : 0;
+      const isVertical = m.kind === "stair" || m.kind === "lift";
+      // Additive blending only actually *glows* once the tinted color pushes
+      // past 1.0 per channel — at plain heat-color brightness the markers
+      // were confirmed live to render but stay almost imperceptible next to
+      // the model at any normal viewing distance (verified: visible only as
+      // a faint halo when the camera is right on top of one). Boosting the
+      // color is the standard cheap way to get a real glow without a bloom
+      // postprocessing pass.
+      const glowColor = evacuationMarkerHeatColor(heat).multiplyScalar(2.2);
+      const material = new THREE.SpriteMaterial({
+        map: isVertical ? evacuationGlowTextures.square : evacuationGlowTextures.circle,
+        color: glowColor,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const sprite = new THREE.Sprite(material);
+      sprite.position.set(m.point.x, m.point.y, m.point.z);
+      // Stairs/lifts get a slightly larger base so the shape (a square glow
+      // vs. a circular one) reads clearly even before the heat-based scale.
+      // Sized to read as a real marker from a typical orbit distance
+      // (confirmed live: the original 0.5–0.65m base was only visible at
+      // point-blank range), not just up close.
+      const baseSize = isVertical ? 1.5 : 1.15;
+      sprite.scale.setScalar(baseSize * (1 + heat * 1.6));
+      sprite.renderOrder = 5;
+      sprite.frustumCulled = false;
+      sprite.name = `infer-evacuation-marker:${m.id}`;
+      evacuationMarkersGroup.add(sprite);
+    }
+    evacuationMarkersGroup.visible = true;
+  };
+
+  const flyToCamera = async (point: { x: number; y: number; z: number }) => {
+    // Close enough that the marker actually reads as the subject (unlike
+    // refreshOrbitTarget's whole-building framing), at a fixed 3/4-elevated
+    // angle rather than reusing the camera's current heading — consistent,
+    // predictable framing every time a bottleneck entry is clicked.
+    const dist = 6;
+    await controls.setLookAt(
+      point.x + dist * 0.6,
+      point.y + dist * 0.55,
+      point.z + dist * 0.6,
+      point.x,
+      point.y,
+      point.z,
+      true,
+    );
   };
 
   const navmeshGroup = new THREE.Group();
@@ -611,6 +858,13 @@ export async function createThatOpenRuntime(
     // but look direction must update the floorplan heading arrow.
     publishCameraPose();
   });
+  // "rest" (motion settled below restThreshold), not "update" (fires
+  // continuously mid-drag) — recomputing shadow bounds does a depth-buffer
+  // render + worker readback, so it only runs once the camera stops, not on
+  // every drag tick. updateShadows() itself no-ops while already computing.
+  world.camera.controls.addEventListener("rest", () => {
+    void world.scene.updateShadows();
+  });
 
   /** Building pivot for Orbit — always the loaded model AABB centre. */
   const orbitTarget = new THREE.Vector3(0, 0, 0);
@@ -643,14 +897,31 @@ export async function createThatOpenRuntime(
       hasOrbitTarget = false;
       modelBox.makeEmpty();
       onModelBounds?.(null);
+      controls.setBoundary(undefined);
       return;
     }
     modelBox.copy(box);
+    // Track the model's real floor elevation instead of a hardcoded world
+    // y≈0 guess — storeys can sit at any real-world elevation, and a fixed
+    // offset left the ground plane floating *above* this particular
+    // building's floor, geometrically occluding the navmesh region fills
+    // (transparent, depthWrite:false) rendered at the true floor height.
+    shadowGround.position.y = box.min.y - 0.02;
     box.getCenter(orbitTarget);
     const size = new THREE.Vector3();
     box.getSize(size);
     orbitRadius = Math.max(size.length() * 0.75, 10);
     hasOrbitTarget = true;
+    // Fly mode (WASD/Space/Shift/Ctrl) otherwise has no limit at all — a
+    // user can truck/forward/elevate away from the building forever with no
+    // way back except manually reorienting. The margin scales with the
+    // model itself so a small room and a campus-scale building both get a
+    // walkable buffer to view the exterior from outside, not just a fixed
+    // metre count that'd be cramped on one and pointless on the other.
+    // boundaryFriction stays at the library default (0) — a firm stop you
+    // can still slide along, not a soft decelerating approach.
+    const flyBoundary = box.clone().expandByScalar(Math.max(size.length() * 1.5, 30));
+    controls.setBoundary(flyBoundary);
     onModelBounds?.({
       minX: box.min.x,
       maxX: box.max.x,
@@ -696,8 +967,28 @@ export async function createThatOpenRuntime(
   fragments.list.onItemSet.add(({ value: model }) => {
     model.useCamera(world.camera.three);
     world.scene.three.add(model.object);
+    // Fragments never sets these itself (confirmed: no castShadow/receiveShadow
+    // anywhere in the package) — every mesh defaults to Object3D's false/false,
+    // so without this the shadow-casting light above would light nothing.
+    // A one-time traversal right after add isn't enough: fragments streams
+    // mesh "tiles" in and out as the view updates (LOD), so tiles that
+    // appear later would never get flagged, and this has to re-run on every
+    // update cycle, not just once at load (confirmed empirically — a single
+    // post-add traversal here left every fragments mesh at castShadow=false
+    // even minutes after the model had fully loaded and rendered).
+    const applyShadowFlags = () => {
+      model.object.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+        }
+      });
+    };
+    model.onViewUpdated.add(applyShadowFlags);
+    applyShadowFlags();
     void fragments.core.update(true);
     refreshOrbitTarget();
+    void world.scene.updateShadows();
   });
 
   fragments.core.models.materials.list.onItemSet.add(({ value: material }) => {
@@ -829,6 +1120,9 @@ export async function createThatOpenRuntime(
   const clear = async () => {
     clearRouteTubeMeshes();
     clearNavmeshMeshes();
+    clearEvacuationMarkerMeshes();
+    evacuationMarkers = [];
+    evacuationMarkersGroup.visible = false;
     for (const id of [...fragments.list.keys()]) {
       await fragments.core.disposeModel(id);
     }
@@ -836,6 +1130,7 @@ export async function createThatOpenRuntime(
     orbitTarget.set(0, 0, 0);
     modelBox.makeEmpty();
     onModelBounds?.(null);
+    controls.setBoundary(undefined);
     publishCoordInverse(null);
   };
 
@@ -889,6 +1184,26 @@ export async function createThatOpenRuntime(
       onStatus?.("Orbit mode", "info");
     }
     void fragments.core.update(true);
+  };
+
+  // Scene lights aren't included here — buildExportGroup adds its own
+  // fixed pair unconditionally, since the live scene's lights (including the
+  // shadow-casting sun + hemisphere ambient above) are an internal
+  // ShadowedScene.setup() implementation detail with no stable handle anyway.
+  const getExportableObjects = (): ExportableGeometrySource | null => {
+    if (fragments.list.size === 0) return null;
+    const fragmentsModels: FragmentsModel[] = [];
+    for (const [, model] of fragments.list) fragmentsModels.push(model);
+    const plainObjects: THREE.Object3D[] = [];
+    if (routeTubeGroup.children.length > 0) plainObjects.push(routeTubeGroup);
+    // Only while actually clipping (band + IFC display mode, matching
+    // applyStoreyFilter's own guard) — "all" and navmesh mode both render
+    // full-height with no clip planes active.
+    const clipBand =
+      storeyFilter.kind === "band" && geometryDisplayMode === "ifc"
+        ? { minY: storeyFilter.minY, maxY: storeyFilter.maxY }
+        : null;
+    return { fragmentsModels, plainObjects, clipBand };
   };
 
   return {
@@ -991,10 +1306,16 @@ export async function createThatOpenRuntime(
     getCoordinationInverse: () =>
       coordinationInverse ? [...coordinationInverse] : null,
     setRouteTube,
+    setEvacuationMarkers,
+    flyToCamera,
+    getExportableObjects,
     dispose() {
       stopFlyLoop();
       clearRouteTubeMeshes();
       clearNavmeshMeshes();
+      clearEvacuationMarkerMeshes();
+      evacuationGlowTextures.circle.dispose();
+      evacuationGlowTextures.square.dispose();
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("resize", resize);
