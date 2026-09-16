@@ -19,7 +19,15 @@ export function readAppTheme(): AppTheme {
 
 /** Tracks the document `dark` class toggled by ThemeToggle. */
 export function useAppTheme(): AppTheme {
-  const [theme, setTheme] = useState<AppTheme>(() => readAppTheme());
+  // Always "light" on the first render, matching what the server rendered
+  // (it has no DOM to read). __root.tsx's blocking inline script already
+  // applied the real class to <html> before hydration, so reading it here
+  // via a lazy initializer would make this component's first client render
+  // diverge from the server's — the hydration mismatch previously visible
+  // on GraphViewer's canvas (background/theme-dependent inline styles).
+  // The real value is picked up a tick later in the effect below, after
+  // hydration has already committed.
+  const [theme, setTheme] = useState<AppTheme>("light");
 
   useEffect(() => {
     const root = document.documentElement;

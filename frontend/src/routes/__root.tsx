@@ -92,7 +92,10 @@ export const Route = createRootRoute({
 
 function RootShell({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
+    // The inline script below sets the "dark" class on this element before
+    // React hydrates (the standard no-flash dark-mode pattern) — the server
+    // never sees it, so the class is an intentional, expected mismatch.
+    <html lang="en" suppressHydrationWarning>
       <head>
         <HeadContent />
         <script
