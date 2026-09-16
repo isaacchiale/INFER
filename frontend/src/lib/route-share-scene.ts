@@ -9,12 +9,13 @@
 import * as THREE from "three";
 import { normalizeElevationsToMetres } from "@/lib/storey-elevations";
 import { ifcPlanToThree } from "@/lib/viewer-camera-pose";
-import type { FootprintsDocument, Point2D } from "@/types/footprints";
+import type { FootprintsDocument, Point2D, DoorPortal } from "@/types/footprints";
 import type { NavmeshRoute } from "@/state/infer-store";
 
 const ROOM_COLOR = 0xcbd5e1;
 const WALL_COLOR = 0xe7e2d8;
 const FURNITURE_COLOR = 0x0d9488;
+const DOOR_COLOR = 0xf59e0b;
 const TUBE_COLOR = 0x1d4ed8;
 const START_COLOR = 0x22c55e;
 const END_COLOR = 0xef4444;
@@ -29,6 +30,10 @@ const WALL_HEIGHT_M = 2.4;
  * a generic desk/cabinet height, shorter than a wall so the route tube stays
  * visible passing beside it rather than reading as another wall. */
 const FURNITURE_HEIGHT_M = 0.75;
+/** Standard interior door height — not in the footprint schema (2D only), same reasoning as WALL_HEIGHT_M. */
+const DOOR_HEIGHT_M = 2.1;
+/** Marker sphere radius for a door with no measured width (DoorPortal.polygon absent). */
+const DOOR_MARKER_RADIUS_M = 0.15;
 
 type StoreySegment = { storeyId: string; points: Point2D[] };
 
@@ -100,6 +105,56 @@ function routeTube(points: Point2D[], elevationM: number): THREE.Mesh | null {
   return new THREE.Mesh(geometry, material);
 }
 
+/**
+ * A door leaf as a thin extruded box at its real plan position/width when
+ * measured (DoorPortal.polygon), falling back to a small marker sphere at
+ * DoorPortal.point when only a centroid is known — real IFC doors often
+ * have no independent solid geometry to extract, so this reads the same
+ * door data the Floorplan pane already shows instead of depending on raw
+ * mesh detail. Null when the door has neither (fully unmeasured).
+ */
+function doorMesh(door: DoorPortal, elevationM: number): THREE.Object3D | null {
+  if (door.polygon && door.polygon.length >= 3) {
+    return prism(door.polygon, elevationM, DOOR_HEIGHT_M, DOOR_COLOR);
+  }
+  if (door.point) {
+    const geometry = new THREE.SphereGeometry(DOOR_MARKER_RADIUS_M, 12, 12);
+    const material = new THREE.MeshStandardMaterial({ color: DOOR_COLOR });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.copy(planPoint(door.point.x, door.point.y, elevationM + DOOR_HEIGHT_M / 2));
+    return mesh;
+  }
+  return null;
+}
+
+/**
+ * Door overlay for the live-geometry export path (buildExportGroup in
+ * live-scene-export.ts), which — unlike buildRouteShareScene below — has no
+ * idea what a FootprintsDocument is; it only knows about fragments'
+ * geometry. Real IFC doors frequently have no solid geometry of their own
+ * to fetch, so this reuses the same door data the proxy path (and the
+ * Floorplan pane) already draws from, scoped to `storeyIds` so a Share
+ * export only shows doors on the storeys the route actually crosses.
+ */
+export function buildDoorOverlay(
+  footprints: FootprintsDocument,
+  storeyIds: ReadonlySet<string>,
+): THREE.Group {
+  const group = new THREE.Group();
+  const elevations = storeyElevationsM(footprints);
+  const added = new Set<string>();
+  for (const door of footprints.doors ?? []) {
+    if (door.incomplete) continue;
+    if (door.storey_global_id != null && !storeyIds.has(door.storey_global_id)) continue;
+    if (added.has(door.global_id)) continue;
+    added.add(door.global_id);
+    const elevationM = door.storey_global_id ? (elevations.get(door.storey_global_id) ?? 0) : 0;
+    const mesh = doorMesh(door, elevationM);
+    if (mesh) group.add(mesh);
+  }
+  return group;
+}
+
 function marker(point: Point2D, elevationM: number, color: number): THREE.Mesh {
   const geometry = new THREE.SphereGeometry(MARKER_RADIUS_M, 16, 16);
   const material = new THREE.MeshStandardMaterial({ color });
@@ -132,6 +187,7 @@ export function buildRouteShareScene(
   // instead of stacking a duplicate copy at every storey's elevation.
   const wallsAdded = new Set<string>();
   const furnitureAdded = new Set<string>();
+  const doorsAdded = new Set<string>();
 
   for (const segment of segments) {
     const elevationM = elevations.get(segment.storeyId) ?? 0;
@@ -148,6 +204,15 @@ export function buildRouteShareScene(
       if (wallsAdded.has(wall.global_id)) continue;
       wallsAdded.add(wall.global_id);
       scene.add(prism(wall.polygon, elevationM, WALL_HEIGHT_M, WALL_COLOR));
+    }
+
+    for (const door of footprints.doors ?? []) {
+      if (door.incomplete) continue;
+      if (door.storey_global_id != null && door.storey_global_id !== segment.storeyId) continue;
+      if (doorsAdded.has(door.global_id)) continue;
+      doorsAdded.add(door.global_id);
+      const mesh = doorMesh(door, elevationM);
+      if (mesh) scene.add(mesh);
     }
 
     for (const item of footprints.furniture ?? []) {

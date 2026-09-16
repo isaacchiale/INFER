@@ -56,6 +56,90 @@ def test_path_traversal_share_id_404s(client: TestClient):
     assert response.status_code == 404
 
 
+def test_usdz_upload_attaches_to_existing_share(client: TestClient):
+    glb_bytes = b"glTF" + b"\x00" * 16
+    created = client.post(
+        "/route-shares", content=glb_bytes, headers={"content-type": "model/gltf-binary"}
+    )
+    share_id = created.json()["share_id"]
+
+    usdz_bytes = b"PK\x03\x04usdz-stand-in"
+    attached = client.post(
+        f"/route-shares?share_id={share_id}",
+        content=usdz_bytes,
+        headers={"content-type": "model/vnd.usdz+zip"},
+    )
+    assert attached.status_code == 201
+    body = attached.json()
+    assert body["share_id"] == share_id
+    assert body["ext"] == "usdz"
+
+    fetched = client.get(f"/route-shares/{share_id}.usdz")
+    assert fetched.status_code == 200
+    assert fetched.content == usdz_bytes
+    assert fetched.headers["content-type"] == "model/vnd.usdz+zip"
+
+    # Both formats now live under the same id.
+    still_glb = client.get(f"/route-shares/{share_id}.glb")
+    assert still_glb.status_code == 200
+    assert still_glb.content == glb_bytes
+
+
+def test_invalid_share_id_on_attach_is_rejected(client: TestClient):
+    response = client.post(
+        "/route-shares?share_id=not-a-real-id",
+        content=b"bytes",
+        headers={"content-type": "model/vnd.usdz+zip"},
+    )
+    assert response.status_code == 400
+
+
+def test_landing_redirects_iphone_to_usdz_and_others_to_glb(client: TestClient):
+    created = client.post(
+        "/route-shares", content=b"glb-bytes", headers={"content-type": "model/gltf-binary"}
+    )
+    share_id = created.json()["share_id"]
+    client.post(
+        f"/route-shares?share_id={share_id}",
+        content=b"usdz-bytes",
+        headers={"content-type": "model/vnd.usdz+zip"},
+    )
+
+    iphone_ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+    to_iphone = client.get(
+        f"/route-shares/{share_id}", headers={"user-agent": iphone_ua}, follow_redirects=False
+    )
+    assert to_iphone.status_code == 307
+    assert to_iphone.headers["location"] == f"/api/route-shares/{share_id}.usdz"
+
+    android_ua = "Mozilla/5.0 (Linux; Android 14)"
+    to_android = client.get(
+        f"/route-shares/{share_id}", headers={"user-agent": android_ua}, follow_redirects=False
+    )
+    assert to_android.status_code == 307
+    assert to_android.headers["location"] == f"/api/route-shares/{share_id}.glb"
+
+
+def test_landing_falls_back_to_whichever_format_exists(client: TestClient):
+    """USDZ-only share (e.g. GLB somehow missing) still resolves for a non-iPhone visitor."""
+    created = client.post(
+        "/route-shares", content=b"usdz-only", headers={"content-type": "model/vnd.usdz+zip"}
+    )
+    share_id = created.json()["share_id"]
+
+    android_ua = "Mozilla/5.0 (Linux; Android 14)"
+    response = client.get(
+        f"/route-shares/{share_id}", headers={"user-agent": android_ua}, follow_redirects=False
+    )
+    assert response.status_code == 307
+    assert response.headers["location"] == f"/api/route-shares/{share_id}.usdz"
+
+
+def test_landing_unknown_share_id_404s(client: TestClient):
+    response = client.get("/route-shares/" + "0" * 32)
+    assert response.status_code == 404
+
+
 def test_expired_shares_swept_on_next_upload(client: TestClient):
     """The router docstring calls this "ephemeral hosting" — verify old
     shares actually get deleted rather than accumulating forever."""

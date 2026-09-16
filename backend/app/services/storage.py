@@ -240,8 +240,13 @@ def _route_shares_root(settings: Settings) -> Path:
     return settings.data_path / "route-shares"
 
 
-def route_share_path(settings: Settings, share_id: str) -> Path:
-    return _route_shares_root(settings) / f"{share_id}.glb"
+ROUTE_SHARE_EXTENSIONS = {"glb", "usdz"}
+
+
+def route_share_path(settings: Settings, share_id: str, ext: str = "glb") -> Path:
+    if ext not in ROUTE_SHARE_EXTENSIONS:
+        raise ValueError(f"Unsupported route share extension: {ext}")
+    return _route_shares_root(settings) / f"{share_id}.{ext}"
 
 
 # Router docstring calls this "ephemeral hosting" — without an actual sweep
@@ -256,21 +261,29 @@ def _sweep_expired_route_shares(settings: Settings) -> None:
     if not root.is_dir():
         return
     cutoff = datetime.now(timezone.utc).timestamp() - ROUTE_SHARE_MAX_AGE_DAYS * 86400
-    for glb in root.glob("*.glb"):
-        try:
-            if glb.stat().st_mtime < cutoff:
-                glb.unlink(missing_ok=True)
-        except OSError:
-            # Best-effort — a share someone's actively viewing shouldn't
-            # block or fail the upload that triggered this sweep.
-            pass
+    for ext in ROUTE_SHARE_EXTENSIONS:
+        for file in root.glob(f"*.{ext}"):
+            try:
+                if file.stat().st_mtime < cutoff:
+                    file.unlink(missing_ok=True)
+            except OSError:
+                # Best-effort — a share someone's actively viewing shouldn't
+                # block or fail the upload that triggered this sweep.
+                pass
 
 
-def save_route_share(settings: Settings, data: bytes) -> str:
-    """Store an exported route GLB under a fresh random id; returns that id."""
+def save_route_share(
+    settings: Settings, data: bytes, ext: str = "glb", share_id: str | None = None
+) -> str:
+    """
+    Store an exported route file under `share_id` (a fresh random id when
+    omitted; pass one back in to attach a second format — e.g. a `.usdz`
+    alongside a `.glb` — to an already-created share). Returns the id.
+    """
     root = _route_shares_root(settings)
     root.mkdir(parents=True, exist_ok=True)
     _sweep_expired_route_shares(settings)
-    share_id = uuid.uuid4().hex
-    route_share_path(settings, share_id).write_bytes(data)
+    if share_id is None:
+        share_id = uuid.uuid4().hex
+    route_share_path(settings, share_id, ext).write_bytes(data)
     return share_id
