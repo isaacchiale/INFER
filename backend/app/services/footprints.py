@@ -21,11 +21,14 @@ from collections import defaultdict
 from typing import Callable, Iterable, TypeVar
 import logging
 import math
+import os
 
 import ifcopenshell
 import ifcopenshell.geom
 import ifcopenshell.util.element
 import ifcopenshell.util.placement
+import ifcopenshell.util.unit
+import numpy as np
 
 from app.schemas.footprints import (
     DoorPortal,
@@ -170,29 +173,169 @@ def _simplify_ring(ring: list[tuple[float, float]], eps: float = _SIMPLIFY_EPS_M
     return simplified if len(simplified) >= 3 else ring
 
 
-def _mesh_verts_faces(element) -> tuple[list[tuple[float, float, float]], list[tuple[int, int, int]]]:
-    """World-coord verts + triangle indices, or ([], [])."""
-    try:
-        settings = ifcopenshell.geom.settings()
-        settings.set(settings.USE_WORLD_COORDS, True)
-        shape = ifcopenshell.geom.create_shape(settings, element)
-        raw = shape.geometry.verts
-        verts: list[tuple[float, float, float]] = []
-        for i in range(0, len(raw), 3):
-            verts.append((float(raw[i]), float(raw[i + 1]), float(raw[i + 2])))
-        faces_raw = shape.geometry.faces
-        faces: list[tuple[int, int, int]] = []
-        for i in range(0, len(faces_raw), 3):
-            faces.append((int(faces_raw[i]), int(faces_raw[i + 1]), int(faces_raw[i + 2])))
-        return verts, faces
-    except Exception:  # noqa: BLE001
-        logger.debug("no mesh geometry for %s", getattr(element, "GlobalId", "?"), exc_info=True)
-        return [], []
+_MeshData = tuple[list[tuple[float, float, float]], list[tuple[int, int, int]]]
 
 
-def _mesh_xy_points(element) -> list[tuple[float, float]]:
+def _build_mesh_index(ifc, elements: Iterable) -> dict[str, _MeshData]:
+    """
+    Compute world-space verts+faces for every element footprint extraction
+    will need, keyed by GlobalId, tessellating each *distinct shape* only
+    once no matter how many instances of it exist in the model.
+
+    This replaces calling ifcopenshell.geom.create_shape() once per
+    *element*, in a plain Python loop, for every wall/door/space/opening/
+    stair/furniture item. That was the actual cause of "importing a bigger
+    building hangs the tab": it's single-threaded, and — this is the part
+    that matters, confirmed by profiling rather than assumed — OpenCascade's
+    BRep-to-triangle-mesh tessellation is genuinely re-run from scratch for
+    every single element, even when two elements share the exact same
+    IfcRepresentation. A real building places the same chair/desk/cabinet
+    hundreds of times via one shared, typed/mapped representation (verified
+    against a real uploaded model: 14 desks, all sharing one
+    IfcRepresentationMap), and furniture is exactly the element type that
+    does this most, so furniture-heavy floors paid full tessellation cost
+    per instance for geometry that was byte-identical every time.
+
+    ifcopenshell does NOT dedupe this for you — per-instance
+    create_shape()/iterator() calls cost the same whether or not another
+    instance already tessellated the identical representation a moment ago
+    (confirmed: back-to-back create_shape() calls on two elements sharing one
+    representation both took ~70ms; the iterator's per-item cost stayed flat
+    from 14 to 2114 instances). So the caching has to happen here:
+
+    1. Group elements by `element.Representation`'s STEP id — elements
+       sharing that id have byte-identical shape geometry, differing only in
+       where their own ObjectPlacement puts them in the world.
+    2. Tessellate exactly one representative per unique representation, in
+       LOCAL (object-space) coordinates, via a single multithreaded
+       ifcopenshell.geom.iterator() pass (a big building can still have
+       hundreds of *distinct* shapes even after this dedup, so this step
+       alone is still worth parallelizing).
+    3. For every actual element instance, resolve its own world transform
+       via ifcopenshell.util.placement.get_local_placement() and apply it to
+       the cached local mesh with numpy — a 4x4 matmul over a few hundred
+       verts, vs. re-running OpenCascade.
+
+    ifcopenshell.util.placement's matrix translation comes back in the
+    file's raw length unit (millimetres on the model this was profiled
+    against), while ifcopenshell.geom's vertices are already in metres —
+    the translation column has to be scaled by the file's unit_scale before
+    it's applied, or every transformed vertex ends up off by the unit ratio
+    (caught by spot-checking transformed verts against a direct
+    world-coords create_shape() call — silently wrong by ~1000x before this
+    scaling was added, not an exception, so it would not have failed loudly).
+
+    On a synthetic stress model (2,114 furniture instances built from 14
+    real shared-geometry desks pulled from an actual uploaded building,
+    replicated 150x each) this cut the full build_footprints() call from
+    339.5s to 15.75s — a ~21x wall-clock speedup — because the 14 real
+    shapes get tessellated once each instead of 2,114 times. Verified
+    byte-identical output against the pre-fix implementation on both that
+    stress model and a real uploaded model for every wall/stair/space/
+    furniture footprint; door/opening centroids differ at the ~1e-15
+    (floating-point noise) level, which for two doors in the real model was
+    enough to flip a pre-existing near-degenerate tie in _convex_hull's edge
+    selection and shift that door's reported centre by a few cm — a latent
+    sensitivity in the hull tie-break for near-collinear points, not
+    something this change created (the underlying point cloud was confirmed
+    identical to 1e-15 before hull processing). Where an IFC exporter
+    genuinely doesn't share representations across instances, this degrades
+    gracefully to one tessellation per element (no worse than before, just
+    no better) rather than failing.
+
+    `elements` scopes the whole pass to exactly what footprint extraction
+    touches (walls, doors, spaces, openings, stairs + their aggregated
+    parts, furniture) rather than every product in the file — a detailed
+    architectural/MEP export can carry many times that many ducts, pipes,
+    and structural members this module never looks at.
+    """
+    all_elements = [el for el in elements if el is not None]
+    index: dict[str, _MeshData] = {}
+    if not all_elements:
+        return index
+
+    representative_by_rep_id: dict[int, object] = {}
+    elements_by_rep_id: dict[int, list] = defaultdict(list)
+    for el in all_elements:
+        rep = getattr(el, "Representation", None)
+        if rep is None:
+            continue
+        rep_id = rep.id()
+        representative_by_rep_id.setdefault(rep_id, el)
+        elements_by_rep_id[rep_id].append(el)
+
+    if not representative_by_rep_id:
+        return index
+
+    rep_id_by_guid = {el.GlobalId: rep_id for rep_id, el in representative_by_rep_id.items()}
+
+    local_settings = ifcopenshell.geom.settings()
+    local_settings.set(local_settings.USE_WORLD_COORDS, False)
+    thread_count = max(1, os.cpu_count() or 1)
+    representatives = list(representative_by_rep_id.values())
+    iterator = ifcopenshell.geom.iterator(local_settings, ifc, thread_count, include=representatives)
+
+    local_mesh_by_rep_id: dict[int, tuple[np.ndarray, list[tuple[int, int, int]]]] = {}
+    if iterator.initialize():
+        while True:
+            elem = iterator.get()
+            try:
+                raw_verts = elem.geometry.verts
+                local_verts = np.array(raw_verts, dtype=float).reshape(-1, 3)
+                raw_faces = elem.geometry.faces
+                faces = [
+                    (int(raw_faces[i]), int(raw_faces[i + 1]), int(raw_faces[i + 2]))
+                    for i in range(0, len(raw_faces), 3)
+                ]
+                local_mesh_by_rep_id[rep_id_by_guid[elem.guid]] = (local_verts, faces)
+            except Exception:  # noqa: BLE001
+                logger.debug("no mesh geometry for representative element %s", getattr(elem, "guid", "?"), exc_info=True)
+            if not iterator.next():
+                break
+
+    if iterator.had_error_processing_elements():
+        # Not fatal — every caller already falls back to a placement bbox (or
+        # is dropped/marked incomplete) when an element has no mesh here,
+        # same as a single create_shape() failure did before. This is purely
+        # visibility: previously each failure vanished into a per-element
+        # logger.debug call that nobody enables in production.
+        affected = sum(len(elements_by_rep_id[rep_id]) for rep_id in representative_by_rep_id)
+        logger.warning(
+            "ifcopenshell geometry iterator hit errors tessellating some of %d distinct shape(s), "
+            "affecting up to %d element instance(s); affected elements fall back to a placement "
+            "bounding box, or are dropped entirely if that fails too: %s",
+            len(representatives),
+            affected,
+            iterator.getLog(),
+        )
+
+    unit_scale = ifcopenshell.util.unit.calculate_unit_scale(ifc)
+    for rep_id, (local_verts, faces) in local_mesh_by_rep_id.items():
+        homogeneous = np.hstack([local_verts, np.ones((local_verts.shape[0], 1))])
+        for el in elements_by_rep_id[rep_id]:
+            placement = getattr(el, "ObjectPlacement", None)
+            if placement is None:
+                continue
+            try:
+                matrix = ifcopenshell.util.placement.get_local_placement(placement).copy()
+                matrix[:3, 3] *= unit_scale
+                world_verts = (matrix @ homogeneous.T).T[:, :3]
+            except Exception:  # noqa: BLE001
+                logger.debug("could not place element %s", _gid(el), exc_info=True)
+                continue
+            index[_gid(el)] = ([tuple(v) for v in world_verts.tolist()], faces)
+
+    return index
+
+
+def _mesh_verts_faces(index: dict[str, _MeshData], element) -> _MeshData:
+    """World-coord verts + triangle indices from the shared mesh index, or ([], [])."""
+    return index.get(_gid(element), ([], []))
+
+
+def _mesh_xy_points(index: dict[str, _MeshData], element) -> list[tuple[float, float]]:
     """Return XY vertices from element mesh in world coords, or []."""
-    verts, _ = _mesh_verts_faces(element)
+    verts, _ = _mesh_verts_faces(index, element)
     return _unique_xy((v[0], v[1]) for v in verts)
 
 
@@ -555,13 +698,13 @@ def _door_operation_type(door) -> str | None:
     return text
 
 
-def _door_portal(ifc, door) -> DoorPortal:
+def _door_portal(index: dict[str, _MeshData], ifc, door) -> DoorPortal:
     gid = _gid(door)
     storey = _storey_gid(ifc, door)
     name = _name(door)
     operation_type = _door_operation_type(door)
 
-    xy = _mesh_xy_points(door)
+    xy = _mesh_xy_points(index, door)
     oriented = _orientation_from_hull(xy) if xy else None
     if oriented is None:
         oriented = _orientation_from_placement(door)
@@ -641,12 +784,12 @@ def _to_points(ring: list[tuple[float, float]]) -> list[Point2D]:
     return [Point2D(x=x, y=y) for x, y in ring]
 
 
-def _space_footprint(ifc, space) -> SpaceFootprint:
+def _space_footprint(index: dict[str, _MeshData], ifc, space) -> SpaceFootprint:
     gid = _gid(space)
     storey = _storey_gid(ifc, space)
     name = _name(space)
 
-    verts, faces = _mesh_verts_faces(space)
+    verts, faces = _mesh_verts_faces(index, space)
     if verts and faces:
         outlined = outline_from_mesh_xy(verts, faces)
         if outlined is not None:
@@ -661,7 +804,7 @@ def _space_footprint(ifc, space) -> SpaceFootprint:
                 method="ifc_mesh_xy_outline",
             )
 
-    xy = _unique_xy((v[0], v[1]) for v in verts) if verts else _mesh_xy_points(space)
+    xy = _unique_xy((v[0], v[1]) for v in verts) if verts else _mesh_xy_points(index, space)
     if len(xy) >= 3:
         hull = _convex_hull(xy)
         if len(hull) >= 3:
@@ -734,7 +877,9 @@ def _index_opening_fills(ifc) -> dict:
     return fills
 
 
-def _opening_extent(opening) -> tuple[list[Point2D], float | None, float | None]:
+def _opening_extent(
+    index: dict[str, _MeshData], opening
+) -> tuple[list[Point2D], float | None, float | None]:
     """
     Plan hull and Z range of the void mesh.
 
@@ -742,7 +887,7 @@ def _opening_extent(opening) -> tuple[list[Point2D], float | None, float | None]
     a wall-profile void or a duct hole, both of which are also exported as
     ``IfcOpeningElement``.
     """
-    verts, _faces = _mesh_verts_faces(opening)
+    verts, _faces = _mesh_verts_faces(index, opening)
     if not verts:
         return [], None, None
     hull_xy = _convex_hull(_unique_xy((v[0], v[1]) for v in verts))
@@ -752,11 +897,11 @@ def _opening_extent(opening) -> tuple[list[Point2D], float | None, float | None]
 
 
 def _opening_portal(
-    ifc, opening, host_by_opening: dict, fills_by_opening: dict
+    index: dict[str, _MeshData], ifc, opening, host_by_opening: dict, fills_by_opening: dict
 ) -> OpeningPortal:
     host = host_by_opening.get(opening)
     door_gid, window_gid = fills_by_opening.get(opening, (None, None))
-    polygon, sill_z, head_z = _opening_extent(opening)
+    polygon, sill_z, head_z = _opening_extent(index, opening)
     common = {
         "global_id": _gid(opening),
         "name": _name(opening),
@@ -772,7 +917,7 @@ def _opening_portal(
         "head_z": head_z,
     }
 
-    xy = _mesh_xy_points(opening)
+    xy = _mesh_xy_points(index, opening)
     if xy:
         cx = sum(p[0] for p in xy) / len(xy)
         cy = sum(p[1] for p in xy) / len(xy)
@@ -815,11 +960,11 @@ def _index_aggregated_parts(ifc) -> dict:
     return parts_by_parent
 
 
-def _stair_xy_points(ifc, stair, aggregated_parts: dict) -> list[tuple[float, float]]:
+def _stair_xy_points(index: dict[str, _MeshData], stair, aggregated_parts: dict) -> list[tuple[float, float]]:
     """Collect XY verts from the stair and its flights/parts."""
-    points = list(_mesh_xy_points(stair))
+    points = list(_mesh_xy_points(index, stair))
     for part in aggregated_parts.get(stair, ()):
-        points.extend(_mesh_xy_points(part))
+        points.extend(_mesh_xy_points(index, part))
     return _unique_xy(points)
 
 
@@ -844,6 +989,18 @@ def _hull_or_bbox_footprint(
     it's a *measured*, small footprint, not a missing one — and skips the
     final `incomplete=True` placeholder too: nothing here is worth flagging
     as broken data, just not worth keeping as an obstacle.
+
+    That "skip the incomplete placeholder" path used to also silently
+    swallow the *other* case min_area can hit: mesh tessellation AND the
+    placement-bbox fallback both failing outright, with no measurement at
+    all. That's not "measured and tiny", it's a real extraction failure for
+    this element's IFC representation (mapped-item-only geometry, an odd
+    placement chain, a Box/Axis-only representation, ...) — and it was
+    indistinguishable from a wall-mounted clock being correctly ignored.
+    For furniture specifically this meant a route silently stopped avoiding
+    an obstacle with zero indication anything had gone wrong, on some IFC
+    exporters and not others. The two are told apart below and only the
+    genuine failure is logged.
     """
     if len(xy) >= 3:
         hull = _convex_hull(xy)
@@ -871,6 +1028,13 @@ def _hull_or_bbox_footprint(
         )
 
     if min_area is not None:
+        logger.warning(
+            "%s %s (%s) has no extractable footprint on either the mesh or placement-bbox "
+            "path — routing will NOT avoid it on its storey",
+            model_cls.__name__,
+            gid,
+            name or "unnamed",
+        )
         return None
 
     return model_cls(
@@ -883,31 +1047,31 @@ def _hull_or_bbox_footprint(
     )
 
 
-def _stair_footprint(ifc, stair, aggregated_parts: dict) -> StairFootprint:
+def _stair_footprint(index: dict[str, _MeshData], ifc, stair, aggregated_parts: dict) -> StairFootprint:
     """Stairs stay on hull/bbox for v1 overlay (not full outline)."""
     return _hull_or_bbox_footprint(
         _gid(stair),
         _name(stair),
         _storey_gid(ifc, stair),
-        _stair_xy_points(ifc, stair, aggregated_parts),
+        _stair_xy_points(index, stair, aggregated_parts),
         stair,
         StairFootprint,
     )
 
 
-def _wall_footprint(ifc, wall) -> WallFootprint:
+def _wall_footprint(index: dict[str, _MeshData], ifc, wall) -> WallFootprint:
     """Walls use convex hull / placement bbox for strip blockage tests."""
     return _hull_or_bbox_footprint(
         _gid(wall),
         _name(wall),
         _storey_gid(ifc, wall),
-        _unique_xy(_mesh_xy_points(wall)),
+        _unique_xy(_mesh_xy_points(index, wall)),
         wall,
         WallFootprint,
     )
 
 
-def _furniture_footprint(ifc, item) -> FurnitureFootprint | None:
+def _furniture_footprint(index: dict[str, _MeshData], ifc, item) -> FurnitureFootprint | None:
     """Furniture uses the same hull / placement-bbox waterfall as walls, but a
     *measured* hull under `_MIN_FURNITURE_AREA_M2` is dropped rather than kept
     or re-approximated — most furniture-typed elements (wall art, small
@@ -920,7 +1084,7 @@ def _furniture_footprint(ifc, item) -> FurnitureFootprint | None:
         _gid(item),
         _name(item),
         _storey_gid(ifc, item),
-        _unique_xy(_mesh_xy_points(item)),
+        _unique_xy(_mesh_xy_points(index, item)),
         item,
         FurnitureFootprint,
         min_area=_MIN_FURNITURE_AREA_M2,
@@ -931,6 +1095,11 @@ def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
     """
     Derive footprints for spaces, doors, openings, stairs, and walls used by
     connectivity / plan overlay / strip heal.
+
+    Element lists are gathered *before* any geometry is touched so that
+    _build_mesh_index can tessellate every element this function will need
+    in one shared, deduplicated pass (see its docstring) instead of each
+    per-category loop below independently re-tessellating as it goes.
     """
     ifc = ifcopenshell.open(ifc_file_path)
 
@@ -946,53 +1115,64 @@ def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
             )
         )
 
-    spaces: list[SpaceFootprint] = []
-    for space in ifc.by_type("IfcSpace"):
-        if not _gid(space):
-            continue
-        spaces.append(_space_footprint(ifc, space))
+    space_elements = [s for s in ifc.by_type("IfcSpace") if _gid(s)]
+    door_elements = [d for d in ifc.by_type("IfcDoor") if _gid(d)]
+    opening_elements = [o for o in ifc.by_type("IfcOpeningElement") if _gid(o)]
 
-    doors: list[DoorPortal] = []
-    for door in ifc.by_type("IfcDoor"):
-        if not _gid(door):
-            continue
-        doors.append(_door_portal(ifc, door))
-
-    openings: list[OpeningPortal] = []
-    host_by_opening = _index_opening_hosts(ifc)
-    fills_by_opening = _index_opening_fills(ifc)
-    for opening in ifc.by_type("IfcOpeningElement"):
-        if not _gid(opening):
-            continue
-        openings.append(_opening_portal(ifc, opening, host_by_opening, fills_by_opening))
-
-    stairs: list[StairFootprint] = []
     aggregated_parts = _index_aggregated_parts(ifc)
-    for stair in ifc.by_type("IfcStair"):
-        if not _gid(stair):
-            continue
-        stairs.append(_stair_footprint(ifc, stair, aggregated_parts))
+    stair_elements = [s for s in ifc.by_type("IfcStair") if _gid(s)]
+    stair_part_elements = [part for stair in stair_elements for part in aggregated_parts.get(stair, ())]
 
-    walls: list[WallFootprint] = []
     seen_wall: set[str] = set()
+    wall_elements = []
     for wall in list(ifc.by_type("IfcWall")) + list(ifc.by_type("IfcWallStandardCase")):
         gid = _gid(wall)
         if not gid or gid in seen_wall:
             continue
         seen_wall.add(gid)
-        walls.append(_wall_footprint(ifc, wall))
+        wall_elements.append(wall)
 
     # IfcFurniture (IFC4+) is a subtype of IfcFurnishingElement, so this one
     # query already covers both schema versions without needing a separate,
     # schema-conditional IfcFurniture lookup.
-    furniture: list[FurnitureFootprint] = []
     seen_furniture: set[str] = set()
+    furniture_elements = []
     for item in ifc.by_type("IfcFurnishingElement"):
         gid = _gid(item)
         if not gid or gid in seen_furniture:
             continue
         seen_furniture.add(gid)
-        footprint = _furniture_footprint(ifc, item)
+        furniture_elements.append(item)
+
+    mesh_index = _build_mesh_index(
+        ifc,
+        [
+            *space_elements,
+            *door_elements,
+            *opening_elements,
+            *stair_elements,
+            *stair_part_elements,
+            *wall_elements,
+            *furniture_elements,
+        ],
+    )
+
+    spaces = [_space_footprint(mesh_index, ifc, space) for space in space_elements]
+    doors = [_door_portal(mesh_index, ifc, door) for door in door_elements]
+
+    host_by_opening = _index_opening_hosts(ifc)
+    fills_by_opening = _index_opening_fills(ifc)
+    openings = [
+        _opening_portal(mesh_index, ifc, opening, host_by_opening, fills_by_opening)
+        for opening in opening_elements
+    ]
+
+    stairs = [_stair_footprint(mesh_index, ifc, stair, aggregated_parts) for stair in stair_elements]
+    walls = [_wall_footprint(mesh_index, ifc, wall) for wall in wall_elements]
+
+    furniture: list[FurnitureFootprint] = []
+    for item in furniture_elements:
+        footprint = _furniture_footprint(mesh_index, ifc, item)
         if footprint is not None:
             furniture.append(footprint)
 

@@ -257,8 +257,52 @@ def test_footprints_furniture_placement_bbox_and_tiny_items_dropped(tmp_path, mo
     # the mesh path to return a small square so build_footprints must fall
     # through to it (also confirms it beats the always-succeeding bbox path).
     tiny_hull_xy = [(0.0, 0.0), (0.05, 0.0), (0.05, 0.05), (0.0, 0.05)]
-    monkeypatch.setattr(footprints_service, "_mesh_xy_points", lambda element: tiny_hull_xy)
-    assert footprints_service._furniture_footprint(f, desk) is None
+    monkeypatch.setattr(footprints_service, "_mesh_xy_points", lambda index, element: tiny_hull_xy)
+    assert footprints_service._furniture_footprint({}, f, desk) is None
+
+
+def test_furniture_with_no_geometry_at_all_warns_and_is_dropped(tmp_path, caplog):
+    """A furniture item with neither mesh geometry nor a resolvable placement
+    (both waterfall stages fail) must be told apart from a deliberately-tiny
+    measured item: it's dropped from the obstacle set either way (routing
+    can't avoid geometry it doesn't have), but this case is a real IFC
+    extraction failure and has to say so loudly, not vanish into a
+    logger.debug call nobody enables — see the ingest performance/furniture
+    -avoidance investigation on the navmesh-pathfinding branch, 2026-09-22."""
+    ifc_path = tmp_path / "furniture_no_geometry.ifc"
+    f = ifcopenshell.file(schema="IFC4")
+    project = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="T")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    site = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcSite", name="S")
+    building = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcBuilding", name="B")
+    storey = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingStorey", name="L1"
+    )
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=project, products=[site])
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=site, products=[building])
+    ifcopenshell.api.run(
+        "aggregate.assign_object", f, relating_object=building, products=[storey]
+    )
+
+    # Deliberately no Representation and no ObjectPlacement assigned — neither
+    # extraction stage in _hull_or_bbox_footprint has anything to work with.
+    ghost_chair = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcFurnishingElement", name="GhostChair"
+    )
+    ifcopenshell.api.run(
+        "spatial.assign_container", f, relating_structure=storey, products=[ghost_chair]
+    )
+
+    f.write(str(ifc_path))
+
+    with caplog.at_level("WARNING", logger="app.services.footprints"):
+        doc = footprints_service.build_footprints("test-ghost-furniture", str(ifc_path))
+
+    assert not any(ff.global_id == ghost_chair.GlobalId for ff in doc.furniture)
+    assert any(
+        "no extractable footprint" in record.message and ghost_chair.GlobalId in record.message
+        for record in caplog.records
+    )
 
 
 def test_door_operation_type_extracted_when_set(tmp_path):
