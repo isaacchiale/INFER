@@ -677,6 +677,9 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const evacuationLoad = useMemo(() => {
     if (!buildingEvacuationLoad || !storeyNavmesh) return null;
     const regionIdsHere = new Set(storeyNavmesh.regions.map((r) => r.spaceId));
+    const regionDistanceToExit = new Map(
+      [...buildingEvacuationLoad.regionDistanceToExit].filter(([id]) => regionIdsHere.has(id)),
+    );
     return {
       portalLoad: buildingEvacuationLoad.portalLoad,
       stairNodes: buildingEvacuationLoad.stairNodes.filter((n) => n.storeyId === storeyNavmesh.storeyId),
@@ -684,6 +687,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
         regionIdsHere.has(id),
       ),
       skippedSpaceIds: buildingEvacuationLoad.skippedSpaceIds.filter((id) => regionIdsHere.has(id)),
+      regionDistanceToExit,
     };
   }, [buildingEvacuationLoad, storeyNavmesh]);
 

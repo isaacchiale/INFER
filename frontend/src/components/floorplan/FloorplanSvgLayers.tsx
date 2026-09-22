@@ -296,12 +296,20 @@ function FloorplanSvgLayersImpl({
   const routeD = smoothPolylinePathD(pathPoints);
   const portalLoad = evacuationLoad?.portalLoad ?? null;
   const stairNodes = evacuationLoad?.stairNodes ?? [];
-  // Cheap (portals per storey is small) and this component only re-runs when
-  // memo() sees a real prop change anyway — no useMemo needed for an O(n) scan.
+  const regionDistanceToExit = evacuationLoad?.regionDistanceToExit ?? null;
+  const unreachableSpaceIds = evacuationLoad?.unreachableSpaceIds ?? null;
+  // Cheap (portals/regions per storey is small) and this component only
+  // re-runs when memo() sees a real prop change anyway — no useMemo needed
+  // for an O(n) scan.
   let maxPortalLoad = 0;
   if (portalLoad) {
     for (const v of portalLoad.values()) if (v > maxPortalLoad) maxPortalLoad = v;
   }
+  let maxRegionDistance = 0;
+  if (regionDistanceToExit) {
+    for (const v of regionDistanceToExit.values()) if (v > maxRegionDistance) maxRegionDistance = v;
+  }
+  const unreachableSet = unreachableSpaceIds ? new Set(unreachableSpaceIds) : null;
   return (
     <>
       {planDisplayMode === "ifc" ? (
@@ -483,16 +491,43 @@ function FloorplanSvgLayersImpl({
         <>
           {storeyNavmesh?.regions.map((r: NavmeshRegion) => {
             const c = polygonCentroid(r.polygon);
+            // Room-fill evacuation heatmap: color the actual floor area a
+            // room occupies by its real walking-distance to the nearest
+            // exit, instead of only glowing the door points around it — see
+            // regionDistanceToExit's doc comment for why this is a distinct
+            // metric from the portal-load dots below (danger-here vs.
+            // congestion-there). Unreachable rooms reuse the same top-of-
+            // scale hazard color as the very worst *reachable* room would,
+            // so the dashed stroke (matching this file's existing excluded-
+            // space convention) is what actually tells them apart — a
+            // solid different color would suggest a fifth heat level that
+            // doesn't exist.
+            const isUnreachable = unreachableSet?.has(r.spaceId) ?? false;
+            const distance = regionDistanceToExit?.get(r.spaceId);
+            const heat = distance == null ? null : maxRegionDistance > 0 ? distance / maxRegionDistance : 0;
+            const fill = isUnreachable
+              ? "var(--hazard)"
+              : heat != null
+                ? evacuationHeatColor(heat)
+                : "rgba(148,163,184,0.35)";
+            const fillOpacity = isUnreachable ? 0.35 : heat != null ? 0.4 + heat * 0.35 : 1;
+            const title = isUnreachable
+              ? `${r.name || r.spaceId} — no path to an exit`
+              : distance != null
+                ? `${r.name || r.spaceId} — ${distance.toFixed(1)} m to nearest exit`
+                : r.name;
             return (
               <g key={r.spaceId}>
                 <path
                   d={spacePathD(r.polygon, r.holes)}
-                  fill="rgba(148,163,184,0.35)"
+                  fill={fill}
+                  fillOpacity={fillOpacity}
                   fillRule="evenodd"
-                  stroke="#64748b"
+                  stroke={isUnreachable ? "var(--hazard)" : "#64748b"}
                   strokeWidth={roomStroke}
+                  strokeDasharray={isUnreachable ? `${roomStroke * 3} ${roomStroke * 2}` : undefined}
                 >
-                  <title>{r.name}</title>
+                  <title>{title}</title>
                 </path>
                 {r.name ? (
                   <g transform={`translate(${c.x} ${c.y})`}>

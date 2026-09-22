@@ -829,6 +829,14 @@ export type EvacuationLoadResult = {
    * their positions from here to draw them, distinctly from real doors.
    */
   stairNodes: { id: string; point: Point2D }[];
+  /**
+   * Real walking-distance (metres) from each region's interior point to the
+   * nearest exit — see {@link BuildingEvacuationLoadResult.regionDistanceToExit}.
+   * Optional here: computeEvacuationLoad (the per-storey version) doesn't
+   * populate it — only the shape FloorplanViewer.tsx builds by projecting
+   * computeBuildingEvacuationLoad's result down to one storey does.
+   */
+  regionDistanceToExit?: Map<string, number>;
 };
 
 /**
@@ -1408,6 +1416,19 @@ export type BuildingEvacuationLoadResult = {
   /** Region (space) ids with no reachable exit anywhere in the *building* (not just their own storey). */
   unreachableSpaceIds: string[];
   skippedSpaceIds: string[];
+  /**
+   * Real walking-distance (metres, obstacle-aware) from each region's own
+   * interior point to the nearest exit anywhere in the building — the same
+   * `bestTotal` value the region-load loop below already computes to pick
+   * which bordering portal to route through, just kept instead of discarded.
+   * A room-level "how dangerous is it here" metric, distinct from
+   * `portalLoad` (which measures door/stair *congestion*, not a room's own
+   * distance to safety) — the two answer different questions and a caller
+   * may want either or both. No entry for a region id means unreachable or
+   * skipped (see those lists); a room can't have "some" distance to an exit
+   * it never found one to.
+   */
+  regionDistanceToExit: Map<string, number>;
   /** Stair/lift nodes considered, across every storey — a caller renders them per-storey using `storeyId`. */
   stairNodes: { id: string; storeyId: string; point: Point2D }[];
 };
@@ -1452,6 +1473,7 @@ export function computeBuildingEvacuationLoad(
   const portalLoad = new Map<string, number>();
   const unreachableSpaceIds: string[] = [];
   const skippedSpaceIds: string[] = [];
+  const regionDistanceToExit = new Map<string, number>();
 
   type MultiNode = {
     id: string;
@@ -1613,7 +1635,7 @@ export function computeBuildingEvacuationLoad(
     for (const mesh of meshes) {
       for (const region of mesh.regions) unreachableSpaceIds.push(region.spaceId);
     }
-    return { portalLoad, unreachableSpaceIds, skippedSpaceIds, stairNodes: [] };
+    return { portalLoad, unreachableSpaceIds, skippedSpaceIds, regionDistanceToExit, stairNodes: [] };
   }
   const closed = new Set<string>();
   while (open.size) {
@@ -1662,6 +1684,7 @@ export function computeBuildingEvacuationLoad(
         unreachableSpaceIds.push(region.spaceId);
         continue;
       }
+      regionDistanceToExit.set(region.spaceId, bestTotal);
 
       const weight = regionOccupantWeight(region);
       let cur = bestNodeId;
@@ -1674,7 +1697,7 @@ export function computeBuildingEvacuationLoad(
     }
   }
 
-  return { portalLoad, unreachableSpaceIds, skippedSpaceIds, stairNodes: stairNodesOut };
+  return { portalLoad, unreachableSpaceIds, skippedSpaceIds, regionDistanceToExit, stairNodes: stairNodesOut };
 }
 
 /** Distance from point to polyline (for right-click hit testing). */

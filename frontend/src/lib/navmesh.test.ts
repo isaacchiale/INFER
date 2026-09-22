@@ -906,6 +906,20 @@ describe("computeBuildingEvacuationLoad", () => {
     assert.ok(Math.abs(result.portalLoad.get(exitPortalId)! - 3.2) < 1e-6);
   });
 
+  it("gives each room its own real walking distance to the nearest exit, not just whether one exists", () => {
+    const meshes = buildTwoStoreyMeshes();
+    const result = computeBuildingEvacuationLoad(meshes, twoStoreyFootprints, twoStoreyGraph);
+
+    const distA = result.regionDistanceToExit.get("space:A");
+    const distU = result.regionDistanceToExit.get("space:U");
+    assert.ok(distA != null && distA > 0, "room A should have a positive distance to its direct exit");
+    assert.ok(distU != null && distU > 0, "room U should have a positive distance to the exit");
+    // Room U has to reach its own stair landing, ride down to room A's
+    // landing, then cross A to the real exit — strictly farther than A's
+    // own direct hop to that same exit.
+    assert.ok(distU! > distA!, "room U (via stair + room A) should be farther than room A's direct hop");
+  });
+
   it("reports every room in the building unreachable when there's no exit anywhere", () => {
     const noExitFootprints: FootprintsDocument = { ...twoStoreyFootprints, doors: [] };
     const noExitGraph: ConnectivityGraph = {
@@ -921,6 +935,7 @@ describe("computeBuildingEvacuationLoad", () => {
 
     assert.deepEqual(result.unreachableSpaceIds.sort(), ["space:A", "space:U"]);
     assert.equal(result.portalLoad.size, 0);
+    assert.equal(result.regionDistanceToExit.size, 0);
   });
 
   it("isolates the upper floor when its connecting stair landing is blocked", () => {
@@ -930,6 +945,8 @@ describe("computeBuildingEvacuationLoad", () => {
     });
 
     assert.deepEqual(result.unreachableSpaceIds, ["space:U"]);
+    assert.ok(!result.regionDistanceToExit.has("space:U"));
+    assert.ok(result.regionDistanceToExit.has("space:A"));
     // Room A is unaffected — it never needed the stair to begin with.
     const s1Mesh = meshes[0]!;
     const exitPortalId = s1Mesh.portals.find((p) => p.kind === "exit")!.id;
