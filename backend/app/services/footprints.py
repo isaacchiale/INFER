@@ -57,12 +57,42 @@ _MIN_FURNITURE_AREA_M2 = 0.05
 
 
 def _unique_xy(points: Iterable[tuple[float, float]], tol: float = 1e-6) -> list[tuple[float, float]]:
-    out: list[tuple[float, float]] = []
+    """
+    Drop near-duplicate points (shared vertices between adjacent mesh
+    triangles, or floating-point noise from a coordinate transform), keeping
+    the first occurrence of each and preserving order.
+
+    This used to check every new point against every point already kept —
+    quadratic in the number of *unique* points, not just points seen, since
+    the "already kept" list itself grows. Real mesh vertex counts are
+    usually small enough not to notice, but one dense element in a real
+    "existing conditions" survey-style IFC export (independently modeled
+    geometry per instance, not simple repeated typed furniture — see
+    _build_mesh_index's docstring on that distinction) was enough to hang
+    an ingest request for many minutes: confirmed live via a py-spy stack
+    dump landing in this exact function while processing one
+    IfcFurnishingElement, not assumed from reading the code.
+
+    Fixed by snapping each point to a `tol`-sized grid cell and using that
+    as a dict key for O(1) average-case lookup — a hash-based dedup instead
+    of an all-pairs scan. tol defaults to 1e-6 (a micrometre at this app's
+    metre scale), far tighter than any real distinction between two mesh
+    vertices, so grid-snapping cannot merge two points a caller would
+    actually consider distinct. The one behavioral difference from the old
+    all-pairs version is a purely theoretical one: a *chain* of points each
+    within tol of the next, spanning further than tol end-to-end, no longer
+    transitively merges into one point. That chain-merging was never the
+    intent here (this dedupes near-identical vertices, not a clustering
+    algorithm) and duplicate mesh vertices in practice sit at identical or
+    bit-noise-identical positions, not spread along such a chain.
+    """
+    seen: dict[tuple[float, float], tuple[float, float]] = {}
+    inv_tol = 1.0 / tol
     for x, y in points:
-        if any(abs(x - ox) <= tol and abs(y - oy) <= tol for ox, oy in out):
-            continue
-        out.append((x, y))
-    return out
+        key = (round(x * inv_tol), round(y * inv_tol))
+        if key not in seen:
+            seen[key] = (x, y)
+    return list(seen.values())
 
 
 def _qxy(x: float, y: float) -> tuple[float, float]:
