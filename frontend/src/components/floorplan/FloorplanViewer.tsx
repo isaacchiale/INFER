@@ -5,7 +5,6 @@ import {
   useMemo,
   useRef,
   useState,
-  useTransition,
 } from "react";
 import {
   Box,
@@ -28,7 +27,8 @@ import {
   type EvacuationLoadMarker,
 } from "@/state/infer-store";
 import { continuousPolylineForStorey, pointInPolygon } from "@/lib/geometric-path";
-import { buildStoreyNavmesh, computeBuildingEvacuationLoad, regionAtPoint } from "@/lib/navmesh";
+import { buildStoreyNavmesh, regionAtPoint, type BuildingEvacuationLoadResult } from "@/lib/navmesh";
+import { computeBuildingEvacuationLoadAsync } from "@/lib/navmesh-worker-client";
 import {
   elevationsForVerticalRemap,
   normalizeElevationsToMetres,
@@ -199,15 +199,15 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const palette = useMemo(() => floorplanPalette(theme), [theme]);
 
   // computeBuildingEvacuationLoad (a Dijkstra over the whole building) runs
-  // synchronously inside the buildingEvacuationLoad useMemo below, which
-  // means it runs during render and blocks paint/input for however long it
-  // takes — a real, measured cost on a large building (see navmesh.test.ts's
-  // "stays fast for a tall building" perf test). Toggling the heat map and
-  // blocking a portal (the two interactions that trigger a recompute) both
-  // go through startTransition so React keeps the rest of the UI responsive
-  // and can report isEvacuationLoadPending, instead of the click just
-  // freezing until the computation finishes.
-  const [isEvacuationLoadPending, startEvacuationLoadTransition] = useTransition();
+  // in a Web Worker (see buildingEvacuationLoad below and
+  // navmesh-worker-client.ts) rather than inline — on a real large building
+  // this is expensive enough to freeze the tab for its duration if run
+  // synchronously during render (see navmesh.test.ts's "stays fast for a
+  // tall building" perf test for the shape of the cost). isEvacuationLoadPending
+  // now tracks that worker call directly instead of going through
+  // React's startTransition, which only reprioritized the resulting
+  // render — it never stopped the synchronous call itself from blocking.
+  const [isEvacuationLoadPending, setIsEvacuationLoadPending] = useState(false);
 
   const [planDisplayMode, setPlanDisplayMode] = useState<PlanDisplayMode>("ifc");
   /** "route": click two points. "exit": click one point, auto-route to the nearest exit. */
@@ -645,11 +645,27 @@ export function FloorplanViewer({ className }: { className?: string }) {
   // stairwell has its route actually continue down through it to a real
   // exit, so a ground-floor lobby door's count reflects everyone funnelling
   // through it from upper floors too, not just that floor's own rooms.
-  const buildingEvacuationLoad = useMemo(() => {
-    if (!showEvacuationLoad || !allStoreyNavmeshes.length) return null;
-    return computeBuildingEvacuationLoad(allStoreyNavmeshes, footprintsDocument, connectivityGraph, {
+  const [buildingEvacuationLoad, setBuildingEvacuationLoad] =
+    useState<BuildingEvacuationLoadResult | null>(null);
+
+  useEffect(() => {
+    if (!showEvacuationLoad || !allStoreyNavmeshes.length) {
+      setBuildingEvacuationLoad(null);
+      setIsEvacuationLoadPending(false);
+      return;
+    }
+    let cancelled = false;
+    setIsEvacuationLoadPending(true);
+    void computeBuildingEvacuationLoadAsync(allStoreyNavmeshes, footprintsDocument, connectivityGraph, {
       blockedPortalIds,
+    }).then((result) => {
+      if (cancelled) return;
+      setBuildingEvacuationLoad(result);
+      setIsEvacuationLoadPending(false);
     });
+    return () => {
+      cancelled = true;
+    };
   }, [showEvacuationLoad, allStoreyNavmeshes, footprintsDocument, connectivityGraph, blockedPortalIds]);
 
   // The floorplan pane only ever shows one storey's plan at a time, so
@@ -1242,13 +1258,11 @@ export function FloorplanViewer({ className }: { className?: string }) {
         const world = clientToView(e.clientX, e.clientY, svg, bounds, cameraRef.current);
         const portal = nearestPortalWithin(pick.mesh.portals, world, pick.portalHitR);
         if (portal) {
-          startEvacuationLoadTransition(() => {
-            setBlockedPortalIds((prev) => {
-              const next = new Set(prev);
-              if (next.has(portal.id)) next.delete(portal.id);
-              else next.add(portal.id);
-              return next;
-            });
+          setBlockedPortalIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(portal.id)) next.delete(portal.id);
+            else next.add(portal.id);
+            return next;
           });
           return;
         }
@@ -1426,10 +1440,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
               <button
                 type="button"
                 aria-pressed={showEvacuationLoad}
-                onClick={() => {
-                  const next = !showEvacuationLoad;
-                  startEvacuationLoadTransition(() => setShowEvacuationLoad(next));
-                }}
+                onClick={() => setShowEvacuationLoad(!showEvacuationLoad)}
                 className={cn(
                   GLASS,
                   "pointer-events-auto inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
@@ -1807,7 +1818,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     type="button"
                     className="pointer-events-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground transition-colors hover:bg-muted"
                     title="Clear all blocked portals"
-                    onClick={() => startEvacuationLoadTransition(() => setBlockedPortalIds(new Set()))}
+                    onClick={() => setBlockedPortalIds(new Set())}
                   >
                     <span className="inline-block size-2 rounded-full bg-portal-blocked" />
                     {blockedPortalIds.size} blocked · clear
