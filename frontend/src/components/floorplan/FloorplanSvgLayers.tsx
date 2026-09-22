@@ -1,5 +1,6 @@
-import { memo } from "react";
+import { memo, useId, useMemo } from "react";
 import { buildDoorGlyph } from "@/lib/door-symbol";
+import { renderEvacuationHeatTextureDataUrl, type HeatSample } from "@/lib/evacuation-heat-texture";
 import { smoothPolylinePathD, type Point2 } from "@/lib/floorplan-camera";
 import type {
   DoorPortal,
@@ -293,6 +294,11 @@ function FloorplanSvgLayersImpl({
   routeStroke,
   selectedStroke,
 }: FloorplanSvgLayersProps) {
+  // Scoped so two mounted instances (however unlikely today) never collide
+  // on the same clipPath id — url(#id) resolves to the first DOM match.
+  // useId()'s colons are valid in a url(#...) fragment reference, but
+  // stripped anyway to sidestep any doubt rather than rely on that.
+  const heatClipId = `evac-heat-clip-${useId().replace(/[^a-zA-Z0-9-]/g, "")}`;
   const routeD = smoothPolylinePathD(pathPoints);
   const portalLoad = evacuationLoad?.portalLoad ?? null;
   const stairNodes = evacuationLoad?.stairNodes ?? [];
@@ -310,6 +316,56 @@ function FloorplanSvgLayersImpl({
     for (const v of regionDistanceToExit.values()) if (v > maxRegionDistance) maxRegionDistance = v;
   }
   const unreachableSet = unreachableSpaceIds ? new Set(unreachableSpaceIds) : null;
+
+  // Continuous heatmap texture: samples every region's centroid + vertices
+  // at its own heat value (unreachable = hottest), so the blob field
+  // roughly follows each room's real footprint shape instead of reading as
+  // one circle per room — see evacuation-heat-texture.ts for the render
+  // technique and why a flat per-polygon fill doesn't read as a real
+  // heatmap. Recomputed only when the load data, the regions, or the theme
+  // (via `palette`, itself a function of theme) actually change, not on
+  // every pan/zoom-only re-render.
+  const evacuationHeatTexture = useMemo(() => {
+    if (!storeyNavmesh || !evacuationLoad) return null;
+    const distMap = evacuationLoad.regionDistanceToExit;
+    const unreachableIds = evacuationLoad.unreachableSpaceIds;
+    if ((!distMap || distMap.size === 0) && (!unreachableIds || unreachableIds.length === 0)) return null;
+
+    let maxDist = 0;
+    if (distMap) for (const v of distMap.values()) if (v > maxDist) maxDist = v;
+    const unreachable = unreachableIds ? new Set(unreachableIds) : null;
+
+    const samples: HeatSample[] = [];
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const r of storeyNavmesh.regions) {
+      const isUnreachable = unreachable?.has(r.spaceId) ?? false;
+      const distance = distMap?.get(r.spaceId);
+      if (!isUnreachable && distance == null) continue;
+      const value = isUnreachable ? 1 : maxDist > 0 ? distance! / maxDist : 0;
+      for (const p of [polygonCentroid(r.polygon), ...r.polygon]) {
+        samples.push({ x: p.x, y: p.y, value });
+        if (p.x < minX) minX = p.x;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.y > maxY) maxY = p.y;
+      }
+    }
+    if (samples.length === 0 || !Number.isFinite(minX)) return null;
+
+    const bounds = { minX, minY, maxX, maxY };
+    // Blob radius as a fraction of the storey's own footprint span, so it
+    // scales sensibly whether this is one small room or a large open floor
+    // instead of a fixed metre value that would look right on one building
+    // and wrong on another.
+    const span = Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
+    const blobRadius = Math.max(1.5, span * 0.12);
+    const dataUrl = renderEvacuationHeatTextureDataUrl(samples, bounds, { blobRadius });
+    return dataUrl ? { dataUrl, bounds } : null;
+  }, [storeyNavmesh, evacuationLoad, palette]);
+
   return (
     <>
       {planDisplayMode === "ifc" ? (
@@ -489,28 +545,41 @@ function FloorplanSvgLayersImpl({
         </>
       ) : (
         <>
+          {evacuationHeatTexture ? (
+            <>
+              <defs>
+                <clipPath id={heatClipId}>
+                  {storeyNavmesh?.regions.map((r: NavmeshRegion) => (
+                    <path key={r.spaceId} d={spacePathD(r.polygon, r.holes)} fillRule="evenodd" />
+                  ))}
+                </clipPath>
+              </defs>
+              <image
+                href={evacuationHeatTexture.dataUrl}
+                x={evacuationHeatTexture.bounds.minX}
+                y={evacuationHeatTexture.bounds.minY}
+                width={evacuationHeatTexture.bounds.maxX - evacuationHeatTexture.bounds.minX}
+                height={evacuationHeatTexture.bounds.maxY - evacuationHeatTexture.bounds.minY}
+                clipPath={`url(#${heatClipId})`}
+                preserveAspectRatio="none"
+                className="pointer-events-none"
+              />
+            </>
+          ) : null}
           {storeyNavmesh?.regions.map((r: NavmeshRegion) => {
             const c = polygonCentroid(r.polygon);
-            // Room-fill evacuation heatmap: color the actual floor area a
-            // room occupies by its real walking-distance to the nearest
-            // exit, instead of only glowing the door points around it — see
-            // regionDistanceToExit's doc comment for why this is a distinct
-            // metric from the portal-load dots below (danger-here vs.
-            // congestion-there). Unreachable rooms reuse the same top-of-
-            // scale hazard color as the very worst *reachable* room would,
-            // so the dashed stroke (matching this file's existing excluded-
-            // space convention) is what actually tells them apart — a
-            // solid different color would suggest a fifth heat level that
-            // doesn't exist.
+            // The heatmap itself is the <image> texture above (a real
+            // continuous field — see evacuation-heat-texture.ts); a flat
+            // per-polygon fill here reads as coloring shapes in, not a
+            // heatmap, which is exactly the look this replaced. This path
+            // is now just outline + label + hit-target, with a faint wash
+            // only when there's no heat data to show (normal navmesh view).
+            // Unreachable still gets its own dashed hazard stroke, since
+            // the texture treats "unreachable" and "worst reachable" as the
+            // same top-of-scale color — the stroke is what actually tells
+            // them apart, same convention this file uses for excluded spaces.
             const isUnreachable = unreachableSet?.has(r.spaceId) ?? false;
             const distance = regionDistanceToExit?.get(r.spaceId);
-            const heat = distance == null ? null : maxRegionDistance > 0 ? distance / maxRegionDistance : 0;
-            const fill = isUnreachable
-              ? "var(--hazard)"
-              : heat != null
-                ? evacuationHeatColor(heat)
-                : "rgba(148,163,184,0.35)";
-            const fillOpacity = isUnreachable ? 0.35 : heat != null ? 0.4 + heat * 0.35 : 1;
             const title = isUnreachable
               ? `${r.name || r.spaceId} — no path to an exit`
               : distance != null
@@ -520,8 +589,7 @@ function FloorplanSvgLayersImpl({
               <g key={r.spaceId}>
                 <path
                   d={spacePathD(r.polygon, r.holes)}
-                  fill={fill}
-                  fillOpacity={fillOpacity}
+                  fill={evacuationHeatTexture ? "transparent" : "rgba(148,163,184,0.35)"}
                   fillRule="evenodd"
                   stroke={isUnreachable ? "var(--hazard)" : "#64748b"}
                   strokeWidth={roomStroke}
