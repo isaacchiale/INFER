@@ -29,20 +29,27 @@ export const PORTAL_COLORS = {
 } as const;
 
 /**
- * Sequential (not diverging) heat scale for the evacuation-load overlay —
- * pale amber at t=0 up through orange to --hazard red at t=1. Deliberately
- * avoids a green↔red gradient: that's the same classic colorblind-confusable
- * pair the rest of this file's palette (see PORTAL_COLORS' comment) already
- * steers clear of, and green would also misleadingly read as "safe/low" at
- * one end of a scale that's never actually indicating safety. The top of the
- * scale reuses the app's real --hazard token (theme-aware) instead of a
- * fourth fixed stop, so "worst bottleneck" here means the same severity as
- * everywhere else in the app.
+ * Sequential heat scale for the evacuation-load overlay — the familiar
+ * traffic-light progression (green -> yellow/orange -> red -> a genuinely
+ * dark red), not a single hue varying only in lightness/chroma. A one-hue
+ * scale was tried first specifically to dodge the classic red/green
+ * colorblind-confusable pair (see PORTAL_COLORS' comment for that pair
+ * elsewhere in this file) and to avoid green misleadingly reading as
+ * "safe" on a scale with no safe state — but in practice, shades of one
+ * color were too hard to tell apart at a glance, which defeats the point
+ * of a heatmap. Reverted to multi-hue; the CVD risk is mitigated by every
+ * stop also changing lightness (not hue alone) and by the exact
+ * distance/load number always being one hover or one look at the "Worst
+ * bottlenecks" panel away, never color-only. --warning and --hazard are
+ * reused directly (not duplicated) as the middle/high anchors, so this
+ * scale's meaning always matches those tokens' meaning elsewhere in the
+ * app.
  */
 const EVACUATION_HEAT_STOPS: [number, string][] = [
   [0, "var(--evac-heat-low)"],
-  [0.5, "var(--evac-heat-mid)"],
-  [1, "var(--hazard)"],
+  [0.33, "var(--warning)"],
+  [0.66, "var(--hazard)"],
+  [1, "var(--evac-heat-max)"],
 ];
 
 export function evacuationHeatColor(t: number): string {
@@ -105,6 +112,21 @@ function polygonCentroid(polygon: Point2[]): Point2 {
   }
   const n = Math.max(polygon.length, 1);
   return { x: x / n, y: y / n };
+}
+
+/** Shoelace area — a rough size estimate for the evacuation heatmap's blob
+ * radius (see evacuationHeatTexture below), not a measurement anyone reads
+ * directly, so holes/precision don't matter here the way they would for
+ * the real footprint pipeline. */
+function polygonAreaForBlobSizing(polygon: Point2[]): number {
+  if (polygon.length < 3) return 0;
+  let sum = 0;
+  for (let i = 0; i < polygon.length; i++) {
+    const a = polygon[i]!;
+    const b = polygon[(i + 1) % polygon.length]!;
+    sum += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(sum) / 2;
 }
 
 /** Scale a polygon about its own centroid — used to pad a door's thin hull
@@ -234,10 +256,8 @@ export type FloorplanSvgLayersProps = {
   navmeshEnd: Point2 | null;
   isExitRoute: boolean;
   blockedPortalIds: Set<string>;
-  /** Evacuation-bottleneck overlay. When set, portal markers are heat-colored/sized by load instead of by kind, and stairNodes render as additional square markers (stairs aren't part of storeyNavmesh.portals at all). Null/omitted leaves the normal kind-colored markers. */
+  /** Evacuation-bottleneck overlay. When set, room fills and stairNodes (stairs aren't part of storeyNavmesh.portals at all) render via the continuous heatmap texture — see evacuationHeatTexture. Portal/stair markers themselves always keep their plain kind color/size. Null/omitted leaves the normal navmesh look with no heatmap. */
   evacuationLoad?: EvacuationLoadResult | null;
-  /** Portal/stair-node ids in the building-wide top-N worst bottlenecks (see FloorplanViewer's `worstBottlenecks`) — these get an animated glow ring on top of the normal heat styling. Everything else stays static; motion is reserved for what actually matters. */
-  hotspotIds?: ReadonlySet<string> | null;
   doorsByGlobalId: Map<string, DoorPortal>;
   palette: FloorplanPalette;
   selectedSpaces: SpaceFootprint[];
@@ -279,7 +299,6 @@ function FloorplanSvgLayersImpl({
   isExitRoute,
   blockedPortalIds,
   evacuationLoad,
-  hotspotIds,
   doorsByGlobalId,
   palette,
   selectedSpaces,
@@ -304,64 +323,89 @@ function FloorplanSvgLayersImpl({
   const stairNodes = evacuationLoad?.stairNodes ?? [];
   const regionDistanceToExit = evacuationLoad?.regionDistanceToExit ?? null;
   const unreachableSpaceIds = evacuationLoad?.unreachableSpaceIds ?? null;
-  // Cheap (portals/regions per storey is small) and this component only
-  // re-runs when memo() sees a real prop change anyway — no useMemo needed
-  // for an O(n) scan.
-  let maxPortalLoad = 0;
-  if (portalLoad) {
-    for (const v of portalLoad.values()) if (v > maxPortalLoad) maxPortalLoad = v;
-  }
-  let maxRegionDistance = 0;
-  if (regionDistanceToExit) {
-    for (const v of regionDistanceToExit.values()) if (v > maxRegionDistance) maxRegionDistance = v;
-  }
   const unreachableSet = unreachableSpaceIds ? new Set(unreachableSpaceIds) : null;
 
-  // Continuous heatmap texture: samples every region's centroid + vertices
-  // at its own heat value (unreachable = hottest), so the blob field
-  // roughly follows each room's real footprint shape instead of reading as
-  // one circle per room — see evacuation-heat-texture.ts for the render
-  // technique and why a flat per-polygon fill doesn't read as a real
-  // heatmap. Recomputed only when the load data, the regions, or the theme
-  // (via `palette`, itself a function of theme) actually change, not on
-  // every pan/zoom-only re-render.
+  // Continuous heatmap texture, combining two distinct signals into one
+  // field instead of showing the second (door/stair traffic) as separate
+  // glowing dot markers on top:
+  //  - room samples (centroid + vertices, so the blob roughly follows each
+  //    room's real footprint instead of reading as one circle per room) at
+  //    that room's own distance-to-exit heat (unreachable = hottest);
+  //  - a sample at every portal/stair point, at that node's own share of
+  //    evacuation traffic — so a heavily-congested door reads as a dark red
+  //    hot pocket bleeding into its surrounding room, "the high-traffic
+  //    road", the same way a WiFi survey heatmap shows a dead zone as a
+  //    patch of the field rather than a separate marker glued on top.
+  // Each signal is normalized against its own max independently (a busy
+  // door can hit full intensity even in a building where no room happens to
+  // be far from an exit, and vice versa) — see evacuation-heat-texture.ts
+  // for the render technique and why a flat per-polygon fill doesn't read
+  // as a real heatmap. Recomputed only when the load data, the regions, or
+  // the theme (via `palette`, itself a function of theme) actually change,
+  // not on every pan/zoom-only re-render.
   const evacuationHeatTexture = useMemo(() => {
     if (!storeyNavmesh || !evacuationLoad) return null;
     const distMap = evacuationLoad.regionDistanceToExit;
     const unreachableIds = evacuationLoad.unreachableSpaceIds;
-    if ((!distMap || distMap.size === 0) && (!unreachableIds || unreachableIds.length === 0)) return null;
+    const loadMap = evacuationLoad.portalLoad;
+    const hasRoomData = !!(distMap && distMap.size) || !!(unreachableIds && unreachableIds.length);
+    const hasTrafficData = !!(loadMap && loadMap.size);
+    if (!hasRoomData && !hasTrafficData) return null;
 
     let maxDist = 0;
     if (distMap) for (const v of distMap.values()) if (v > maxDist) maxDist = v;
     const unreachable = unreachableIds ? new Set(unreachableIds) : null;
+    let maxLoad = 0;
+    if (loadMap) for (const v of loadMap.values()) if (v > maxLoad) maxLoad = v;
 
     const samples: HeatSample[] = [];
     let minX = Infinity;
     let minY = Infinity;
     let maxX = -Infinity;
     let maxY = -Infinity;
+    const addSample = (x: number, y: number, value: number) => {
+      samples.push({ x, y, value });
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    };
+
     for (const r of storeyNavmesh.regions) {
       const isUnreachable = unreachable?.has(r.spaceId) ?? false;
       const distance = distMap?.get(r.spaceId);
       if (!isUnreachable && distance == null) continue;
       const value = isUnreachable ? 1 : maxDist > 0 ? distance! / maxDist : 0;
-      for (const p of [polygonCentroid(r.polygon), ...r.polygon]) {
-        samples.push({ x: p.x, y: p.y, value });
-        if (p.x < minX) minX = p.x;
-        if (p.x > maxX) maxX = p.x;
-        if (p.y < minY) minY = p.y;
-        if (p.y > maxY) maxY = p.y;
+      for (const p of [polygonCentroid(r.polygon), ...r.polygon]) addSample(p.x, p.y, value);
+    }
+    if (maxLoad > 0) {
+      for (const p of storeyNavmesh.portals) {
+        const load = loadMap?.get(p.id) ?? 0;
+        if (load > 0) addSample(p.point.x, p.point.y, load / maxLoad);
+      }
+      for (const s of evacuationLoad.stairNodes) {
+        const load = loadMap?.get(s.id) ?? 0;
+        if (load > 0) addSample(s.point.x, s.point.y, load / maxLoad);
       }
     }
     if (samples.length === 0 || !Number.isFinite(minX)) return null;
 
     const bounds = { minX, minY, maxX, maxY };
-    // Blob radius as a fraction of the storey's own footprint span, so it
-    // scales sensibly whether this is one small room or a large open floor
-    // instead of a fixed metre value that would look right on one building
-    // and wrong on another.
-    const span = Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
-    const blobRadius = Math.max(1.5, span * 0.12);
+    // Blob radius sized off a *typical room's* footprint (median sqrt-area
+    // across this storey's regions), not the overall bounding-box span —
+    // a long, thin building (a 100m corridor wing 5m wide, say) has a huge
+    // span but the same small rooms as any other building, and sizing off
+    // span alone would give a blob more than double the corridor's own
+    // width, blurring away every room-to-room distinction along its length
+    // instead of just smoothing within/between adjacent rooms. Clamped so
+    // one huge open room (a warehouse floor) doesn't blow the radius out
+    // either.
+    const roomSpans = storeyNavmesh.regions
+      .map((r) => Math.sqrt(polygonAreaForBlobSizing(r.polygon)))
+      .filter((s) => s > 0)
+      .sort((a, b) => a - b);
+    const medianRoomSpan = roomSpans.length ? roomSpans[Math.floor(roomSpans.length / 2)]! : 4;
+    const blobRadius = Math.max(1.5, Math.min(medianRoomSpan * 0.4, 8));
     const dataUrl = renderEvacuationHeatTextureDataUrl(samples, bounds, { blobRadius });
     return dataUrl ? { dataUrl, bounds } : null;
   }, [storeyNavmesh, evacuationLoad, palette]);
@@ -618,7 +662,6 @@ function FloorplanSvgLayersImpl({
           {storeyNavmesh?.portals.map((p: NavmeshPortal) => {
             const blocked = blockedPortalIds.has(p.id);
             const load = portalLoad?.get(p.id) ?? 0;
-            const heat = portalLoad ? (maxPortalLoad > 0 ? load / maxPortalLoad : 0) : null;
             const door = p.doorGlobalId ? doorsByGlobalId.get(p.doorGlobalId) : null;
             const glyph =
               door && door.segment.length === 2 && door.normal
@@ -653,54 +696,31 @@ function FloorplanSvgLayersImpl({
                     ))}
                   </g>
                 ) : null}
-                {heat != null ? (
-                  // Soft under-glow instead of a flat filled dot — reads as
-                  // a heat source with real depth, not a scatter-plot point.
-                  <circle
-                    cx={p.point.x}
-                    cy={p.point.y}
-                    r={portalR * (2.2 + heat * 1.6)}
-                    fill={evacuationHeatColor(heat)}
-                    opacity={0.14 + heat * 0.22}
-                    className="pointer-events-none"
-                  />
-                ) : null}
-                {heat != null && hotspotIds?.has(p.id) ? (
-                  // Reserved for the building-wide top-N worst nodes only —
-                  // motion draws the eye to what actually matters instead of
-                  // every marker pulsing at once.
-                  <circle
-                    cx={p.point.x}
-                    cy={p.point.y}
-                    r={portalR * (2.6 + heat * 1.6)}
-                    fill="none"
-                    stroke={evacuationHeatColor(heat)}
-                    strokeWidth={doorStroke * 0.8}
-                    className="hazard-pulse pointer-events-none"
-                  />
-                ) : null}
+                {/* Traffic is now shown by the heatmap texture itself (see
+                    evacuationHeatTexture) — this marker always keeps its
+                    plain kind color/size, evacuation mode or not, so it
+                    reads as "what kind of portal" rather than competing
+                    with the field underneath as a second heat encoding. */}
                 <circle
                   cx={p.point.x}
                   cy={p.point.y}
-                  r={heat != null ? portalR * (1 + heat * 1.4) : portalR}
+                  r={portalR}
                   fill={
-                    heat != null
-                      ? evacuationHeatColor(heat)
-                      : blocked
-                        ? PORTAL_COLORS.blocked
-                        : p.kind === "exit"
-                          ? PORTAL_COLORS.exit
-                          : p.kind === "space"
-                            ? PORTAL_COLORS.spacePortal
-                            : p.inferred
-                              ? PORTAL_COLORS.doorHeal
-                              : PORTAL_COLORS.door
+                    blocked
+                      ? PORTAL_COLORS.blocked
+                      : p.kind === "exit"
+                        ? PORTAL_COLORS.exit
+                        : p.kind === "space"
+                          ? PORTAL_COLORS.spacePortal
+                          : p.inferred
+                            ? PORTAL_COLORS.doorHeal
+                            : PORTAL_COLORS.door
                   }
                   stroke="#0f172a"
                   strokeWidth={doorStroke * 0.4}
                 >
                   <title>
-                    {heat != null
+                    {portalLoad
                       ? `${load} evacuation route${load === 1 ? "" : "s"} cross this portal`
                       : blocked
                         ? "Blocked — click to unblock"
@@ -736,40 +756,19 @@ function FloorplanSvgLayersImpl({
             // all (see computeEvacuationLoad's doc comment on why they're
             // treated as exits here), so this needs to read as visually
             // distinct from a real door/exit portal, not just another dot.
+            // Traffic through it is shown by the heatmap texture itself (see
+            // evacuationHeatTexture) — plain size/color always, same as
+            // portals above.
             const load = portalLoad?.get(s.id) ?? 0;
-            const heat = maxPortalLoad > 0 ? load / maxPortalLoad : 0;
-            const size = portalR * 1.6 * (1 + heat * 1.4);
-            const glowSize = portalR * 1.6 * (3.4 + heat * 2.2);
-            const isHotspot = hotspotIds?.has(s.id);
+            const size = portalR * 1.6;
             return (
               <g key={s.id}>
-                <rect
-                  x={s.point.x - glowSize / 2}
-                  y={s.point.y - glowSize / 2}
-                  width={glowSize}
-                  height={glowSize}
-                  fill={evacuationHeatColor(heat)}
-                  opacity={0.14 + heat * 0.22}
-                  className="pointer-events-none"
-                />
-                {isHotspot ? (
-                  <rect
-                    x={s.point.x - glowSize / 2 - portalR * 0.3}
-                    y={s.point.y - glowSize / 2 - portalR * 0.3}
-                    width={glowSize + portalR * 0.6}
-                    height={glowSize + portalR * 0.6}
-                    fill="none"
-                    stroke={evacuationHeatColor(heat)}
-                    strokeWidth={doorStroke * 0.8}
-                    className="hazard-pulse pointer-events-none"
-                  />
-                ) : null}
                 <rect
                   x={s.point.x - size / 2}
                   y={s.point.y - size / 2}
                   width={size}
                   height={size}
-                  fill={evacuationHeatColor(heat)}
+                  fill="var(--stair-glyph)"
                   stroke="#0f172a"
                   strokeWidth={doorStroke * 0.4}
                 >

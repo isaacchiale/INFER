@@ -954,6 +954,325 @@ describe("computeBuildingEvacuationLoad", () => {
   });
 });
 
+describe("computeBuildingEvacuationLoad — realistic multi-exit/topology scenarios", () => {
+  // R_L (has exit EL) -- DL -- R_M -- DR -- R_R (has exit ER, much farther
+  // from the DR side than EL is from the DL side) -- plus R_ISO, a room
+  // with no doors at all, disconnected from everything.
+  //
+  //   [R_L]--EL(exit)   [R_L]--DL--[R_M]--DR--[R_R]--ER(exit)   [R_ISO]
+  //
+  const threeRoomFootprints: FootprintsDocument = {
+    schema_version: "1.0",
+    model_id: "t3",
+    coordinate_system: "ifc_world_xy_metres",
+    storeys: [{ global_id: "S1", name: "L1", elevation: 0 }],
+    spaces: [
+      {
+        global_id: "L",
+        name: "L",
+        storey_global_id: "S1",
+        polygon: [
+          { x: 0, y: 0 },
+          { x: 2, y: 0 },
+          { x: 2, y: 2 },
+          { x: 0, y: 2 },
+        ],
+        incomplete: false,
+        method: "ifc_placement_bbox",
+      },
+      {
+        global_id: "M",
+        name: "M",
+        storey_global_id: "S1",
+        polygon: [
+          { x: 2, y: 0 },
+          { x: 6, y: 0 },
+          { x: 6, y: 2 },
+          { x: 2, y: 2 },
+        ],
+        incomplete: false,
+        method: "ifc_placement_bbox",
+      },
+      {
+        global_id: "R",
+        name: "R",
+        storey_global_id: "S1",
+        polygon: [
+          { x: 6, y: 0 },
+          { x: 16, y: 0 },
+          { x: 16, y: 2 },
+          { x: 6, y: 2 },
+        ],
+        incomplete: false,
+        method: "ifc_placement_bbox",
+      },
+      {
+        global_id: "ISO",
+        name: "ISO",
+        storey_global_id: "S1",
+        polygon: [
+          { x: 50, y: 50 },
+          { x: 52, y: 50 },
+          { x: 52, y: 52 },
+          { x: 50, y: 52 },
+        ],
+        incomplete: false,
+        method: "ifc_placement_bbox",
+      },
+    ],
+    doors: [
+      {
+        global_id: "EL",
+        name: "EL",
+        storey_global_id: "S1",
+        point: { x: 0, y: 1 },
+        segment: [
+          { x: 0, y: 0.5 },
+          { x: 0, y: 1.5 },
+        ],
+        incomplete: false,
+        method: "ifc_object_placement",
+      },
+      {
+        global_id: "DL",
+        name: "DL",
+        storey_global_id: "S1",
+        point: { x: 2, y: 1 },
+        segment: [
+          { x: 2, y: 0.5 },
+          { x: 2, y: 1.5 },
+        ],
+        incomplete: false,
+        method: "ifc_object_placement",
+      },
+      {
+        global_id: "DR",
+        name: "DR",
+        storey_global_id: "S1",
+        point: { x: 6, y: 1 },
+        segment: [
+          { x: 6, y: 0.5 },
+          { x: 6, y: 1.5 },
+        ],
+        incomplete: false,
+        method: "ifc_object_placement",
+      },
+      {
+        global_id: "ER",
+        name: "ER",
+        storey_global_id: "S1",
+        point: { x: 16, y: 1 },
+        segment: [
+          { x: 16, y: 0.5 },
+          { x: 16, y: 1.5 },
+        ],
+        incomplete: false,
+        method: "ifc_object_placement",
+      },
+    ],
+  };
+
+  const threeRoomGraph: ConnectivityGraph = {
+    schema_version: "1.0",
+    model_id: "t3",
+    variant: "geometry",
+    nodes: [
+      { id: "space:L", kind: "space", global_id: "L", name: "L", storey_global_id: "S1" },
+      { id: "space:M", kind: "space", global_id: "M", name: "M", storey_global_id: "S1" },
+      { id: "space:R", kind: "space", global_id: "R", name: "R", storey_global_id: "S1" },
+      { id: "space:ISO", kind: "space", global_id: "ISO", name: "ISO", storey_global_id: "S1" },
+      { id: "door:EL", kind: "door", global_id: "EL", name: "EL", storey_global_id: "S1" },
+      { id: "door:DL", kind: "door", global_id: "DL", name: "DL", storey_global_id: "S1" },
+      { id: "door:DR", kind: "door", global_id: "DR", name: "DR", storey_global_id: "S1" },
+      { id: "door:ER", kind: "door", global_id: "ER", name: "ER", storey_global_id: "S1" },
+    ],
+    edges: [
+      { id: "sd:L:EL", kind: "space_door", source: "space:L", target: "door:EL", method: "geom_door_space", inferred: true },
+      { id: "sd:L:DL", kind: "space_door", source: "space:L", target: "door:DL", method: "geom_door_space", inferred: true },
+      { id: "sd:M:DL", kind: "space_door", source: "space:M", target: "door:DL", method: "geom_door_space", inferred: true },
+      { id: "sd:M:DR", kind: "space_door", source: "space:M", target: "door:DR", method: "geom_door_space", inferred: true },
+      { id: "sd:R:DR", kind: "space_door", source: "space:R", target: "door:DR", method: "geom_door_space", inferred: true },
+      { id: "sd:R:ER", kind: "space_door", source: "space:R", target: "door:ER", method: "geom_door_space", inferred: true },
+    ],
+  };
+
+  function buildThreeRoomMesh(): StoreyNavmesh {
+    return buildStoreyNavmesh(threeRoomFootprints, threeRoomGraph, "S1");
+  }
+
+  it("picks the nearer of two exits, not just any reachable one", () => {
+    const mesh = buildThreeRoomMesh();
+    const result = computeBuildingEvacuationLoad([mesh], threeRoomFootprints, threeRoomGraph);
+
+    const distL = result.regionDistanceToExit.get("space:L")!;
+    const distM = result.regionDistanceToExit.get("space:M")!;
+    const distR = result.regionDistanceToExit.get("space:R")!;
+    // Monotonically farther from the near (left) exit as you move right,
+    // right up until R's own much-farther-away exit would need to dominate.
+    assert.ok(distL < distM, `L (${distL}) should be closer to its exit than M (${distM})`);
+    assert.ok(distM < distR, `M (${distM}) should be closer than R (${distR}) — R's own exit is 10m from its door`);
+
+    // M is ~4m from the left exit (2m to DL + 2m across L to EL) vs ~12m
+    // from the right exit (2m to DR + 10m across R to ER) — the left route
+    // must win, and load should show up on the left path only.
+    const dl = mesh.portals.find((p) => p.doorGlobalId === "DL")!.id;
+    const dr = mesh.portals.find((p) => p.doorGlobalId === "DR")!.id;
+    assert.ok(distM < 6, `expected M's distance to reflect the ~4m left route, got ${distM}`);
+    assert.ok(result.portalLoad.has(dl), "M's route should cross DL (the near side)");
+    assert.ok(!result.portalLoad.has(dr), "M's route should not cross DR (the far side) when the near exit is open");
+  });
+
+  it("reroutes to the farther exit — with a correspondingly larger distance — when the near one is blocked", () => {
+    const mesh = buildThreeRoomMesh();
+    const elPortalId = mesh.portals.find((p) => p.doorGlobalId === "EL")!.id;
+    const open = computeBuildingEvacuationLoad([mesh], threeRoomFootprints, threeRoomGraph);
+    const blocked = computeBuildingEvacuationLoad([mesh], threeRoomFootprints, threeRoomGraph, {
+      blockedPortalIds: new Set([elPortalId]),
+    });
+
+    const distMOpen = open.regionDistanceToExit.get("space:M")!;
+    const distMBlocked = blocked.regionDistanceToExit.get("space:M")!;
+    assert.ok(
+      distMBlocked > distMOpen,
+      `blocking the near exit should increase M's distance (open=${distMOpen}, blocked=${distMBlocked})`,
+    );
+
+    const dr = mesh.portals.find((p) => p.doorGlobalId === "DR")!.id;
+    const er = mesh.portals.find((p) => p.doorGlobalId === "ER")!.id;
+    assert.ok(blocked.portalLoad.has(dr), "with EL blocked, M's route should now cross DR");
+    assert.ok(blocked.portalLoad.has(er), "with EL blocked, M's route should now reach the far exit ER");
+  });
+
+  it("marks a fully disconnected room unreachable without disturbing the rest of the building", () => {
+    const mesh = buildThreeRoomMesh();
+    const result = computeBuildingEvacuationLoad([mesh], threeRoomFootprints, threeRoomGraph);
+
+    assert.ok(result.unreachableSpaceIds.includes("space:ISO"));
+    assert.ok(!result.regionDistanceToExit.has("space:ISO"));
+    // The disconnected room shouldn't affect the connected wing at all.
+    assert.ok(result.regionDistanceToExit.has("space:L"));
+    assert.ok(result.regionDistanceToExit.has("space:M"));
+    assert.ok(result.regionDistanceToExit.has("space:R"));
+    assert.ok(!result.unreachableSpaceIds.includes("space:L"));
+  });
+
+  it("treats blocking every exit the same as having none — every room unreachable, no distances", () => {
+    const mesh = buildThreeRoomMesh();
+    const elPortalId = mesh.portals.find((p) => p.doorGlobalId === "EL")!.id;
+    const erPortalId = mesh.portals.find((p) => p.doorGlobalId === "ER")!.id;
+    const result = computeBuildingEvacuationLoad([mesh], threeRoomFootprints, threeRoomGraph, {
+      blockedPortalIds: new Set([elPortalId, erPortalId]),
+    });
+    for (const gid of ["L", "M", "R"]) {
+      assert.ok(result.unreachableSpaceIds.includes(`space:${gid}`), `space:${gid} should be unreachable`);
+    }
+    assert.equal(result.regionDistanceToExit.size, 0);
+    assert.equal(result.portalLoad.size, 0);
+  });
+
+  // A small (2x2) and a much bigger (2x50) room, both with their exit door
+  // centered on an identically-positioned wall — so both rooms' centroids
+  // sit exactly as far (1m) from their own exit despite wildly different
+  // floor areas, isolating regionDistanceToExit (must be equal — it's a
+  // geometric measure) from portalLoad (must differ — it's area-weighted).
+  const sizeFootprints: FootprintsDocument = {
+    schema_version: "1.0",
+    model_id: "size",
+    coordinate_system: "ifc_world_xy_metres",
+    storeys: [{ global_id: "S1", name: "L1", elevation: 0 }],
+    spaces: [
+      {
+        global_id: "SMALL",
+        name: "SMALL",
+        storey_global_id: "S1",
+        polygon: [
+          { x: 0, y: 0 },
+          { x: 2, y: 0 },
+          { x: 2, y: 2 },
+          { x: 0, y: 2 },
+        ],
+        incomplete: false,
+        method: "ifc_placement_bbox",
+      },
+      {
+        global_id: "BIG",
+        name: "BIG",
+        storey_global_id: "S1",
+        polygon: [
+          { x: 10, y: 0 },
+          { x: 12, y: 0 },
+          { x: 12, y: 50 },
+          { x: 10, y: 50 },
+        ],
+        incomplete: false,
+        method: "ifc_placement_bbox",
+      },
+    ],
+    doors: [
+      {
+        global_id: "ES",
+        name: "ES",
+        storey_global_id: "S1",
+        point: { x: 0, y: 1 },
+        segment: [
+          { x: 0, y: 0.5 },
+          { x: 0, y: 1.5 },
+        ],
+        incomplete: false,
+        method: "ifc_object_placement",
+      },
+      {
+        global_id: "EB",
+        name: "EB",
+        storey_global_id: "S1",
+        point: { x: 10, y: 25 },
+        segment: [
+          { x: 10, y: 24.5 },
+          { x: 10, y: 25.5 },
+        ],
+        incomplete: false,
+        method: "ifc_object_placement",
+      },
+    ],
+  };
+  const sizeGraph: ConnectivityGraph = {
+    schema_version: "1.0",
+    model_id: "size",
+    variant: "geometry",
+    nodes: [
+      { id: "space:SMALL", kind: "space", global_id: "SMALL", name: "SMALL", storey_global_id: "S1" },
+      { id: "space:BIG", kind: "space", global_id: "BIG", name: "BIG", storey_global_id: "S1" },
+      { id: "door:ES", kind: "door", global_id: "ES", name: "ES", storey_global_id: "S1" },
+      { id: "door:EB", kind: "door", global_id: "EB", name: "EB", storey_global_id: "S1" },
+    ],
+    edges: [
+      { id: "sd:SMALL:ES", kind: "space_door", source: "space:SMALL", target: "door:ES", method: "geom_door_space", inferred: true },
+      { id: "sd:BIG:EB", kind: "space_door", source: "space:BIG", target: "door:EB", method: "geom_door_space", inferred: true },
+    ],
+  };
+
+  it("keeps regionDistanceToExit purely geometric — a 25x-bigger room the same distance from its exit gets the same distance, not a scaled one", () => {
+    const mesh = buildStoreyNavmesh(sizeFootprints, sizeGraph, "S1");
+    const result = computeBuildingEvacuationLoad([mesh], sizeFootprints, sizeGraph);
+
+    const distSmall = result.regionDistanceToExit.get("space:SMALL")!;
+    const distBig = result.regionDistanceToExit.get("space:BIG")!;
+    assert.ok(
+      Math.abs(distSmall - distBig) < 1e-6,
+      `expected equal distances (both rooms are 1m from their own exit), got small=${distSmall} big=${distBig}`,
+    );
+
+    // But the *load* each exit carries must differ — BIG (2x50=100 m²) is a
+    // much bigger contributor than SMALL (2x2=4 m²), which is exactly what
+    // portalLoad is for (see regionOccupantWeight).
+    const es = mesh.portals.find((p) => p.doorGlobalId === "ES")!.id;
+    const eb = mesh.portals.find((p) => p.doorGlobalId === "EB")!.id;
+    const loadSmall = result.portalLoad.get(es)!;
+    const loadBig = result.portalLoad.get(eb)!;
+    assert.ok(loadBig > loadSmall * 5, `expected BIG's load (${loadBig}) to dwarf SMALL's (${loadSmall})`);
+  });
+});
+
 describe("computeBuildingEvacuationLoad performance", () => {
   /**
    * Reproduces a real scaling risk in the cross-storey vertical-connector

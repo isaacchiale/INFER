@@ -44,7 +44,7 @@
   --color-furniture-fill: var(--furniture-fill);
   --color-furniture-stroke: var(--furniture-stroke);
   --color-evac-heat-low: var(--evac-heat-low);
-  --color-evac-heat-mid: var(--evac-heat-mid);
+  --color-evac-heat-max: var(--evac-heat-max);
 
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
@@ -156,10 +156,24 @@
   --stair-glyph: oklch(0.5413 0.2466 293.01); /* was #7c3aed */
   --furniture-fill: oklch(0.6002 0.1038 184.70); /* was #0d9488 */
   --furniture-stroke: oklch(0.5109 0.0861 186.39); /* was #0f766e */
-  /* Evacuation-load heat scale's low/mid stops (see evacuationHeatColor) —
-     the high end reuses --hazard directly instead of a third fixed stop. */
-  --evac-heat-low: oklch(0.9619 0.058 95.62);
-  --evac-heat-mid: oklch(0.7049 0.1867 47.6);
+  /*
+   * Evacuation-load heat scale (see evacuationHeatColor): the familiar
+   * traffic-light progression — green through --warning (yellow/orange)
+   * through --hazard (red) to --evac-heat-max, a genuinely dark red.
+   * Deliberately multi-hue rather than one hue varying only in lightness:
+   * shades of a single color were tried first and turned out too hard to
+   * tell apart at a glance, which defeats the point of a heatmap (see git
+   * history for that iteration and why it didn't work in practice). This
+   * does reintroduce the red/green pair PORTAL_COLORS' comment otherwise
+   * steers clear of for colorblind viewers — mitigated by every stop also
+   * changing lightness (not hue alone) and by the numeric distance/load
+   * always being available on hover and in the "Worst bottlenecks" panel,
+   * not color-only. --warning and --hazard are reused directly (not
+   * duplicated here) so this scale's middle/high anchors always match
+   * those tokens' own meaning elsewhere in the app.
+   */
+  --evac-heat-low: oklch(0.72 0.15 145);
+  --evac-heat-max: oklch(0.28 0.13 22);
 }
 
 
@@ -195,6 +209,9 @@
   --warning: oklch(0.78 0.12 78);
   --warning-foreground: oklch(0.86 0.1 78);
   --hazard: oklch(0.66 0.18 22);
+  /* Brighter than the light-mode value — a dark red this deep would nearly
+     vanish against the app's own dark background otherwise. */
+  --evac-heat-max: oklch(0.42 0.19 22);
   --verified: oklch(0.7 0.1 160);
   --inferred: oklch(0.76 0.1 88);
   --invalid: oklch(0.66 0.17 27);
@@ -234,6 +251,7 @@
   --route-accessible: oklch(0.72 0.1 175);
   --route-emergency: oklch(0.68 0.17 32);
   --hazard: oklch(0.66 0.18 22);
+  --evac-heat-max: oklch(0.42 0.19 22);
   --verified: oklch(0.7 0.1 160);
   --inferred: oklch(0.76 0.1 88);
   --invalid: oklch(0.66 0.17 27);

@@ -184,28 +184,40 @@ function createViewportBackgroundTexture(): THREE.Texture {
 
 /**
  * Same sequential heat scale as the floorplan pane's evacuationHeatColor
- * (FloorplanSvgLayers.tsx) — pale amber up through orange to the app's real
- * --hazard token, so "worst bottleneck" means the same severity in both
- * panes. Exact oklch→sRGB conversions of --evac-heat-low/-mid and the
- * *dark-theme* --hazard value specifically: the 3D viewport is always dark
- * (see styles.css's "Viewport stays graphite-dark in both themes" comment),
- * so it always wants the dark-theme anchor regardless of the app's own
+ * (FloorplanSvgLayers.tsx) — green through yellow/orange to the app's real
+ * --hazard token and on to a genuinely dark red, so "worst bottleneck"
+ * means the same severity in both panes. Exact oklch→sRGB conversions of
+ * --evac-heat-low (green), --warning, and the *dark-theme* --hazard/
+ * --evac-heat-max values specifically: the 3D viewport is always dark (see
+ * styles.css's "Viewport stays graphite-dark in both themes" comment), so
+ * it always wants the dark-theme anchors regardless of the app's own
  * light/dark toggle. Plain RGB lerp, not color-mix(in oklch) like the SVG
  * version — this only ever tints a small glow sprite, not a large flat
  * fill, so the perceptual-uniformity difference isn't visible.
  */
-const EVAC_HEAT_LOW = new THREE.Color(0xfef3c7);
-const EVAC_HEAT_MID = new THREE.Color(0xf97316);
-const EVAC_HEAT_HIGH = new THREE.Color(0xec5a5e);
+const EVAC_HEAT_STOPS: [number, THREE.Color][] = [
+  [0, new THREE.Color(0x61bd67)],
+  [0.33, new THREE.Color(0xe1ad57)],
+  [0.66, new THREE.Color(0xec5a5e)],
+  [1, new THREE.Color(0x9b0015)],
+];
 
 function evacuationMarkerHeatColor(t: number): THREE.Color {
   const clamped = Math.max(0, Math.min(1, t));
-  const color = new THREE.Color();
-  if (clamped <= 0.5) {
-    color.lerpColors(EVAC_HEAT_LOW, EVAC_HEAT_MID, clamped / 0.5);
-  } else {
-    color.lerpColors(EVAC_HEAT_MID, EVAC_HEAT_HIGH, (clamped - 0.5) / 0.5);
+  let lo = EVAC_HEAT_STOPS[0]!;
+  let hi = EVAC_HEAT_STOPS[EVAC_HEAT_STOPS.length - 1]!;
+  for (let i = 0; i < EVAC_HEAT_STOPS.length - 1; i++) {
+    const a = EVAC_HEAT_STOPS[i]!;
+    const b = EVAC_HEAT_STOPS[i + 1]!;
+    if (clamped >= a[0] && clamped <= b[0]) {
+      lo = a;
+      hi = b;
+      break;
+    }
   }
+  const span = hi[0] - lo[0] || 1;
+  const color = new THREE.Color();
+  color.lerpColors(lo[1], hi[1], (clamped - lo[0]) / span);
   return color;
 }
 

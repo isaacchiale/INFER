@@ -806,11 +806,6 @@ export function FloorplanViewer({ className }: { className?: string }) {
     return entries.slice(0, 8);
   }, [buildingEvacuationLoad, stairNodesById, graphNodesById, storeyNameById, portalInfoById, doorsByGlobalId]);
 
-  const hotspotIds = useMemo(
-    () => new Set(worstBottlenecks.map((b) => b.id)),
-    [worstBottlenecks],
-  );
-
   // Every loaded door/exit/stair/lift with nonzero load, in plan space —
   // the full building, not just the top 8 shown in the ranked list. Published
   // to the shared store (see EvacuationLoadMarker) so InferModelViewport can
@@ -1522,7 +1517,6 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     isExitRoute={isExitRoute}
                     blockedPortalIds={blockedPortalIds}
                     evacuationLoad={evacuationLoad ?? null}
-                    hotspotIds={showEvacuationLoad ? hotspotIds : null}
                     doorsByGlobalId={doorsByGlobalId}
                     palette={palette}
                     selectedSpaces={selectedSpaces}
@@ -1670,20 +1664,11 @@ export function FloorplanViewer({ className }: { className?: string }) {
                                 />
                                 High evacuation load
                               </div>
-                              {hotspotIds.size > 0 ? (
-                                <div className="flex items-center gap-1.5 text-foreground">
-                                  <span
-                                    className="hazard-pulse inline-block size-2.5 shrink-0 rounded-full border-2"
-                                    style={{ borderColor: evacuationHeatColor(1) }}
-                                  />
-                                  Glowing = top {Math.min(hotspotIds.size, 8)} worst building-wide
-                                </div>
-                              ) : null}
                               {evacuationLoad && evacuationLoad.stairNodes.length > 0 ? (
                                 <div className="flex items-center gap-1.5 text-foreground">
                                   <span
                                     className="inline-block size-2.5 shrink-0"
-                                    style={{ background: evacuationHeatColor(0.5) }}
+                                    style={{ background: "var(--stair-glyph)" }}
                                   />
                                   Stair/lift landing (square)
                                 </div>
