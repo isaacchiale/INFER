@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { buildAllStoreyNavmeshesAsync } from "@/lib/navmesh-worker-client";
 import {
-  buildAllStoreyNavmeshesAsync,
-  findMultiStoreyNavmeshPathAsync,
-  findNavmeshPathAsync,
-  findNearestExitPathAsync,
-} from "@/lib/navmesh-worker-client";
-import type { StoreyNavmesh } from "@/lib/navmesh";
+  buildStoreyNavmeshesIncremental,
+  findMultiStoreyNavmeshPath,
+  findNavmeshPath,
+  findNearestExitPath,
+  storeysAffectedByExclusionChange,
+  type StoreyNavmesh,
+} from "@/lib/navmesh";
 import type { FootprintsDocument } from "@/types/footprints";
 import type { ConnectivityGraph } from "@/types/graph";
 import type { NavmeshRoute } from "@/state/infer-store";
@@ -14,19 +16,19 @@ import type { NavmeshRoute } from "@/state/infer-store";
  * The click-to-click navmesh routing state machine: which portals are
  * hazard-blocked, whether the current route is an "exit" search, the A-star /
  * nearest-exit recompute whenever pins or the mesh change, and clearing
- * everything on a model switch. Doesn't touch the DOM or pointer events —
- * FloorplanViewer still owns placing pins (it needs the SVG↔world mapping
+ * everything on a model switch. Doesn't touch the DOM or pointer events ?
+ * FloorplanViewer still owns placing pins (it needs the SVG?world mapping
  * and the storey-scoped mesh to hit-test against) and calls back into
  * `setIsExitRoute`/`setBlockedPortalIds`/the shared `setNavmeshRoute`
  * returned/passed here.
  *
- * The whole-building mesh build and every A-star/Dijkstra search run in a
- * Web Worker (navmesh-worker-client.ts) rather than inline — on a real
- * multi-storey building these are expensive enough to freeze the tab for
- * their duration if run synchronously here. Each effect below follows the
- * standard "ignore a stale resolution" pattern (a `cancelled` flag set in
- * the cleanup function) since a newer pin placement/exclusion change can
- * fire before an older worker call's promise resolves.
+ * Initial / full-building mesh builds run in a Web Worker so Trapelo-scale
+ * loads don't freeze the tab. Exclusion toggles use
+ * {@link buildStoreyNavmeshesIncremental} on the main thread (usually one
+ * dirty storey). Path searches run sync on the main thread against the
+ * stable mesh objects in React state so the WeakMap portal-core cache
+ * actually hits across clicks (a worker structured-clone would miss every
+ * time). Building-wide evacuation load stays on the worker.
  */
 export function useNavmeshRouting({
   footprintsId,
@@ -51,23 +53,86 @@ export function useNavmeshRouting({
   /** Hazard/what-if: portals excluded from routing without removing them from the graph. */
   const [blockedPortalIds, setBlockedPortalIds] = useState<Set<string>>(() => new Set());
 
-  // Every storey's mesh — needed once the end pin can land on a different
+  // Every storey's mesh ? needed once the end pin can land on a different
   // floor than the start (stairs/lifts bridge them via findMultiStoreyNavmeshPath).
-  // Built in a worker (see the hook docstring) rather than a plain useMemo,
-  // so it starts empty and fills in once the worker resolves.
   const [allStoreyNavmeshes, setAllStoreyNavmeshes] = useState<StoreyNavmesh[]>([]);
+  const navmeshCacheRef = useRef<{
+    footprints: FootprintsDocument;
+    graph: ConnectivityGraph;
+    excludedNodes: ReadonlySet<string>;
+    excludedEdges: ReadonlySet<string>;
+    meshes: StoreyNavmesh[];
+  } | null>(null);
 
   useEffect(() => {
     if (!footprintsDocument || !connectivityGraph) {
+      navmeshCacheRef.current = null;
       setAllStoreyNavmeshes([]);
       return;
     }
+
+    const prev = navmeshCacheRef.current;
+    const baseChanged =
+      !prev || prev.footprints !== footprintsDocument || prev.graph !== connectivityGraph;
+    const dirty: ReadonlySet<string> | "all" = baseChanged
+      ? "all"
+      : storeysAffectedByExclusionChange(
+          footprintsDocument,
+          connectivityGraph,
+          prev.excludedNodes,
+          excludedNodeIds,
+          prev.excludedEdges,
+          excludedEdgeIds,
+        );
+
+    // Exclusion-only: patch dirty storeys on the main thread (cheap).
+    if (dirty !== "all" && prev) {
+      if (dirty.size === 0) {
+        navmeshCacheRef.current = {
+          footprints: footprintsDocument,
+          graph: connectivityGraph,
+          excludedNodes: excludedNodeIds,
+          excludedEdges: excludedEdgeIds,
+          meshes: prev.meshes,
+        };
+        return;
+      }
+      const meshes = buildStoreyNavmeshesIncremental(
+        prev.meshes,
+        footprintsDocument,
+        connectivityGraph,
+        {
+          excludedNodeIds,
+          excludedEdgeIds,
+          dirtyStoreyIds: dirty,
+        },
+      );
+      navmeshCacheRef.current = {
+        footprints: footprintsDocument,
+        graph: connectivityGraph,
+        excludedNodes: excludedNodeIds,
+        excludedEdges: excludedEdgeIds,
+        meshes,
+      };
+      setAllStoreyNavmeshes(meshes);
+      return;
+    }
+
+    // Full rebuild (model load / graph identity change) ? off the main thread.
     let cancelled = false;
     void buildAllStoreyNavmeshesAsync(footprintsDocument, connectivityGraph, {
       excludedNodeIds,
       excludedEdgeIds,
     }).then((meshes) => {
-      if (!cancelled) setAllStoreyNavmeshes(meshes);
+      if (cancelled) return;
+      navmeshCacheRef.current = {
+        footprints: footprintsDocument,
+        graph: connectivityGraph,
+        excludedNodes: excludedNodeIds,
+        excludedEdges: excludedEdgeIds,
+        meshes,
+      };
+      setAllStoreyNavmeshes(meshes);
     });
     return () => {
       cancelled = true;
@@ -75,16 +140,14 @@ export function useNavmeshRouting({
   }, [footprintsDocument, connectivityGraph, excludedNodeIds, excludedEdgeIds]);
 
   // Recompute A* whenever pins + mesh change (persists across IFC/navmesh
-  // toggle and storey switches — the end pin may be on a different storey).
+  // toggle and storey switches ? the end pin may be on a different storey).
   useEffect(() => {
     if (!navmeshRoute) {
       setNavmeshPathNote(null);
       return;
     }
 
-    let cancelled = false;
-
-    // Exit routes only ever pin a start point — re-find the nearest exit from
+    // Exit routes only ever pin a start point ? re-find the nearest exit from
     // scratch each time (an exclusion change could make a different exit the
     // closest one, not just invalidate the old path to the same exit).
     if (isExitRoute) {
@@ -94,45 +157,54 @@ export function useNavmeshRouting({
         setNavmeshPathNote("Storey mesh unavailable");
         return;
       }
-      void findNearestExitPathAsync(mesh, navmeshRoute.start, footprintsDocument, {
+      const result = findNearestExitPath(mesh, navmeshRoute.start, footprintsDocument, {
         blockedPortalIds,
-      }).then((result) => {
-        if (cancelled) return;
-        setNavmeshPathNote(result.found ? null : result.note);
-        const nextEnd = result.found ? result.points[result.points.length - 1]! : null;
-        const nextPoints = result.found ? result.points : null;
-        const sameEnd =
-          (navmeshRoute.end == null && nextEnd == null) ||
-          (navmeshRoute.end != null &&
-            nextEnd != null &&
-            navmeshRoute.end.x === nextEnd.x &&
-            navmeshRoute.end.y === nextEnd.y);
-        const samePoints =
-          (navmeshRoute.points == null && nextPoints == null) ||
-          (navmeshRoute.points != null &&
-            nextPoints != null &&
-            navmeshRoute.points.length === nextPoints.length &&
-            navmeshRoute.points.every(
-              (p, i) => p.x === nextPoints[i]!.x && p.y === nextPoints[i]!.y,
-            ));
-        if (!sameEnd || !samePoints || navmeshRoute.segments) {
-          setNavmeshRoute({
-            ...navmeshRoute,
-            end: nextEnd,
-            endStoreyId: nextEnd ? navmeshRoute.storeyId : null,
-            points: nextPoints,
-            segments: null,
-          });
-        }
       });
-      return () => {
-        cancelled = true;
-      };
+      setNavmeshPathNote(result.found ? null : result.note);
+      const nextEnd = result.found ? result.points[result.points.length - 1]! : null;
+      const nextPoints = result.found ? result.points : null;
+      const sameEnd =
+        (navmeshRoute.end == null && nextEnd == null) ||
+        (navmeshRoute.end != null &&
+          nextEnd != null &&
+          navmeshRoute.end.x === nextEnd.x &&
+          navmeshRoute.end.y === nextEnd.y);
+      const samePoints =
+        (navmeshRoute.points == null && nextPoints == null) ||
+        (navmeshRoute.points != null &&
+          nextPoints != null &&
+          navmeshRoute.points.length === nextPoints.length &&
+          navmeshRoute.points.every(
+            (p, i) => p.x === nextPoints[i]!.x && p.y === nextPoints[i]!.y,
+          ));
+      const nextGraph = result.found ? result.graphNodeIds : null;
+      const sameGraphNodes =
+        (navmeshRoute.graphNodeIds == null && nextGraph == null) ||
+        (navmeshRoute.graphNodeIds != null &&
+          nextGraph != null &&
+          navmeshRoute.graphNodeIds.length === nextGraph.length &&
+          navmeshRoute.graphNodeIds.every((id, i) => id === nextGraph[i]));
+      if (!sameEnd || !samePoints || navmeshRoute.segments || !sameGraphNodes) {
+        setNavmeshRoute({
+          ...navmeshRoute,
+          end: nextEnd,
+          endStoreyId: nextEnd ? navmeshRoute.storeyId : null,
+          points: nextPoints,
+          segments: null,
+          graphNodeIds: nextGraph,
+        });
+      }
+      return;
     }
 
     if (!navmeshRoute.end || navmeshRoute.endStoreyId == null) {
-      if (navmeshRoute.points || navmeshRoute.segments) {
-        setNavmeshRoute({ ...navmeshRoute, points: null, segments: null });
+      if (navmeshRoute.points || navmeshRoute.segments || navmeshRoute.graphNodeIds) {
+        setNavmeshRoute({
+          ...navmeshRoute,
+          points: null,
+          segments: null,
+          graphNodeIds: null,
+        });
       }
       setNavmeshPathNote(null);
       return;
@@ -147,65 +219,80 @@ export function useNavmeshRouting({
     }
 
     if (navmeshRoute.storeyId === navmeshRoute.endStoreyId) {
-      void findNavmeshPathAsync(
+      const result = findNavmeshPath(
         startMesh,
         navmeshRoute.start,
         navmeshRoute.end,
         footprintsDocument,
         { blockedPortalIds },
-      ).then((result) => {
-        if (cancelled) return;
-        setNavmeshPathNote(result.found ? null : result.note);
-        const nextPoints = result.found ? result.points : null;
-        const same =
-          (navmeshRoute.points == null && nextPoints == null) ||
-          (navmeshRoute.points != null &&
-            nextPoints != null &&
-            navmeshRoute.points.length === nextPoints.length &&
-            navmeshRoute.points.every(
-              (p, i) => p.x === nextPoints[i]!.x && p.y === nextPoints[i]!.y,
-            ));
-        if (!same || navmeshRoute.segments) {
-          setNavmeshRoute({ ...navmeshRoute, points: nextPoints, segments: null });
-        }
-      });
-      return () => {
-        cancelled = true;
-      };
+      );
+      setNavmeshPathNote(result.found ? null : result.note);
+      const nextPoints = result.found ? result.points : null;
+      const nextGraph = result.found ? result.graphNodeIds : null;
+      const same =
+        (navmeshRoute.points == null && nextPoints == null) ||
+        (navmeshRoute.points != null &&
+          nextPoints != null &&
+          navmeshRoute.points.length === nextPoints.length &&
+          navmeshRoute.points.every(
+            (p, i) => p.x === nextPoints[i]!.x && p.y === nextPoints[i]!.y,
+          ));
+      const sameGraphNodes =
+        (navmeshRoute.graphNodeIds == null && nextGraph == null) ||
+        (navmeshRoute.graphNodeIds != null &&
+          nextGraph != null &&
+          navmeshRoute.graphNodeIds.length === nextGraph.length &&
+          navmeshRoute.graphNodeIds.every((id, i) => id === nextGraph[i]));
+      if (!same || navmeshRoute.segments || !sameGraphNodes) {
+        setNavmeshRoute({
+          ...navmeshRoute,
+          points: nextPoints,
+          segments: null,
+          graphNodeIds: nextGraph,
+        });
+      }
+      return;
     }
 
-    void findMultiStoreyNavmeshPathAsync(
+    const result = findMultiStoreyNavmeshPath(
       allStoreyNavmeshes,
       connectivityGraph,
       footprintsDocument,
       { storeyId: navmeshRoute.storeyId, point: navmeshRoute.start },
       { storeyId: navmeshRoute.endStoreyId, point: navmeshRoute.end },
       { blockedPortalIds },
-    ).then((result) => {
-      if (cancelled) return;
-      setNavmeshPathNote(result.found ? null : result.note);
-      const nextSegments = result.found ? result.segments : null;
-      const sameSegments =
-        (navmeshRoute.segments == null && nextSegments == null) ||
-        (navmeshRoute.segments != null &&
-          nextSegments != null &&
-          navmeshRoute.segments.length === nextSegments.length &&
-          navmeshRoute.segments.every(
-            (s, i) =>
-              s.storeyId === nextSegments[i]!.storeyId &&
-              s.points.length === nextSegments[i]!.points.length &&
-              s.points.every(
-                (p, j) =>
-                  p.x === nextSegments[i]!.points[j]!.x && p.y === nextSegments[i]!.points[j]!.y,
-              ),
-          ));
-      if (!sameSegments || navmeshRoute.points) {
-        setNavmeshRoute({ ...navmeshRoute, points: null, segments: nextSegments });
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
+    );
+    setNavmeshPathNote(result.found ? null : result.note);
+    const nextSegments = result.found ? result.segments : null;
+    const nextGraph = result.found ? result.graphNodeIds : null;
+    const sameSegments =
+      (navmeshRoute.segments == null && nextSegments == null) ||
+      (navmeshRoute.segments != null &&
+        nextSegments != null &&
+        navmeshRoute.segments.length === nextSegments.length &&
+        navmeshRoute.segments.every(
+          (s, i) =>
+            s.storeyId === nextSegments[i]!.storeyId &&
+            s.points.length === nextSegments[i]!.points.length &&
+            s.points.every(
+              (p, j) =>
+                p.x === nextSegments[i]!.points[j]!.x && p.y === nextSegments[i]!.points[j]!.y,
+            ),
+        ));
+    const sameGraphNodes =
+      (navmeshRoute.graphNodeIds == null && nextGraph == null) ||
+      (navmeshRoute.graphNodeIds != null &&
+        nextGraph != null &&
+        navmeshRoute.graphNodeIds.length === nextGraph.length &&
+        navmeshRoute.graphNodeIds.every((id, i) => id === nextGraph[i]));
+    if (!sameSegments || navmeshRoute.points || !sameGraphNodes) {
+      setNavmeshRoute({
+        ...navmeshRoute,
+        points: null,
+        segments: nextSegments,
+        graphNodeIds: nextGraph,
+      });
+    }
   }, [
     allStoreyNavmeshes,
     blockedPortalIds,
@@ -221,7 +308,7 @@ export function useNavmeshRouting({
     setNavmeshRoute,
   ]);
 
-  // Model change → clear pins and path (storey switches and IFC↔navmesh
+  // Model change ? clear pins and path (storey switches and IFC?navmesh
   // toggles now preserve an in-progress or cross-storey route).
   const routeScopeRef = useRef(footprintsId);
   useEffect(() => {

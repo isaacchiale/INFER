@@ -196,6 +196,57 @@ function pointInObstacles(x: number, y: number, obstacles?: Point2D[][]): boolea
   return false;
 }
 
+/** Axis-aligned bounds of a ring (inclusive). */
+function ringBounds(ring: Point2D[]): {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+} {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const p of ring) {
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x);
+    maxY = Math.max(maxY, p.y);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+/**
+ * Clearance vs interior obstacles, with AABB culling so a desk on the far
+ * side of a Trapelo floor doesn't get an edge-distance scan on every cell.
+ * Returns −1 when the point is blocked (inside or within `blockRadius`).
+ */
+function obstacleClearance(
+  x: number,
+  y: number,
+  obstacles: Point2D[][],
+  blockRadius: number,
+): number {
+  let best = Infinity;
+  for (const obs of obstacles) {
+    if (obs.length < 3) continue;
+    const b = ringBounds(obs);
+    if (
+      x < b.minX - blockRadius ||
+      x > b.maxX + blockRadius ||
+      y < b.minY - blockRadius ||
+      y > b.maxY + blockRadius
+    ) {
+      continue;
+    }
+    if (pointInPolygon(x, y, obs)) return -1;
+    const d = distToRings(x, y, [obs]);
+    if (d < blockRadius) return -1;
+    if (d < best) best = d;
+  }
+  return best;
+}
+
 /**
  * Inside a doorway void, or within the same half-cell used to thicken
  * obstacles below. Without that tolerance a doorway thinner than the grid
@@ -238,10 +289,11 @@ function cellClearance(
   const dSpace = distToSpaceWall(x, y, exterior, holes);
   if (!obstacles?.length) return dSpace;
 
-  const dObs = distToRings(x, y, obstacles);
-  // Half-cell thicken so the grid can't slip through sub-cell walls.
-  const blocked = pointInObstacles(x, y, obstacles) || dObs < cellSize * 0.45;
-  if (blocked) return inDoorwayVoid(x, y, doorwayVoids, cellSize) ? dSpace : -1;
+  const blockRadius = cellSize * 0.45;
+  const dObs = obstacleClearance(x, y, obstacles, blockRadius);
+  if (dObs < 0) {
+    return inDoorwayVoid(x, y, doorwayVoids, cellSize) ? dSpace : -1;
+  }
   return Math.min(dSpace, dObs);
 }
 
@@ -290,7 +342,6 @@ function footprintOverlapsSpace(
 ): boolean {
   if (footprint.incomplete || footprint.polygon.length < 3) return false;
   if (
-    footprint.storey_global_id &&
     space.storey_global_id &&
     footprint.storey_global_id !== space.storey_global_id
   ) {
@@ -406,24 +457,30 @@ export const LOCAL_PATH_CELL_M = 0.1;
  * Upper bound on the local-search grid's cell count. At the default 0.1 m
  * cell size that's a room up to ~20m x 20m at full resolution; a bigger
  * room (an atrium, a warehouse floor, a large open-plan office) would
- * otherwise build an unbounded grid — clearance is precomputed for every
- * cell up front, so an ungapped 0.1 m grid over a 100m x 60m floor would be
- * 600,000+ cells, each scanning every obstacle edge. {@link pickCellSize}
- * coarsens the grid just enough to stay under this cap instead.
+ * otherwise build an unbounded grid. {@link pickCellSize} coarsens just
+ * enough to stay under this cap. With interior obstacles each cell is
+ * several PIP tests, so the obstacle-aware cap is tighter.
  */
 const MAX_LOCAL_PATH_CELLS = 200 * 200;
+const MAX_LOCAL_PATH_CELLS_WITH_OBSTACLES = 100 * 100;
 
 /**
  * Cell size for a room of the given plan size: the default fine resolution
- * when it fits under {@link MAX_LOCAL_PATH_CELLS}, otherwise scaled up just
- * enough (uniformly, so cells stay square) to fit the cap.
+ * when it fits under the cell cap, otherwise scaled up just enough
+ * (uniformly, so cells stay square) to fit.
  */
-function pickCellSize(width: number, height: number): number {
+function pickCellSize(
+  width: number,
+  height: number,
+  obstacleCount = 0,
+): number {
+  const cap =
+    obstacleCount > 0 ? MAX_LOCAL_PATH_CELLS_WITH_OBSTACLES : MAX_LOCAL_PATH_CELLS;
   const naturalCols = Math.max(2, Math.ceil(width / LOCAL_PATH_CELL_M) + 1);
   const naturalRows = Math.max(2, Math.ceil(height / LOCAL_PATH_CELL_M) + 1);
   const naturalCells = naturalCols * naturalRows;
-  if (naturalCells <= MAX_LOCAL_PATH_CELLS) return LOCAL_PATH_CELL_M;
-  return LOCAL_PATH_CELL_M * Math.sqrt(naturalCells / MAX_LOCAL_PATH_CELLS);
+  if (naturalCells <= cap) return LOCAL_PATH_CELL_M;
+  return LOCAL_PATH_CELL_M * Math.sqrt(naturalCells / cap);
 }
 
 /** Floor so wall-adjacent cells don't send A* cost to Infinity. */
@@ -526,6 +583,25 @@ function astarInPolygon(
   const g = clampPointToSpace(goal, polygon, holes);
   if (dist(s, g) < 1e-6) return { points: [s], reached: true };
 
+  // Straight chord past furniture/walls → skip the grid. Only when there are
+  // interior obstacles: empty rooms still run clearance-weighted A* so
+  // corridors bias toward the centre (1/clearance) instead of hugging walls.
+  // Endpoints inside an obstacle (e.g. centroid on a wall hull) must not
+  // short-circuit — A* snaps them to a free cell first.
+  if (obstacles?.length) {
+    const sOk =
+      cellClearance(s.x, s.y, polygon, holes, obstacles, doorwayVoids) >= 0;
+    const gOk =
+      cellClearance(g.x, g.y, polygon, holes, obstacles, doorwayVoids) >= 0;
+    if (
+      sOk &&
+      gOk &&
+      hasLineOfSight(s, g, polygon, holes, obstacles, doorwayVoids)
+    ) {
+      return { points: [s, g], reached: true };
+    }
+  }
+
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
@@ -539,7 +615,7 @@ function astarInPolygon(
 
   // Coarsens automatically for a room too large to grid at full resolution
   // (see MAX_LOCAL_PATH_CELLS) instead of building an unbounded grid.
-  const cell = pickCellSize(maxX - minX, maxY - minY);
+  const cell = pickCellSize(maxX - minX, maxY - minY, obstacles?.length ?? 0);
   const cols = Math.max(2, Math.ceil((maxX - minX) / cell) + 1);
   const rows = Math.max(2, Math.ceil((maxY - minY) / cell) + 1);
 
@@ -549,17 +625,28 @@ function astarInPolygon(
     y: minY + r * cell,
   });
 
+  // Lazy clearance: only cells A* actually touches get scored. Prefilling a
+  // 200×200 grid against every desk/wall edge was the click-to-click stall
+  // (seconds per room) even when the eventual path only needed a few hundred
+  // cells. NaN = not computed yet.
   const clearance = new Float64Array(cols * rows);
-  let maxClear = CLEARANCE_EPS_M;
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const idx = r * cols + c;
-      const p = cellCentre(c, r);
-      const d = cellClearance(p.x, p.y, polygon, holes, obstacles, doorwayVoids, cell);
-      clearance[idx] = d;
-      if (d > maxClear) maxClear = d;
-    }
-  }
+  clearance.fill(Number.NaN);
+  const clearAt = (c: number, r: number): number => {
+    const idx = r * cols + c;
+    let d = clearance[idx]!;
+    if (!Number.isNaN(d)) return d;
+    const p = cellCentre(c, r);
+    d = cellClearance(p.x, p.y, polygon, holes, obstacles, doorwayVoids, cell);
+    clearance[idx] = d;
+    return d;
+  };
+
+  // Over-estimate of max clearance keeps the heuristic admissible without a
+  // full-grid scan (true cost ≥ pathLen / maxClear).
+  const maxClear = Math.max(
+    CLEARANCE_EPS_M,
+    Math.min(maxX - minX, maxY - minY) * 0.25,
+  );
 
   /** Nearest free cell by Euclidean distance (no clearance preference). */
   const toFreeCell = (p: Point2D) => {
@@ -572,7 +659,7 @@ function astarInPolygon(
         const c = c0 + dc;
         const r = r0 + dr;
         if (c < 0 || r < 0 || c >= cols || r >= rows) continue;
-        if (clearance[r * cols + c]! < 0) continue;
+        if (clearAt(c, r) < 0) continue;
         const centre = cellCentre(c, r);
         const d = Math.hypot(centre.x - p.x, centre.y - p.y);
         if (d < bestD) {
@@ -628,14 +715,28 @@ function astarInPolygon(
     if (closed.has(ck)) continue;
     closed.add(ck);
     if (cur.c === goalCell.c && cur.r === goalCell.r) {
-      const raw: Point2D[] = [g];
+      // If the caller handed us a start/goal inside an obstacle (e.g. a
+      // space centroid that lands on a wall hull), emit the free cell we
+      // actually searched from/to — keeping the blocked point in the
+      // polyline makes the path look like it crossed the wall.
+      const outGoal =
+        clearAt(goalCell.c, goalCell.r) >= 0 &&
+        cellClearance(g.x, g.y, polygon, holes, obstacles, doorwayVoids, cell) < 0
+          ? cellCentre(goalCell.c, goalCell.r)
+          : g;
+      const outStart =
+        clearAt(startCell.c, startCell.r) >= 0 &&
+        cellClearance(s.x, s.y, polygon, holes, obstacles, doorwayVoids, cell) < 0
+          ? cellCentre(startCell.c, startCell.r)
+          : s;
+      const raw: Point2D[] = [outGoal];
       let k: string | undefined = came.get(ck);
       while (k && k !== key(startCell.c, startCell.r)) {
         const [cs, rs] = k.split(",").map(Number) as [number, number];
         raw.push(cellCentre(cs, rs));
         k = came.get(k);
       }
-      raw.push(s);
+      raw.push(outStart);
       raw.reverse();
       const smoothed = simplifyLocalPath(raw, polygon, holes, obstacles, doorwayVoids);
       return { points: smoothed, reached: true };
@@ -644,13 +745,12 @@ function astarInPolygon(
       const nc = cur.c + dc!;
       const nr = cur.r + dr!;
       if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
-      const nIdx = nr * cols + nc;
-      const clear = clearance[nIdx]!;
+      const clear = clearAt(nc, nr);
       if (clear < 0 && !(nc === goalCell.c && nr === goalCell.r)) continue;
       // No diagonal corner-cuts through blocked cells (thin IfcWalls).
       if (dc !== 0 && dr !== 0) {
-        if (clearance[cur.r * cols + nc]! < 0) continue;
-        if (clearance[nr * cols + cur.c]! < 0) continue;
+        if (clearAt(nc, cur.r) < 0) continue;
+        if (clearAt(cur.c, nr) < 0) continue;
       }
 
       const stepLen = Math.hypot(dc!, dr!) * cell;

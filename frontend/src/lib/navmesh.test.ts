@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   buildAllStoreyNavmeshes,
   buildStoreyNavmesh,
+  buildStoreyNavmeshesIncremental,
   buildVerticalConnectors,
   computeBuildingEvacuationLoad,
   computeEvacuationLoad,
@@ -10,7 +11,10 @@ import {
   findMultiStoreyNavmeshPath,
   findNavmeshPath,
   findNearestExitPath,
+  invalidatePortalEdgeCosts,
   regionAtPoint,
+  storeysAffectedByExclusionChange,
+  warmPortalCoreGraphs,
   type StoreyNavmesh,
 } from "./navmesh.ts";
 import { pointInPolygon } from "./geometric-path.ts";
@@ -113,6 +117,76 @@ describe("navmesh", () => {
     assert.equal(mesh.portals[0]!.doorGlobalId, "D");
   });
 
+  it("keeps one portal per authored door between the same rooms", () => {
+    const twoDoors: ConnectivityGraph = {
+      ...graph,
+      nodes: [
+        ...graph.nodes,
+        { id: "door:D2", kind: "door", global_id: "D2", name: "D2", storey_global_id: "S1" },
+      ],
+      edges: [
+        {
+          id: "space_door:A:D:geom",
+          kind: "space_door",
+          source: "space:A",
+          target: "door:D",
+          method: "geom_door_space",
+          inferred: true,
+        },
+        {
+          id: "space_door:B:D:geom",
+          kind: "space_door",
+          source: "space:B",
+          target: "door:D",
+          method: "geom_door_space",
+          inferred: true,
+        },
+        {
+          id: "space_door:A:D2:geom",
+          kind: "space_door",
+          source: "space:A",
+          target: "door:D2",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+        {
+          id: "space_door:B:D2:geom",
+          kind: "space_door",
+          source: "space:B",
+          target: "door:D2",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+      ],
+    };
+    const fpTwo: FootprintsDocument = {
+      ...footprints,
+      doors: [
+        ...footprints.doors,
+        {
+          global_id: "D2",
+          name: "D2",
+          storey_global_id: "S1",
+          point: { x: 4, y: 3 },
+          segment: [
+            { x: 4, y: 2.5 },
+            { x: 4, y: 3.5 },
+          ],
+          incomplete: false,
+          method: "ifc_object_placement",
+        },
+      ],
+    };
+    const mesh = buildStoreyNavmesh(fpTwo, twoDoors, "S1");
+    const doorPortals = mesh.portals.filter((p) => p.kind === "door");
+    assert.equal(doorPortals.length, 2);
+    const gids = new Set(doorPortals.map((p) => p.doorGlobalId));
+    assert.ok(gids.has("D"));
+    assert.ok(gids.has("D2"));
+    const pts = doorPortals.map((p) => `${p.point.x},${p.point.y}`).sort();
+    assert.deepEqual(pts, ["4,2", "4,3"]);
+  });
+
   it("marks IFC door portals as not inferred", () => {
     const ifcGraph: ConnectivityGraph = {
       ...graph,
@@ -155,6 +229,7 @@ describe("navmesh", () => {
     const path = findNavmeshPath(mesh, { x: 1, y: 1 }, { x: 3, y: 3 }, footprints);
     assert.equal(path.found, true);
     assert.ok(path.points.length >= 2);
+    assert.deepEqual(path.graphNodeIds, ["space:A"]);
   });
 
   it("finds cross-portal A* path A→B", () => {
@@ -167,6 +242,7 @@ describe("navmesh", () => {
     assert.ok(nearDoor, "expected path through door portal");
     const last = path.points[path.points.length - 1]!;
     assert.ok(last.x > 4, "expected end in room B");
+    assert.deepEqual(path.graphNodeIds, ["space:A", "space:B"]);
   });
 
   it("fails when no portal connects regions", () => {
@@ -209,6 +285,167 @@ describe("navmesh", () => {
       path.points.some((p) => Math.abs(p.y - 2) > 0.3),
       "expected a detour around the desk, not a straight line through it",
     );
+  });
+
+  it("prefers a clear portal hop over a short chord through furniture", () => {
+    // Hall below + room above. Two doors into the room (west/east); a desk
+    // blocks the straight room chord. Start west / end east in the hall —
+    // euclidean portal A* preferred hall→west→(chord through desk)→east→hall;
+    // walk-weighted costs make that chord expensive so the path stays in the hall.
+    const fp: FootprintsDocument = {
+      schema_version: "1.0",
+      model_id: "t",
+      coordinate_system: "ifc_world_xy_metres",
+      storeys: [{ global_id: "S1", name: "L1", elevation: 0 }],
+      spaces: [
+        {
+          global_id: "Hall",
+          name: "Hall",
+          storey_global_id: "S1",
+          polygon: [
+            { x: 0, y: 0 },
+            { x: 10, y: 0 },
+            { x: 10, y: 2 },
+            { x: 0, y: 2 },
+          ],
+          incomplete: false,
+          method: "ifc_placement_bbox",
+        },
+        {
+          global_id: "Room",
+          name: "Room",
+          storey_global_id: "S1",
+          polygon: [
+            { x: 0, y: 2 },
+            { x: 10, y: 2 },
+            { x: 10, y: 6 },
+            { x: 0, y: 6 },
+          ],
+          incomplete: false,
+          method: "ifc_placement_bbox",
+        },
+      ],
+      doors: [
+        {
+          global_id: "W",
+          name: "W",
+          storey_global_id: "S1",
+          point: { x: 1, y: 2 },
+          segment: [
+            { x: 0.5, y: 2 },
+            { x: 1.5, y: 2 },
+          ],
+          incomplete: false,
+          method: "ifc_object_placement",
+        },
+        {
+          global_id: "E",
+          name: "E",
+          storey_global_id: "S1",
+          point: { x: 9, y: 2 },
+          segment: [
+            { x: 8.5, y: 2 },
+            { x: 9.5, y: 2 },
+          ],
+          incomplete: false,
+          method: "ifc_object_placement",
+        },
+      ],
+      furniture: [
+        {
+          global_id: "Desk",
+          name: "Desk",
+          storey_global_id: "S1",
+          polygon: [
+            { x: 3, y: 3 },
+            { x: 7, y: 3 },
+            { x: 7, y: 5 },
+            { x: 3, y: 5 },
+          ],
+          incomplete: false,
+          method: "ifc_placement_bbox",
+        },
+      ],
+    };
+    const g: ConnectivityGraph = {
+      schema_version: "1.0",
+      model_id: "t",
+      variant: "geometry",
+      nodes: [
+        { id: "space:Hall", kind: "space", global_id: "Hall", name: "Hall", storey_global_id: "S1" },
+        { id: "space:Room", kind: "space", global_id: "Room", name: "Room", storey_global_id: "S1" },
+        { id: "door:W", kind: "door", global_id: "W", name: "W", storey_global_id: "S1" },
+        { id: "door:E", kind: "door", global_id: "E", name: "E", storey_global_id: "S1" },
+      ],
+      edges: [
+        {
+          id: "sd:H:W",
+          kind: "space_door",
+          source: "space:Hall",
+          target: "door:W",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+        {
+          id: "sd:R:W",
+          kind: "space_door",
+          source: "space:Room",
+          target: "door:W",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+        {
+          id: "sd:H:E",
+          kind: "space_door",
+          source: "space:Hall",
+          target: "door:E",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+        {
+          id: "sd:R:E",
+          kind: "space_door",
+          source: "space:Room",
+          target: "door:E",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+      ],
+    };
+    const mesh = buildStoreyNavmesh(fp, g, "S1");
+    assert.equal(mesh.portals.filter((p) => p.kind === "door").length, 2);
+
+    const path = findNavmeshPath(mesh, { x: 1, y: 1 }, { x: 9, y: 1 }, fp);
+    assert.equal(path.found, true);
+    // Staying in the hall means every point stays at y <= 2 (+ small tolerance).
+    assert.ok(
+      path.points.every((p) => p.y <= 2.35),
+      "expected hall-only route, not a detour up into the furnished room",
+    );
+  });
+
+  it("keeps cached walk costs for doors not touched by a block change", () => {
+    const mesh = buildStoreyNavmesh(footprints, graph, "S1");
+    warmPortalCoreGraphs([mesh], footprints);
+    const first = findNavmeshPath(mesh, { x: 1, y: 2 }, { x: 7, y: 2 }, footprints);
+    assert.equal(first.found, true);
+
+    // Block a portal id that is not on this mesh — adoptPortalCore still runs
+    // with an empty affected set relative to real portals, so the only door's
+    // walk cost must remain memoized (second search still succeeds).
+    const blocked = new Set(["viz-door:door:OTHER:space:X:space:Y"]);
+    warmPortalCoreGraphs([mesh], footprints, blocked);
+    const second = findNavmeshPath(mesh, { x: 1, y: 2 }, { x: 7, y: 2 }, footprints, {
+      blockedPortalIds: blocked,
+    });
+    assert.equal(second.found, true);
+
+    const doorId = mesh.portals[0]!.id;
+    invalidatePortalEdgeCosts(mesh, [doorId]);
+    const third = findNavmeshPath(mesh, { x: 1, y: 2 }, { x: 7, y: 2 }, footprints, {
+      blockedPortalIds: blocked,
+    });
+    assert.equal(third.found, true);
   });
 
   describe("exit portals", () => {
@@ -572,6 +809,37 @@ describe("navmesh", () => {
       assert.equal(result.segments.length, 2);
       assert.equal(result.segments[0]!.storeyId, "S1");
       assert.equal(result.segments[1]!.storeyId, "S2");
+    });
+
+    it("rebuilds only the dirty storey mesh on exclusion; keeps others by identity", () => {
+      const empty = new Set<string>();
+      const previous = buildAllStoreyNavmeshes(multiStoreyFootprints, multiStoreyGraph);
+      const s1 = previous.find((m) => m.storeyId === "S1");
+      const s2 = previous.find((m) => m.storeyId === "S2");
+      assert.ok(s1 && s2);
+
+      const nextNodes = new Set(["space:A"]);
+      const dirty = storeysAffectedByExclusionChange(
+        multiStoreyFootprints,
+        multiStoreyGraph,
+        empty,
+        nextNodes,
+        empty,
+        empty,
+      );
+      assert.ok(dirty !== "all");
+      assert.deepEqual([...dirty].sort(), ["S1"]);
+
+      const patched = buildStoreyNavmeshesIncremental(previous, multiStoreyFootprints, multiStoreyGraph, {
+        excludedNodeIds: nextNodes,
+        dirtyStoreyIds: dirty,
+      });
+      const nextS1 = patched.find((m) => m.storeyId === "S1");
+      const nextS2 = patched.find((m) => m.storeyId === "S2");
+      assert.ok(nextS1 && nextS2);
+      assert.notEqual(nextS1, s1);
+      assert.equal(nextS2, s2);
+      assert.ok(!nextS1.regions.some((r) => r.spaceId === "space:A"));
     });
 
     it("fails when the connecting stair landing is blocked", () => {

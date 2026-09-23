@@ -12,7 +12,6 @@ import {
   wallsOverlappingSpace,
   furnitureOverlappingSpace,
   doorwayVoidsInSpace,
-  hasLineOfSight,
   MinHeap,
 } from "@/lib/geometric-path";
 import type { DoorPortal, FootprintsDocument, Point2D, SpaceFootprint } from "@/types/footprints";
@@ -190,7 +189,8 @@ function portalPointForDisplayEdge(
 
 /**
  * Build the walkable mesh for one storey from footprints + the connectivity
- * graph currently shown (doors collapsed to portals; soft-disabled edges skipped).
+ * graph currently shown (each authored door is its own portal; soft-disabled
+ * edges skipped).
  */
 export function buildStoreyNavmesh(
   footprints: FootprintsDocument,
@@ -237,7 +237,7 @@ export function buildStoreyNavmesh(
   const regionIds = new Set(regions.map((r) => r.spaceId));
   const display = opts.display ?? toDisplayGraph(graph);
   const portals: NavmeshPortal[] = [];
-  const seen = new Set<string>();
+  const seenEdgeIds = new Set<string>();
 
   for (const edge of display.edges) {
     if (edge.kind === "vertical") continue;
@@ -246,12 +246,13 @@ export function buildStoreyNavmesh(
     if (!regionIds.has(edge.source) || !regionIds.has(edge.target)) continue;
     if (!spaceOnStorey(spaceById, edge.source, storeyId)) continue;
     if (!spaceOnStorey(spaceById, edge.target, storeyId)) continue;
+    // One portal per display edge (per door / opening) — do not collapse
+    // multiple doors between the same space pair into a single point.
+    if (seenEdgeIds.has(edge.id)) continue;
+    seenEdgeIds.add(edge.id);
 
     const a = edge.source < edge.target ? edge.source : edge.target;
     const b = edge.source < edge.target ? edge.target : edge.source;
-    const key = `${a}|${b}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
 
     const point = portalPointForDisplayEdge(edge, doorById, edgeById, edgesByPair, spaceById);
     if (!point) continue;
@@ -389,6 +390,168 @@ export function buildAllStoreyNavmeshes(
     .filter((m) => m.regions.length > 0);
 }
 
+function symmetricSetDiff(a: ReadonlySet<string>, b: ReadonlySet<string>): string[] {
+  const out: string[] = [];
+  for (const x of a) if (!b.has(x)) out.push(x);
+  for (const x of b) if (!a.has(x)) out.push(x);
+  return out;
+}
+
+/**
+ * Storeys whose walkable mesh (regions / same-floor portals) can change when
+ * this graph/footprint node is excluded or restored. Stair/lift nodes only
+ * affect vertical hopping at path time — per-storey meshes skip `vertical`
+ * edges — so they return an empty list.
+ */
+export function storeysForExcludedNode(
+  nodeId: string,
+  footprints: FootprintsDocument,
+  graph: ConnectivityGraph,
+): string[] {
+  if (nodeId.startsWith("stair:") || nodeId.startsWith("lift:")) return [];
+
+  const fromGraph = graph.nodes.find((n) => n.id === nodeId)?.storey_global_id;
+  if (fromGraph) return [fromGraph];
+
+  if (nodeId.startsWith("space:")) {
+    const gid = nodeId.slice("space:".length);
+    const storey = footprints.spaces.find((s) => s.global_id === gid)?.storey_global_id;
+    return storey ? [storey] : [];
+  }
+  if (nodeId.startsWith("door:")) {
+    const gid = nodeId.slice("door:".length);
+    const storey = footprints.doors.find((d) => d.global_id === gid)?.storey_global_id;
+    return storey ? [storey] : [];
+  }
+  return [];
+}
+
+/**
+ * Storeys touched by disabling/restoring a display or raw graph edge.
+ * Returns `"all"` only when the id can't be resolved (safer full rebuild).
+ */
+export function storeysForExcludedEdge(
+  edgeId: string,
+  footprints: FootprintsDocument,
+  graph: ConnectivityGraph,
+): string[] | "all" {
+  const doorId = doorIdFromVizEdge(edgeId);
+  if (doorId) {
+    const storeys = storeysForExcludedNode(doorId, footprints, graph);
+    // viz-door also names the two spaces — include their storeys if present.
+    const parts = edgeId.slice("viz-door:".length).split(":");
+    if (parts.length >= 6 && parts[2] === "space" && parts[4] === "space") {
+      for (const spaceId of [`space:${parts[3]}`, `space:${parts[5]}`]) {
+        for (const s of storeysForExcludedNode(spaceId, footprints, graph)) storeys.push(s);
+      }
+    }
+    return [...new Set(storeys)];
+  }
+
+  const edge =
+    graph.edges.find((e) => e.id === edgeId) ??
+    toDisplayGraph(graph).edges.find((e) => e.id === edgeId);
+  if (!edge) return "all";
+
+  const storeys = [
+    ...storeysForExcludedNode(edge.source, footprints, graph),
+    ...storeysForExcludedNode(edge.target, footprints, graph),
+  ];
+  return [...new Set(storeys)];
+}
+
+/**
+ * Which storeys need a fresh {@link buildStoreyNavmesh} after an exclusion
+ * toggle. `"all"` when footprints/graph identity changed (caller) or an id
+ * can't be mapped. Empty set = keep the previous meshes as-is.
+ */
+export function storeysAffectedByExclusionChange(
+  footprints: FootprintsDocument,
+  graph: ConnectivityGraph,
+  prevNodes: ReadonlySet<string>,
+  nextNodes: ReadonlySet<string>,
+  prevEdges: ReadonlySet<string>,
+  nextEdges: ReadonlySet<string>,
+): Set<string> | "all" {
+  const dirty = new Set<string>();
+  for (const id of symmetricSetDiff(prevNodes, nextNodes)) {
+    for (const s of storeysForExcludedNode(id, footprints, graph)) dirty.add(s);
+  }
+  for (const id of symmetricSetDiff(prevEdges, nextEdges)) {
+    const storeys = storeysForExcludedEdge(id, footprints, graph);
+    if (storeys === "all") return "all";
+    for (const s of storeys) dirty.add(s);
+  }
+  return dirty;
+}
+
+/**
+ * Rebuild only dirty storeys; reuse previous meshes for the rest. Vertical
+ * stair/lift links are not stored on these meshes —
+ * {@link findMultiStoreyNavmeshPath} reassembles them from the connectivity
+ * graph at path time.
+ */
+export function buildStoreyNavmeshesIncremental(
+  previous: StoreyNavmesh[] | null,
+  footprints: FootprintsDocument,
+  graph: ConnectivityGraph,
+  opts: {
+    excludedNodeIds?: ReadonlySet<string>;
+    excludedEdgeIds?: ReadonlySet<string>;
+    dirtyStoreyIds: ReadonlySet<string> | "all";
+  },
+): StoreyNavmesh[] {
+  const dirty = opts.dirtyStoreyIds;
+  if (!previous || dirty === "all") {
+    return buildAllStoreyNavmeshes(footprints, graph, {
+      ...(opts.excludedNodeIds ? { excludedNodeIds: opts.excludedNodeIds } : {}),
+      ...(opts.excludedEdgeIds ? { excludedEdgeIds: opts.excludedEdgeIds } : {}),
+    });
+  }
+  if (dirty.size === 0) {
+    return previous;
+  }
+
+  const display = toDisplayGraph(graph);
+  const spaceById = spacesById(footprints);
+  const doorById = doorsByGlobalId(footprints);
+  const edgeById = edgesById(graph);
+  const edgesByPair = edgesByPairKey(graph);
+  const prevByStorey = new Map(previous.map((m) => [m.storeyId, m]));
+
+  const storeyIds = new Set<string>();
+  for (const space of footprints.spaces) {
+    if (space.incomplete || space.polygon.length < 3 || !space.storey_global_id) continue;
+    storeyIds.add(space.storey_global_id);
+  }
+  const ordered = (footprints.storeys ?? [])
+    .map((s) => s.global_id)
+    .filter((id) => storeyIds.has(id));
+  for (const id of storeyIds) {
+    if (!ordered.includes(id)) ordered.push(id);
+  }
+
+  const buildOpts = {
+    ...(opts.excludedNodeIds ? { excludedNodeIds: opts.excludedNodeIds } : {}),
+    ...(opts.excludedEdgeIds ? { excludedEdgeIds: opts.excludedEdgeIds } : {}),
+    display,
+    spaceById,
+    doorById,
+    edgeById,
+    edgesByPair,
+  };
+
+  return ordered
+    .map((id) => {
+      if (!dirty.has(id)) {
+        const kept = prevByStorey.get(id);
+        if (kept) return kept;
+      }
+      return buildStoreyNavmesh(footprints, graph, id, buildOpts);
+    })
+    .filter((m) => m.regions.length > 0);
+}
+
 function dist(a: Point2D, b: Point2D): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
@@ -439,86 +602,206 @@ function localWalk(
 
 type PortalGraphNode = { id: string; point: Point2D; regions: string[]; isExit?: boolean };
 
-type PortalGraph = {
-  nodes: Map<string, PortalGraphNode>;
-  adjacency: Map<string, { id: string; viaRegion: string; cost: number }[]>;
+/**
+ * Door↔door adjacency. `cost` / `path` start null and are filled lazily:
+ * clear chords store euclidean + a 2-point path; blocked chords run localWalk
+ * once and memoize both length and polyline for A* and stitch.
+ */
+type PortalAdj = {
+  id: string;
+  viaRegion: string;
+  cost: number | null;
+  /** Walk polyline from this node to `id` (inclusive). Reversed for the opposite edge. */
+  path: Point2D[] | null;
 };
 
-function pathLength(points: Point2D[]): number {
-  let total = 0;
-  for (let i = 1; i < points.length; i++) total += dist(points[i - 1]!, points[i]!);
-  return total;
-}
+type PortalGraph = {
+  nodes: Map<string, PortalGraphNode>;
+  adjacency: Map<string, PortalAdj[]>;
+};
 
-/** Obstacle/doorway-void geometry a region's local pathing needs, computed once per region and reused. */
-function regionGeometry(
+const CLEAR_LINE_SAMPLES = 14;
+
+/** Obstacles for a region — memoized on the portal core so door pairs don't re-scan footprints. */
+function obstaclesForRegion(
+  core: PortalCoreCache,
   region: NavmeshRegion,
-  footprints: FootprintsDocument | null | undefined,
-): { obstacles: Point2D[][]; voids: Point2D[][] } {
-  const space = spaceFootprintForRegion(footprints, region);
-  if (!space || !footprints) return { obstacles: [], voids: [] };
-  return {
-    obstacles: [
-      ...wallsOverlappingSpace(footprints, space),
-      ...furnitureOverlappingSpace(footprints, space),
-    ],
-    voids: doorwayVoidsInSpace(footprints, space),
-  };
+): Point2D[][] {
+  const hit = core.obstaclesByRegion.get(region.spaceId);
+  if (hit) return hit;
+  const space = spaceFootprintForRegion(core.footprints, region);
+  // Furniture only for portal-chord costing. Wall hulls are already baked into
+  // region polygons/holes; scanning every overlapping wall on each door pair
+  // was the main reason unedited routing felt slower than straight-line A*.
+  const obstacles =
+    space && core.footprints
+      ? furnitureOverlappingSpace(core.footprints, space)
+      : [];
+  core.obstaclesByRegion.set(region.spaceId, obstacles);
+  return obstacles;
 }
 
-/**
- * Edge cost between two points that share a walkable region: straight-line
- * distance when there's a clear line of sight between them (the common
- * case — cheap and exact, since there's genuinely no detour needed), or the
- * true local-A* walking distance when something in the room blocks that
- * line. Straight-line distance always UNDERESTIMATES the real cost of
- * detouring around an obstacle, so without this, the portal-graph search
- * (and "nearest exit" search) could judge a route "shortest" using a chord
- * through furniture/a column it can't actually walk through, while the
- * rendered path — already obstacle-aware via `localWalk` — comes out
- * longer than the graph thought when picking between routes.
- */
-function traversalCost(
+/** True when the chord stays in the region and misses walls/furniture (no full A*). */
+function straightLineClear(
   a: Point2D,
   b: Point2D,
   region: NavmeshRegion,
   obstacles: Point2D[][],
-  voids: Point2D[][],
-): number {
-  const straight = dist(a, b);
-  if (!obstacles.length) return straight;
-  if (hasLineOfSight(a, b, region.polygon, region.holes, obstacles, voids)) return straight;
-  return pathLength(localPathInPolygon(a, b, region.polygon, region.holes, obstacles, voids));
+): boolean {
+  for (let i = 0; i <= CLEAR_LINE_SAMPLES; i++) {
+    const t = i / CLEAR_LINE_SAMPLES;
+    const x = a.x + (b.x - a.x) * t;
+    const y = a.y + (b.y - a.y) * t;
+    if (!pointInSpace(x, y, region.polygon, region.holes)) return false;
+  }
+  if (!obstacles.length) return true;
+  for (let i = 0; i <= CLEAR_LINE_SAMPLES; i++) {
+    const t = i / CLEAR_LINE_SAMPLES;
+    const x = a.x + (b.x - a.x) * t;
+    const y = a.y + (b.y - a.y) * t;
+    for (const obs of obstacles) {
+      if (obs.length >= 3 && pointInSpace(x, y, obs)) return false;
+    }
+  }
+  return true;
 }
 
 /**
- * Shared portal-graph builder for `findNavmeshPath` and `findNearestExitPath`:
- * one node per extra point (click targets) plus every non-blocked portal,
- * bucketed by region so adjacency is built once in O(V) rather than an O(V^2)
- * per-node rescan (a portal-dense storey can have hundreds of doors). Edge
- * costs come from `traversalCost` above; region obstacle/void geometry is
- * computed once per region (not once per edge — wallsOverlappingSpace scans
- * every wall in the model, and an edge-per-call cost would turn this back
- * into an O(V x walls) rescan).
+ * Edge cost between two portal points that share a walkable region.
+ *
+ * Clear chords stay euclidean (pre-localWalk snappiness). Blocked chords get
+ * a soft length penalty so A* prefers clear door sequences — without running
+ * grid A* during neighbour expansion (that was the multi-second stall on
+ * furnished Trapelo rooms). Stitch still {@link localWalk}s blocked hops for
+ * geometry.
  */
-function buildPortalGraph(
+function resolveWalkEdge(
+  a: Point2D,
+  b: Point2D,
+  region: NavmeshRegion,
+  obstacles: Point2D[][],
+): { cost: number; path: Point2D[] } {
+  const d = dist(a, b);
+  if (!obstacles.length || straightLineClear(a, b, region, obstacles)) {
+    return { cost: d, path: [a, b] };
+  }
+  return { cost: d * 3, path: [] };
+}
+
+function blockedPortalKey(blocked?: ReadonlySet<string>): string {
+  if (!blocked?.size) return "";
+  return [...blocked].sort().join("\0");
+}
+
+type PortalCoreCache = {
+  mesh: StoreyNavmesh;
+  footprints: FootprintsDocument | null | undefined;
+  blockedKey: string;
+  regionById: Map<string, NavmeshRegion>;
+  /** Lazily filled per region — avoids re-scanning footprints on every door pair. */
+  obstaclesByRegion: Map<string, Point2D[][]>;
+  /** Portal nodes only — no __start/__end. */
+  graph: PortalGraph;
+  /** True once every door↔door edge has a concrete cost. */
+  warmed: boolean;
+};
+
+/** One core graph per storey mesh; invalidated when mesh / footprints change. */
+const portalCoreCacheByMesh = new WeakMap<StoreyNavmesh, PortalCoreCache>();
+
+/**
+ * Clear memoized walk costs for edges incident to `portalIds`. Call after a
+ * portal is blocked/restored so only those door↔door weights recompute on the
+ * next resolve — remaining edges keep their cached walk lengths.
+ */
+export function invalidatePortalEdgeCosts(
   mesh: StoreyNavmesh,
-  regionById: Map<string, NavmeshRegion>,
-  extraNodes: PortalGraphNode[],
+  portalIds: ReadonlySet<string> | readonly string[],
+): void {
+  const core = portalCoreCacheByMesh.get(mesh);
+  if (!core) return;
+  const affected = portalIds instanceof Set ? portalIds : new Set(portalIds);
+  if (!affected.size) return;
+  core.warmed = false;
+  for (const [fromId, edges] of core.graph.adjacency) {
+    const fromHit = affected.has(fromId);
+    for (const edge of edges) {
+      if (fromHit || affected.has(edge.id)) {
+        edge.cost = null;
+        edge.path = null;
+      }
+    }
+  }
+}
+
+/**
+ * Resolve (and memoize) a portal-graph edge cost. Clear chords are euclidean;
+ * obstructed chords run localWalk once and cache length + polyline.
+ */
+function resolvePortalEdgeCost(
+  core: PortalCoreCache,
+  fromId: string,
+  edge: PortalAdj,
+): number {
+  if (edge.cost != null) return edge.cost;
+  const from = core.graph.nodes.get(fromId);
+  const to = core.graph.nodes.get(edge.id);
+  const region = core.regionById.get(edge.viaRegion);
+  if (!from || !to || !region) {
+    edge.cost = Infinity;
+    edge.path = null;
+    return Infinity;
+  }
+  const obstacles = obstaclesForRegion(core, region);
+  const resolved = resolveWalkEdge(from.point, to.point, region, obstacles);
+  edge.cost = resolved.cost;
+  edge.path = resolved.path.length >= 2 ? resolved.path : null;
+  const rev = core.graph.adjacency
+    .get(edge.id)
+    ?.find((e) => e.id === fromId && e.viaRegion === edge.viaRegion);
+  if (rev && rev.cost == null) {
+    rev.cost = resolved.cost;
+    rev.path =
+      resolved.path.length >= 2 ? [...resolved.path].reverse() : null;
+  }
+  return resolved.cost;
+}
+
+function warmPortalCore(core: PortalCoreCache): void {
+  if (core.warmed) return;
+  for (const [fromId, edges] of core.graph.adjacency) {
+    for (const edge of edges) {
+      if (edge.cost == null) resolvePortalEdgeCost(core, fromId, edge);
+    }
+  }
+  core.warmed = true;
+}
+
+/**
+ * Precompute door↔door walk weights for the given meshes. Optional — routing
+ * resolves lazily. Full warm runs local A* for every portal pair and can hang
+ * Trapelo-scale models on the main thread; prefer not to call it there.
+ */
+export function warmPortalCoreGraphs(
+  meshes: readonly StoreyNavmesh[],
   footprints: FootprintsDocument | null | undefined,
   blockedPortalIds?: ReadonlySet<string>,
-  /**
-   * Optional externally-owned region-geometry cache — lets a caller that
-   * also needs `regionGeometry` results for its own work (computeEvacuationLoad,
-   * which seeds a Dijkstra from each region's own geometry) share this
-   * function's cache instead of each recomputing it. `findNavmeshPath` and
-   * `findNearestExitPath` don't pass one, so their behaviour (a fresh,
-   * call-scoped cache) is unchanged.
-   */
-  sharedGeometryCache?: Map<string, { obstacles: Point2D[][]; voids: Point2D[][] }>,
-): PortalGraph {
+): void {
+  for (const mesh of meshes) {
+    warmPortalCore(getPortalCoreGraph(mesh, footprints, blockedPortalIds));
+  }
+}
+
+/** Build portal nodes + unloaded adjacency for a storey (no walk costs yet). */
+function buildPortalCoreAdjacency(
+  mesh: StoreyNavmesh,
+  blockedPortalIds?: ReadonlySet<string>,
+): {
+  regionById: Map<string, NavmeshRegion>;
+  graph: PortalGraph;
+} {
+  const regionById = new Map(mesh.regions.map((r) => [r.spaceId, r]));
   const nodes = new Map<string, PortalGraphNode>();
-  for (const n of extraNodes) nodes.set(n.id, n);
   for (const p of mesh.portals) {
     if (blockedPortalIds?.has(p.id)) continue;
     nodes.set(p.id, {
@@ -537,37 +820,167 @@ function buildPortalGraph(
       nodesByRegion.set(regionId, list);
     }
   }
-  const geomByRegion =
-    sharedGeometryCache ?? new Map<string, { obstacles: Point2D[][]; voids: Point2D[][] }>();
-  const geometryFor = (regionId: string, region: NavmeshRegion) => {
-    let g = geomByRegion.get(regionId);
-    if (!g) {
-      g = regionGeometry(region, footprints);
-      geomByRegion.set(regionId, g);
-    }
-    return g;
-  };
 
-  const adjacency = new Map<string, { id: string; viaRegion: string; cost: number }[]>();
+  const adjacency = new Map<string, PortalAdj[]>();
   for (const node of nodes.values()) {
-    const out: { id: string; viaRegion: string; cost: number }[] = [];
+    const out: PortalAdj[] = [];
     const linked = new Set<string>();
-    // First of this node's own regions (in order) that the other node also
-    // belongs to — stable tie-break, independent of Map iteration order.
     for (const regionId of node.regions) {
-      const region = regionById.get(regionId);
+      if (!regionById.has(regionId)) continue;
       for (const other of nodesByRegion.get(regionId) ?? []) {
         if (other.id === node.id || linked.has(other.id)) continue;
         linked.add(other.id);
-        let cost = dist(node.point, other.point);
-        if (region) {
-          const { obstacles, voids } = geometryFor(regionId, region);
-          cost = traversalCost(node.point, other.point, region, obstacles, voids);
-        }
-        out.push({ id: other.id, viaRegion: regionId, cost });
+        out.push({ id: other.id, viaRegion: regionId, cost: null, path: null });
       }
     }
     adjacency.set(node.id, out);
+  }
+
+  return { regionById, graph: { nodes, adjacency } };
+}
+
+/**
+ * Reuse walk-cost memo when only the blocked-portal set changed: rebuild the
+ * adjacency skeleton, then copy costs for edges whose endpoints were not in
+ * the blocked-set symmetric difference (those doors' incident edges are the
+ * only ones that need a fresh resolve).
+ */
+function adoptPortalCoreForBlockedChange(
+  prev: PortalCoreCache,
+  blockedPortalIds: ReadonlySet<string> | undefined,
+  blockedKey: string,
+): PortalCoreCache {
+  const prevBlocked = new Set(
+    prev.blockedKey ? prev.blockedKey.split("\0").filter(Boolean) : [],
+  );
+  const nextBlocked = blockedPortalIds ?? new Set<string>();
+  const affected = new Set<string>();
+  for (const id of prevBlocked) if (!nextBlocked.has(id)) affected.add(id);
+  for (const id of nextBlocked) if (!prevBlocked.has(id)) affected.add(id);
+
+  const { regionById, graph } = buildPortalCoreAdjacency(prev.mesh, blockedPortalIds);
+
+  const prevCost = new Map<string, { cost: number; path: Point2D[] | null }>();
+  for (const [fromId, edges] of prev.graph.adjacency) {
+    for (const edge of edges) {
+      if (edge.cost == null) continue;
+      const lo = fromId < edge.id ? fromId : edge.id;
+      const hi = fromId < edge.id ? edge.id : fromId;
+      prevCost.set(`${lo}|${hi}|${edge.viaRegion}`, {
+        cost: edge.cost,
+        path: fromId < edge.id ? edge.path : edge.path ? [...edge.path].reverse() : null,
+      });
+    }
+  }
+
+  for (const [fromId, edges] of graph.adjacency) {
+    for (const edge of edges) {
+      if (affected.has(fromId) || affected.has(edge.id)) continue;
+      const lo = fromId < edge.id ? fromId : edge.id;
+      const hi = fromId < edge.id ? edge.id : fromId;
+      const cached = prevCost.get(`${lo}|${hi}|${edge.viaRegion}`);
+      if (!cached) continue;
+      edge.cost = cached.cost;
+      edge.path =
+        fromId < edge.id
+          ? cached.path
+          : cached.path
+            ? [...cached.path].reverse()
+            : null;
+    }
+  }
+
+  const entry: PortalCoreCache = {
+    mesh: prev.mesh,
+    footprints: prev.footprints,
+    blockedKey,
+    regionById,
+    obstaclesByRegion: prev.obstaclesByRegion,
+    graph,
+    warmed: false,
+  };
+  portalCoreCacheByMesh.set(prev.mesh, entry);
+  return entry;
+}
+
+/**
+ * Door↔door portal graph adjacency. Edge costs start null and are filled
+ * lazily on first resolve (or by {@link warmPortalCoreGraphs}).
+ *
+ * Cache key is mesh identity + blocked set — not the footprints object
+ * reference. React often hands a new footprints wrapper for the same model;
+ * requiring `===` wiped walk memos on every click and made routing feel like
+ * a cold start every time.
+ */
+function getPortalCoreGraph(
+  mesh: StoreyNavmesh,
+  footprints: FootprintsDocument | null | undefined,
+  blockedPortalIds?: ReadonlySet<string>,
+): PortalCoreCache {
+  const blockedKey = blockedPortalKey(blockedPortalIds);
+  const hit = portalCoreCacheByMesh.get(mesh);
+  if (hit) {
+    hit.footprints = footprints;
+    if (hit.blockedKey === blockedKey) return hit;
+    return adoptPortalCoreForBlockedChange(hit, blockedPortalIds, blockedKey);
+  }
+
+  const { regionById, graph } = buildPortalCoreAdjacency(mesh, blockedPortalIds);
+  const entry: PortalCoreCache = {
+    mesh,
+    footprints,
+    blockedKey,
+    regionById,
+    obstaclesByRegion: new Map(),
+    graph,
+    warmed: false,
+  };
+  portalCoreCacheByMesh.set(mesh, entry);
+  return entry;
+}
+
+/**
+ * Shallow-copy the cached core graph and attach ephemeral terminals
+ * (__start / __end).
+ *
+ * Terminal↔portal edges use plain euclidean distance — pins move every click,
+ * so walk-weighting them would re-run local A* against every door in the room
+ * on each pick (not snappy). Door↔door weights stay lazy walk lengths on the
+ * shared core; stitch still localWalks the chosen pin→door segments.
+ */
+function withPortalTerminals(
+  core: PortalCoreCache,
+  terminals: PortalGraphNode[],
+): PortalGraph {
+  const nodes = new Map(core.graph.nodes);
+  const adjacency = new Map<string, PortalAdj[]>();
+  for (const [id, list] of core.graph.adjacency) {
+    adjacency.set(id, list.slice());
+  }
+
+  const portalsByRegion = new Map<string, PortalGraphNode[]>();
+  for (const node of core.graph.nodes.values()) {
+    for (const regionId of node.regions) {
+      const list = portalsByRegion.get(regionId) ?? [];
+      list.push(node);
+      portalsByRegion.set(regionId, list);
+    }
+  }
+
+  for (const terminal of terminals) {
+    nodes.set(terminal.id, terminal);
+    const out: PortalAdj[] = [];
+    for (const regionId of terminal.regions) {
+      if (!core.regionById.has(regionId)) continue;
+      for (const other of portalsByRegion.get(regionId) ?? []) {
+        const cost = dist(terminal.point, other.point);
+        out.push({ id: other.id, viaRegion: regionId, cost, path: null });
+        adjacency
+          .get(other.id)!
+          .push({ id: terminal.id, viaRegion: regionId, cost, path: null });
+      }
+    }
+    adjacency.set(terminal.id, out);
   }
 
   return { nodes, adjacency };
@@ -582,7 +995,7 @@ function stitchPortalPath(
   startId: string,
   endId: string,
   footprints: FootprintsDocument | null | undefined,
-): { points: Point2D[]; hops: number; portalIds: string[] } | null {
+): { points: Point2D[]; hops: number; portalIds: string[]; chain: { id: string; viaRegion: string }[] } | null {
   const chain: { id: string; viaRegion: string }[] = [];
   let cur = endId;
   while (cur !== startId) {
@@ -594,30 +1007,72 @@ function stitchPortalPath(
   chain.reverse();
 
   const points: Point2D[] = [];
+  let fromId = startId;
   let fromPt = start;
   for (const step of chain) {
     const toNode = graph.nodes.get(step.id)!;
     const region = regionById.get(step.viaRegion);
     if (!region) return null;
-    const seg = localWalk(fromPt, toNode.point, region, footprints);
+
+    // Door↔door: reuse the polyline memoized during cost resolve. Pin↔door
+    // terminals still localWalk (pins move every click). Re-walking every hop
+    // was the click-to-click lag even when the navmesh hadn't changed.
+    const edge = graph.adjacency
+      .get(fromId)
+      ?.find((e) => e.id === step.id && e.viaRegion === step.viaRegion);
+    let seg: Point2D[];
+    if (edge?.path && edge.path.length >= 2) {
+      seg = edge.path;
+    } else {
+      seg = localWalk(fromPt, toNode.point, region, footprints);
+    }
     if (!seg.length) return null;
     if (points.length) {
-      // Avoid duplicating the shared portal vertex.
       points.push(...seg.slice(1));
     } else {
       points.push(...seg);
     }
+    fromId = step.id;
     fromPt = toNode.point;
   }
-  // Every hop's node id is a real portal graph node — i.e. a NavmeshPortal.id
-  // (see buildPortalGraph: `nodes.set(p.id, {...})` for each `p` of
-  // `mesh.portals`) — with one exception: findNavmeshPath (click-to-click)
-  // calls this with a synthetic "__end" id as `endId`, which then shows up
-  // as the last entry here too (the walk-back loop only ever excludes
-  // `startId`, never `endId`). findNearestExitPath below never has this
-  // problem — its `endId` is always a real exit portal node — which is the
-  // only caller that currently reads `portalIds`.
-  return { points, hops: chain.length, portalIds: chain.map((s) => s.id) };
+  return {
+    points,
+    hops: chain.length,
+    portalIds: chain.map((s) => s.id),
+    chain,
+  };
+}
+
+/**
+ * Ordered Cytoscape node ids (spaces / stairs / lifts) for a portal A* chain.
+ * Doors become separate portals (one per authored door); graph node ids for
+ * highlighting are still spaces / stairs / lifts only.
+ */
+export function graphNodeIdsFromPortalChain(
+  startSpaceId: string,
+  endSpaceId: string,
+  chain: ReadonlyArray<{ id: string; viaRegion: string | null }>,
+): string[] {
+  const out: string[] = [];
+  const push = (id: string | null | undefined) => {
+    if (!id) return;
+    if (!(id.startsWith("space:") || id.startsWith("stair:") || id.startsWith("lift:"))) {
+      return;
+    }
+    if (out[out.length - 1] === id) return;
+    out.push(id);
+  };
+  push(startSpaceId);
+  for (const step of chain) {
+    push(step.viaRegion);
+    if (step.id.startsWith("vlink:")) {
+      const body = step.id.slice("vlink:".length);
+      const at = body.indexOf("@");
+      push(at >= 0 ? body.slice(0, at) : body);
+    }
+  }
+  push(endSpaceId);
+  return out;
 }
 
 /**
@@ -631,11 +1086,16 @@ export function findNavmeshPath(
   end: Point2D,
   footprints?: FootprintsDocument | null,
   opts: { blockedPortalIds?: ReadonlySet<string> } = {},
-): { found: boolean; points: Point2D[]; note: string } {
+): { found: boolean; points: Point2D[]; note: string; graphNodeIds: string[] } {
   const startRegion = regionAtPoint(mesh, start);
   const endRegion = regionAtPoint(mesh, end);
   if (!startRegion || !endRegion) {
-    return { found: false, points: [], note: "Pick points inside walkable regions" };
+    return {
+      found: false,
+      points: [],
+      note: "Pick points inside walkable regions",
+      graphNodeIds: [],
+    };
   }
 
   if (startRegion.spaceId === endRegion.spaceId) {
@@ -644,25 +1104,16 @@ export function findNavmeshPath(
       found: points.length > 0,
       points,
       note: points.length ? "Same-region path" : "No path in region",
+      graphNodeIds: points.length > 0 ? [startRegion.spaceId] : [],
     };
   }
 
-  const regionById = new Map(mesh.regions.map((r) => [r.spaceId, r]));
-  const graph = buildPortalGraph(
-    mesh,
-    regionById,
-    [
-      { id: "__start", point: start, regions: [startRegion.spaceId] },
-      { id: "__end", point: end, regions: [endRegion.spaceId] },
-    ],
-    footprints,
-    opts.blockedPortalIds,
-  );
+  const core = getPortalCoreGraph(mesh, footprints, opts.blockedPortalIds);
+  const graph = withPortalTerminals(core, [
+    { id: "__start", point: start, regions: [startRegion.spaceId] },
+    { id: "__end", point: end, regions: [endRegion.spaceId] },
+  ]);
 
-  // A* over the portal graph (obstacle-aware edge costs — see
-  // `traversalCost`), binary-heap open set — re-pushes a cheaper route
-  // instead of mutating an open entry, so stale entries are skipped via
-  // `closed` on pop (no decrease-key needed).
   const cameFrom = new Map<string, { prev: string; viaRegion: string }>();
   const gScore = new Map<string, number>([["__start", 0]]);
   const open = new MinHeap<{ id: string; f: number }>((a, b) => a.f < b.f);
@@ -680,7 +1131,7 @@ export function findNavmeshPath(
     }
     const gCur = gScore.get(current.id) ?? Infinity;
     for (const n of graph.adjacency.get(current.id) ?? []) {
-      const tentative = gCur + n.cost;
+      const tentative = gCur + resolvePortalEdgeCost(core, current.id, n);
       if (tentative >= (gScore.get(n.id) ?? Infinity)) continue;
       cameFrom.set(n.id, { prev: current.id, viaRegion: n.viaRegion });
       gScore.set(n.id, tentative);
@@ -690,12 +1141,17 @@ export function findNavmeshPath(
   }
 
   if (!foundEnd) {
-    return { found: false, points: [], note: "No portal path between regions" };
+    return {
+      found: false,
+      points: [],
+      note: "No portal path between regions",
+      graphNodeIds: [],
+    };
   }
 
   const stitched = stitchPortalPath(
     graph,
-    regionById,
+    core.regionById,
     cameFrom,
     start,
     "__start",
@@ -703,21 +1159,25 @@ export function findNavmeshPath(
     footprints,
   );
   if (!stitched) {
-    return { found: false, points: [], note: "Path reconstruction failed" };
+    return { found: false, points: [], note: "Path reconstruction failed", graphNodeIds: [] };
   }
 
   return {
     found: stitched.points.length >= 2,
     points: stitched.points,
     note: `${stitched.hops} hops`,
+    graphNodeIds: graphNodeIdsFromPortalChain(
+      startRegion.spaceId,
+      endRegion.spaceId,
+      stitched.chain,
+    ),
   };
 }
 
 /**
- * Multi-target Dijkstra from `start` to the nearest reachable "exit" portal
- * (a boundary door with no modelled space on the far side — see
- * {@link NavmeshPortal}). Used for emergency "nearest way out" routing rather
- * than a specific click-to-click destination.
+ * Dijkstra to the nearest `kind: "exit"` portal from `start`. Used by the
+ * floorplan "route to nearest exit" pick mode — one click, auto-goal,
+ * rather than a specific click-to-click destination.
  */
 export function findNearestExitPath(
   mesh: StoreyNavmesh,
@@ -731,27 +1191,36 @@ export function findNearestExitPath(
   exitPortalId?: string;
   /** Every portal (door/space/exit) the route crosses, in order — used to tally evacuation load per portal (see computeEvacuationLoad). Empty when not found or already at an exit. */
   portalIds: string[];
+  /** Ordered graph node ids (spaces) for the Graph Viewer hop highlight. */
+  graphNodeIds: string[];
 } {
   const startRegion = regionAtPoint(mesh, start);
   if (!startRegion) {
-    return { found: false, points: [], note: "Pick a point inside a walkable region", portalIds: [] };
+    return {
+      found: false,
+      points: [],
+      note: "Pick a point inside a walkable region",
+      portalIds: [],
+      graphNodeIds: [],
+    };
   }
 
   const hasExit = mesh.portals.some((p) => p.kind === "exit" && !opts.blockedPortalIds?.has(p.id));
   if (!hasExit) {
-    return { found: false, points: [], note: "No exit portal on this storey", portalIds: [] };
+    return {
+      found: false,
+      points: [],
+      note: "No exit portal on this storey",
+      portalIds: [],
+      graphNodeIds: [],
+    };
   }
 
-  const regionById = new Map(mesh.regions.map((r) => [r.spaceId, r]));
-  const graph = buildPortalGraph(
-    mesh,
-    regionById,
-    [{ id: "__start", point: start, regions: [startRegion.spaceId] }],
-    footprints,
-    opts.blockedPortalIds,
-  );
+  const core = getPortalCoreGraph(mesh, footprints, opts.blockedPortalIds);
+  const graph = withPortalTerminals(core, [
+    { id: "__start", point: start, regions: [startRegion.spaceId] },
+  ]);
 
-  // Plain Dijkstra (no heuristic — there's no single fixed goal point).
   const cameFrom = new Map<string, { prev: string; viaRegion: string }>();
   const gScore = new Map<string, number>([["__start", 0]]);
   const open = new MinHeap<{ id: string; g: number }>((a, b) => a.g < b.g);
@@ -770,7 +1239,7 @@ export function findNearestExitPath(
     }
     const gCur = gScore.get(current.id) ?? Infinity;
     for (const n of graph.adjacency.get(current.id) ?? []) {
-      const tentative = gCur + n.cost;
+      const tentative = gCur + resolvePortalEdgeCost(core, current.id, n);
       if (tentative >= (gScore.get(n.id) ?? Infinity)) continue;
       cameFrom.set(n.id, { prev: current.id, viaRegion: n.viaRegion });
       gScore.set(n.id, tentative);
@@ -779,7 +1248,13 @@ export function findNearestExitPath(
   }
 
   if (!exitId) {
-    return { found: false, points: [], note: "No reachable exit", portalIds: [] };
+    return {
+      found: false,
+      points: [],
+      note: "No reachable exit",
+      portalIds: [],
+      graphNodeIds: [],
+    };
   }
 
   if (exitId === "__start") {
@@ -789,12 +1264,13 @@ export function findNearestExitPath(
       note: "Already at an exit",
       exitPortalId: exitId,
       portalIds: [],
+      graphNodeIds: [startRegion.spaceId],
     };
   }
 
   const stitched = stitchPortalPath(
     graph,
-    regionById,
+    core.regionById,
     cameFrom,
     start,
     "__start",
@@ -802,8 +1278,17 @@ export function findNearestExitPath(
     footprints,
   );
   if (!stitched) {
-    return { found: false, points: [], note: "Path reconstruction failed", portalIds: [] };
+    return {
+      found: false,
+      points: [],
+      note: "Path reconstruction failed",
+      portalIds: [],
+      graphNodeIds: [],
+    };
   }
+
+  const exitPortal = mesh.portals.find((p) => p.id === exitId);
+  const endSpaceId = exitPortal?.spaceA ?? startRegion.spaceId;
 
   return {
     found: stitched.points.length >= 2,
@@ -811,6 +1296,7 @@ export function findNearestExitPath(
     note: `${stitched.hops} hops to exit`,
     exitPortalId: exitId,
     portalIds: stitched.portalIds,
+    graphNodeIds: graphNodeIdsFromPortalChain(startRegion.spaceId, endSpaceId, stitched.chain),
   };
 }
 
@@ -951,14 +1437,12 @@ export function computeEvacuationLoad(
     return { portalLoad, unreachableSpaceIds, skippedSpaceIds, stairNodes: [] };
   }
 
-  // Same "no storey recorded => treated as every storey" rule wallsAdded/
-  // furnitureAdded elsewhere in this file (and footprintOverlapsSpace in
-  // geometric-path.ts) already apply — this doesn't change which
-  // walls/furniture/openings end up counted, only how many get iterated to
-  // find out, since footprintOverlapsSpace already rejects a genuine
-  // cross-storey mismatch itself.
+  // Reuses the cached portal core; attaches stair landings as exit-like
+  // terminals once. Door↔door costs resolve lazily during each room's search.
+  // Scoped footprints keep the WeakMap key storey-local (and would matter if
+  // ranking ever used obstacle geometry again).
   const onThisStorey = <T extends { storey_global_id: string | null }>(items: T[] | undefined): T[] =>
-    (items ?? []).filter((item) => item.storey_global_id == null || item.storey_global_id === mesh.storeyId);
+    (items ?? []).filter((item) => item.storey_global_id === mesh.storeyId);
   const scopedFootprints: FootprintsDocument | null | undefined = footprints
     ? {
         ...footprints,
@@ -968,16 +1452,8 @@ export function computeEvacuationLoad(
       }
     : footprints;
 
-  const regionById = new Map(mesh.regions.map((r) => [r.spaceId, r]));
-  const geometryCache = new Map<string, { obstacles: Point2D[][]; voids: Point2D[][] }>();
-  const graph = buildPortalGraph(
-    mesh,
-    regionById,
-    stairNodes,
-    scopedFootprints,
-    opts.blockedPortalIds,
-    geometryCache,
-  );
+  const core = getPortalCoreGraph(mesh, scopedFootprints, opts.blockedPortalIds);
+  const graph = withPortalTerminals(core, stairNodes);
 
   const nodesByRegion = new Map<string, PortalGraphNode[]>();
   for (const node of graph.nodes.values()) {
@@ -1001,26 +1477,12 @@ export function computeEvacuationLoad(
       continue;
     }
 
-    // Seed Dijkstra directly from this region's own bordering portals
-    // (costed the same way buildPortalGraph costs its own edges) instead of
-    // inserting a synthetic start node into the shared graph — the whole
-    // point is to leave `graph` untouched so it stays reusable as-is for
-    // every other region. geometryCache was already populated for this
-    // region by buildPortalGraph above whenever the region has >1 bordering
-    // portal (the common case); only borderNodes.length === 1 regions (a
-    // dead-end room with exactly one door) reach buildPortalGraph without
-    // it, since that loop only costs edges *between* portals.
-    let geom = geometryCache.get(region.spaceId);
-    if (!geom) {
-      geom = regionGeometry(region, scopedFootprints);
-      geometryCache.set(region.spaceId, geom);
-    }
-    const { obstacles, voids } = geom;
+    // Seed Dijkstra from bordering portals with straight-line cost.
     const gScore = new Map<string, number>();
     const cameFrom = new Map<string, { prev: string; viaRegion: string }>();
     const open = new MinHeap<{ id: string; g: number }>((a, b) => a.g < b.g);
     for (const node of borderNodes) {
-      const g = traversalCost(start, node.point, region, obstacles, voids);
+      const g = dist(start, node.point);
       if (g < (gScore.get(node.id) ?? Infinity)) {
         gScore.set(node.id, g);
         open.push({ id: node.id, g });
@@ -1040,7 +1502,7 @@ export function computeEvacuationLoad(
       }
       const gCur = gScore.get(current.id) ?? Infinity;
       for (const n of graph.adjacency.get(current.id) ?? []) {
-        const tentative = gCur + n.cost;
+        const tentative = gCur + resolvePortalEdgeCost(core, current.id, n);
         if (tentative >= (gScore.get(n.id) ?? Infinity)) continue;
         cameFrom.set(n.id, { prev: current.id, viaRegion: n.viaRegion });
         gScore.set(n.id, tentative);
@@ -1177,17 +1639,27 @@ export function findMultiStoreyNavmeshPath(
   start: { storeyId: string; point: Point2D },
   end: { storeyId: string; point: Point2D },
   opts: { blockedPortalIds?: ReadonlySet<string>; blockedConnectorIds?: ReadonlySet<string> } = {},
-): { found: boolean; note: string; segments: { storeyId: string; points: Point2D[] }[] } {
+): {
+  found: boolean;
+  note: string;
+  segments: { storeyId: string; points: Point2D[] }[];
+  graphNodeIds: string[];
+} {
   const meshById = new Map(meshes.map((m) => [m.storeyId, m]));
   const startMesh = meshById.get(start.storeyId);
   const endMesh = meshById.get(end.storeyId);
   if (!startMesh || !endMesh) {
-    return { found: false, note: "Unknown storey", segments: [] };
+    return { found: false, note: "Unknown storey", segments: [], graphNodeIds: [] };
   }
   const startRegion = regionAtPoint(startMesh, start.point);
   const endRegion = regionAtPoint(endMesh, end.point);
   if (!startRegion || !endRegion) {
-    return { found: false, note: "Pick points inside walkable regions", segments: [] };
+    return {
+      found: false,
+      note: "Pick points inside walkable regions",
+      segments: [],
+      graphNodeIds: [],
+    };
   }
 
   if (start.storeyId === end.storeyId) {
@@ -1197,6 +1669,7 @@ export function findMultiStoreyNavmeshPath(
       found: result.found,
       note: result.note,
       segments: result.found ? [{ storeyId: start.storeyId, points: result.points }] : [],
+      graphNodeIds: result.graphNodeIds,
     };
   }
 
@@ -1251,10 +1724,11 @@ export function findMultiStoreyNavmeshPath(
     }
   }
 
-  // Same-storey adjacency: bucket nodes by region id (space ids are globally
-  // unique, so no need to also key by storey) — same O(V) approach as
-  // {@link buildPortalGraph}. `viaRegion: null` marks a cross-storey hop,
-  // stitched below as a discrete vertical transition rather than a local walk.
+  // Same-storey adjacency: portal↔portal edges stay lazy on each storey's
+  // core; only pin/stair terminals pay distance at build time.
+  const coreByStorey = new Map(
+    meshes.map((m) => [m.storeyId, getPortalCoreGraph(m, footprints, opts.blockedPortalIds)] as const),
+  );
   const nodesByRegion = new Map<string, MultiNode[]>();
   for (const node of nodes.values()) {
     for (const regionId of node.regions) {
@@ -1263,35 +1737,31 @@ export function findMultiStoreyNavmeshPath(
       nodesByRegion.set(regionId, list);
     }
   }
-  // Same-region obstacle/void geometry, computed once per region and reused
-  // across every edge that crosses it — see `traversalCost` / `buildPortalGraph`.
-  const geomByRegion = new Map<string, { obstacles: Point2D[][]; voids: Point2D[][] }>();
-  const geometryFor = (regionId: string, region: NavmeshRegion) => {
-    let g = geomByRegion.get(regionId);
-    if (!g) {
-      g = regionGeometry(region, footprints);
-      geomByRegion.set(regionId, g);
-    }
-    return g;
-  };
 
-  const adjacency = new Map<string, { id: string; viaRegion: string | null; cost: number }[]>();
+  type MultiAdj = { id: string; viaRegion: string | null; cost: number | null };
+  const adjacency = new Map<string, MultiAdj[]>();
   for (const node of nodes.values()) {
-    const out: { id: string; viaRegion: string | null; cost: number }[] = [];
+    const out: MultiAdj[] = [];
     const linked = new Set<string>();
+    const core = coreByStorey.get(node.storeyId);
+    const nodeInCore = !!core?.graph.nodes.has(node.id);
     for (const regionId of node.regions) {
-      // node.storeyId === other.storeyId is guaranteed here: space ids are
-      // globally unique, so two nodes sharing a regionId share a storey too.
-      const region = regionByIdPerStorey.get(node.storeyId)?.get(regionId);
       for (const other of nodesByRegion.get(regionId) ?? []) {
         if (other.id === node.id || linked.has(other.id)) continue;
         linked.add(other.id);
-        let cost = dist(node.point, other.point);
-        if (region) {
-          const { obstacles, voids } = geometryFor(regionId, region);
-          cost = traversalCost(node.point, other.point, region, obstacles, voids);
+        const otherInCore = !!core?.graph.nodes.has(other.id);
+        if (nodeInCore && otherInCore) {
+          out.push({ id: other.id, viaRegion: regionId, cost: null });
+        } else {
+          // Pin / stair landing ↔ portal: euclidean only (same rationale as
+          // withPortalTerminals — these endpoints move or are sparse; door↔door
+          // walk weights live on the per-storey core).
+          out.push({
+            id: other.id,
+            viaRegion: regionId,
+            cost: dist(node.point, other.point),
+          });
         }
-        out.push({ id: other.id, viaRegion: regionId, cost });
       }
     }
     adjacency.set(node.id, out);
@@ -1322,6 +1792,27 @@ export function findMultiStoreyNavmeshPath(
     }
   }
 
+  const resolveMultiCost = (fromId: string, edge: MultiAdj): number => {
+    if (edge.cost != null) return edge.cost;
+    const from = nodes.get(fromId)!;
+    const core = coreByStorey.get(from.storeyId);
+    if (!core || edge.viaRegion == null) {
+      const to = nodes.get(edge.id)!;
+      edge.cost = dist(from.point, to.point);
+      return edge.cost;
+    }
+    const coreEdge = core.graph.adjacency
+      .get(fromId)
+      ?.find((e) => e.id === edge.id && e.viaRegion === edge.viaRegion);
+    if (coreEdge) {
+      edge.cost = resolvePortalEdgeCost(core, fromId, coreEdge);
+      return edge.cost;
+    }
+    const to = nodes.get(edge.id)!;
+    edge.cost = dist(from.point, to.point);
+    return edge.cost;
+  };
+
   // Plain Dijkstra — there's no admissible heuristic once elevation enters
   // the cost (plan-distance and floor-height aren't the same units).
   const cameFrom = new Map<string, { prev: string; viaRegion: string | null }>();
@@ -1341,7 +1832,7 @@ export function findMultiStoreyNavmeshPath(
     }
     const gCur = gScore.get(current.id) ?? Infinity;
     for (const n of adjacency.get(current.id) ?? []) {
-      const tentative = gCur + n.cost;
+      const tentative = gCur + resolveMultiCost(current.id, n);
       if (tentative >= (gScore.get(n.id) ?? Infinity)) continue;
       cameFrom.set(n.id, { prev: current.id, viaRegion: n.viaRegion });
       gScore.set(n.id, tentative);
@@ -1350,7 +1841,7 @@ export function findMultiStoreyNavmeshPath(
   }
 
   if (!foundEnd) {
-    return { found: false, note: "No multi-storey path found", segments: [] };
+    return { found: false, note: "No multi-storey path found", segments: [], graphNodeIds: [] };
   }
 
   const chain: { id: string; viaRegion: string | null }[] = [];
@@ -1358,7 +1849,7 @@ export function findMultiStoreyNavmeshPath(
   while (cur !== "__start") {
     const step = cameFrom.get(cur);
     if (!step) {
-      return { found: false, note: "Path reconstruction failed", segments: [] };
+      return { found: false, note: "Path reconstruction failed", segments: [], graphNodeIds: [] };
     }
     chain.push({ id: cur, viaRegion: step.viaRegion });
     cur = step.prev;
@@ -1368,6 +1859,7 @@ export function findMultiStoreyNavmeshPath(
   const segments: { storeyId: string; points: Point2D[] }[] = [];
   let currentStoreyId = start.storeyId;
   let currentPoints: Point2D[] = [];
+  let fromId = "__start";
   let fromPt = start.point;
   for (const step of chain) {
     const toNode = nodes.get(step.id)!;
@@ -1380,22 +1872,33 @@ export function findMultiStoreyNavmeshPath(
       }
       currentStoreyId = toNode.storeyId;
       currentPoints = [toNode.point];
+      fromId = step.id;
       fromPt = toNode.point;
       continue;
     }
     const region = regionByIdPerStorey.get(toNode.storeyId)?.get(step.viaRegion);
     if (!region) {
-      return { found: false, note: "Missing region on path", segments: [] };
+      return { found: false, note: "Missing region on path", segments: [], graphNodeIds: [] };
     }
-    const seg = localWalk(fromPt, toNode.point, region, footprints);
+    const core = coreByStorey.get(toNode.storeyId);
+    const coreEdge = core?.graph.adjacency
+      .get(fromId)
+      ?.find((e) => e.id === step.id && e.viaRegion === step.viaRegion);
+    let seg: Point2D[];
+    if (coreEdge?.path && coreEdge.path.length >= 2) {
+      seg = coreEdge.path;
+    } else {
+      seg = localWalk(fromPt, toNode.point, region, footprints);
+    }
     if (!seg.length) {
-      return { found: false, note: `No walk in ${region.name}`, segments: [] };
+      return { found: false, note: `No walk in ${region.name}`, segments: [], graphNodeIds: [] };
     }
     if (currentPoints.length) {
       currentPoints.push(...seg.slice(1));
     } else {
       currentPoints.push(...seg);
     }
+    fromId = step.id;
     fromPt = toNode.point;
   }
   if (currentPoints.length) {
@@ -1407,6 +1910,7 @@ export function findMultiStoreyNavmeshPath(
     found: segments.length > 0,
     note: `${chain.length} hops across ${storeyCount} storeys`,
     segments,
+    graphNodeIds: graphNodeIdsFromPortalChain(startRegion.spaceId, endRegion.spaceId, chain),
   };
 }
 
@@ -1520,49 +2024,9 @@ export function computeBuildingEvacuationLoad(
     }
   }
 
-  // Storey-scoped footprints + a per-storey geometry cache — same
-  // performance fix as computeEvacuationLoad, for the same reason: this
-  // touches every region across the whole building, so an unscoped
-  // regionGeometry (which scans every wall/furniture/opening in the
-  // *entire model*) would compound across every storey, not just repeat
-  // within one.
-  const onThisStorey = <T extends { storey_global_id: string | null }>(
-    items: T[] | undefined,
-    storeyId: string,
-  ): T[] =>
-    (items ?? []).filter((item) => item.storey_global_id == null || item.storey_global_id === storeyId);
-  const scopedFootprintsCache = new Map<string, FootprintsDocument | null | undefined>();
-  const scopedFootprintsFor = (storeyId: string): FootprintsDocument | null | undefined => {
-    let scoped = scopedFootprintsCache.get(storeyId);
-    if (scoped !== undefined) return scoped;
-    scoped = footprints
-      ? {
-          ...footprints,
-          walls: onThisStorey(footprints.walls, storeyId),
-          furniture: onThisStorey(footprints.furniture, storeyId),
-          openings: onThisStorey(footprints.openings, storeyId),
-        }
-      : footprints;
-    scopedFootprintsCache.set(storeyId, scoped);
-    return scoped;
-  };
-  const geometryCacheByStorey = new Map<
-    string,
-    Map<string, { obstacles: Point2D[][]; voids: Point2D[][] }>
-  >();
-  const geometryFor = (storeyId: string, region: NavmeshRegion) => {
-    let cache = geometryCacheByStorey.get(storeyId);
-    if (!cache) {
-      cache = new Map();
-      geometryCacheByStorey.set(storeyId, cache);
-    }
-    let g = cache.get(region.spaceId);
-    if (!g) {
-      g = regionGeometry(region, scopedFootprintsFor(storeyId));
-      cache.set(region.spaceId, g);
-    }
-    return g;
-  };
+  // Storey scoping for wall/furniture/opening lists is unused here now that
+  // same-storey edges are plain distance (see adjacency below) — kept out on
+  // purpose so Trapelo-scale furniture can't pull local A* into this pass.
 
   const nodesByRegion = new Map<string, MultiNode[]>();
   for (const node of nodes.values()) {
@@ -1580,16 +2044,17 @@ export function computeBuildingEvacuationLoad(
     for (const regionId of node.regions) {
       // node.storeyId === other.storeyId is guaranteed: space ids are
       // globally unique, so two nodes sharing a regionId share a storey.
-      const region = regionByIdPerStorey.get(node.storeyId)?.get(regionId);
       for (const other of nodesByRegion.get(regionId) ?? []) {
         if (other.id === node.id || linked.has(other.id)) continue;
         linked.add(other.id);
-        let cost = dist(node.point, other.point);
-        if (region) {
-          const { obstacles, voids } = geometryFor(node.storeyId, region);
-          cost = traversalCost(node.point, other.point, region, obstacles, voids);
-        }
-        out.push({ id: other.id, viaRegion: regionId, cost });
+        // Straight-line only — full local-A* door↔door weighing across the
+        // whole building is what made "Evacuation load" never finish on
+        // Trapelo-scale models. Heatmap ranking doesn't need that precision.
+        out.push({
+          id: other.id,
+          viaRegion: regionId,
+          cost: dist(node.point, other.point),
+        });
       }
     }
     adjacency.set(node.id, out);
@@ -1668,13 +2133,12 @@ export function computeBuildingEvacuationLoad(
         continue;
       }
 
-      const { obstacles, voids } = geometryFor(mesh.storeyId, region);
       let bestNodeId: string | null = null;
       let bestTotal = Infinity;
       for (const node of borderNodes) {
         const distToExit = gScore.get(node.id);
         if (distToExit == null) continue;
-        const total = traversalCost(start, node.point, region, obstacles, voids) + distToExit;
+        const total = dist(start, node.point) + distToExit;
         if (total < bestTotal) {
           bestTotal = total;
           bestNodeId = node.id;

@@ -50,6 +50,21 @@ function getWorker(): Worker | null {
     if (event.data.ok) entry.resolve(event.data.result);
     else entry.reject(new Error(event.data.error));
   };
+  // Without these, a failed worker module load (or crash) leaves every
+  // pending call hanging forever — FloorplanViewer's "Evacuation load
+  // computing…" spinner never clears.
+  const failAll = (reason: unknown) => {
+    const err = reason instanceof Error ? reason : new Error(String(reason));
+    for (const [, entry] of pending) entry.reject(err);
+    pending.clear();
+    worker = null;
+  };
+  worker.onerror = (event) => {
+    failAll(event.message || "navmesh worker error");
+  };
+  worker.onmessageerror = () => {
+    failAll("navmesh worker messageerror");
+  };
   return worker;
 }
 
