@@ -448,6 +448,130 @@ describe("navmesh", () => {
     assert.equal(third.found, true);
   });
 
+  it("bakes portal edge memos at build so a cloned mesh starts warm", () => {
+    // Two doors sharing rooms → door↔door edges to bake. Simulates the
+    // worker→main structured clone: WeakMap identity is lost, but
+    // portalEdgeMemos on the mesh must still seed a warm core.
+    const fp2: FootprintsDocument = {
+      schema_version: "1.0",
+      model_id: "t",
+      coordinate_system: "ifc_world_xy_metres",
+      storeys: [{ global_id: "S1", name: "L1", elevation: 0 }],
+      spaces: [
+        {
+          global_id: "Hall",
+          name: "Hall",
+          storey_global_id: "S1",
+          polygon: [
+            { x: 0, y: 0 },
+            { x: 10, y: 0 },
+            { x: 10, y: 2 },
+            { x: 0, y: 2 },
+          ],
+          incomplete: false,
+          method: "ifc_placement_bbox",
+        },
+        {
+          global_id: "Room",
+          name: "Room",
+          storey_global_id: "S1",
+          polygon: [
+            { x: 0, y: 2 },
+            { x: 10, y: 2 },
+            { x: 10, y: 6 },
+            { x: 0, y: 6 },
+          ],
+          incomplete: false,
+          method: "ifc_placement_bbox",
+        },
+      ],
+      doors: [
+        {
+          global_id: "W",
+          name: "W",
+          storey_global_id: "S1",
+          point: { x: 1, y: 2 },
+          segment: [
+            { x: 0.5, y: 2 },
+            { x: 1.5, y: 2 },
+          ],
+          incomplete: false,
+          method: "ifc_object_placement",
+        },
+        {
+          global_id: "E",
+          name: "E",
+          storey_global_id: "S1",
+          point: { x: 9, y: 2 },
+          segment: [
+            { x: 8.5, y: 2 },
+            { x: 9.5, y: 2 },
+          ],
+          incomplete: false,
+          method: "ifc_object_placement",
+        },
+      ],
+    };
+    const g2: ConnectivityGraph = {
+      schema_version: "1.0",
+      model_id: "t",
+      variant: "geometry",
+      nodes: [
+        { id: "space:Hall", kind: "space", global_id: "Hall", name: "Hall", storey_global_id: "S1" },
+        { id: "space:Room", kind: "space", global_id: "Room", name: "Room", storey_global_id: "S1" },
+        { id: "door:W", kind: "door", global_id: "W", name: "W", storey_global_id: "S1" },
+        { id: "door:E", kind: "door", global_id: "E", name: "E", storey_global_id: "S1" },
+      ],
+      edges: [
+        {
+          id: "sd:H:W",
+          kind: "space_door",
+          source: "space:Hall",
+          target: "door:W",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+        {
+          id: "sd:R:W",
+          kind: "space_door",
+          source: "space:Room",
+          target: "door:W",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+        {
+          id: "sd:H:E",
+          kind: "space_door",
+          source: "space:Hall",
+          target: "door:E",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+        {
+          id: "sd:R:E",
+          kind: "space_door",
+          source: "space:Room",
+          target: "door:E",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+      ],
+    };
+    const warmMesh = buildStoreyNavmesh(fp2, g2, "S1", { warmPortalCosts: true });
+    assert.ok(
+      (warmMesh.portalEdgeMemos?.length ?? 0) > 0,
+      "expected baked door↔door memos on a multi-door storey",
+    );
+    const cloned = structuredClone(warmMesh);
+    const path = findNavmeshPath(
+      cloned,
+      { x: 1, y: 1 },
+      { x: 9, y: 1 },
+      fp2,
+    );
+    assert.equal(path.found, true);
+  });
+
   describe("exit portals", () => {
     const footprintsWithExit: FootprintsDocument = {
       ...footprints,

@@ -263,6 +263,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     setBlockedPortalIds,
     allStoreyNavmeshes,
     clearNavmeshRoute,
+    navmeshBusy,
   } = useNavmeshRouting({
     footprintsId,
     footprintsDocument,
@@ -1058,6 +1059,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
           endStoreyId: null,
           points: null,
           segments: null,
+          graphNodeIds: null,
         });
         return;
       }
@@ -1071,6 +1073,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
           endStoreyId: null,
           points: null,
           segments: null,
+          graphNodeIds: null,
         });
         return;
       }
@@ -1084,6 +1087,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
         endStoreyId: pick.storeyId,
         points: null,
         segments: null,
+        graphNodeIds: null,
       });
     };
 
@@ -1461,6 +1465,11 @@ export function FloorplanViewer({ className }: { className?: string }) {
                 ) : null}
               </button>
               </>
+            ) : null}
+            {navmeshBusy ? (
+              <span className="text-[10px] text-muted-foreground">
+                Recalculating navmesh…
+              </span>
             ) : null}
           </div>
 

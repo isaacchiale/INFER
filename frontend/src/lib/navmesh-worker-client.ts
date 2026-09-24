@@ -17,10 +17,12 @@ import type {
   findMultiStoreyNavmeshPath,
   findNavmeshPath,
   findNearestExitPath,
+  warmStoreyNavmeshWalkCosts,
 } from "@/lib/navmesh";
 
 type Handlers = {
   buildAllStoreyNavmeshes: typeof buildAllStoreyNavmeshes;
+  warmStoreyNavmeshWalkCosts: typeof warmStoreyNavmeshWalkCosts;
   findNavmeshPath: typeof findNavmeshPath;
   findNearestExitPath: typeof findNearestExitPath;
   findMultiStoreyNavmeshPath: typeof findMultiStoreyNavmeshPath;
@@ -85,6 +87,10 @@ async function call<F extends FnName>(fn: F, args: Parameters<Handlers[F]>): Pro
 
 export const buildAllStoreyNavmeshesAsync = (...args: Parameters<typeof buildAllStoreyNavmeshes>) =>
   call("buildAllStoreyNavmeshes", args);
+
+export const warmStoreyNavmeshWalkCostsAsync = (
+  ...args: Parameters<typeof warmStoreyNavmeshWalkCosts>
+) => call("warmStoreyNavmeshWalkCosts", args);
 
 export const findNavmeshPathAsync = (...args: Parameters<typeof findNavmeshPath>) =>
   call("findNavmeshPath", args);

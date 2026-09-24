@@ -57,6 +57,21 @@ export type StoreyNavmesh = {
   storeyId: string;
   regions: NavmeshRegion[];
   portals: NavmeshPortal[];
+  /**
+   * Door↔door walk costs/paths baked at mesh build time so they survive a
+   * worker structured-clone (WeakMap memos on the worker thread do not).
+   * Seeded into the portal-core cache on first use on the main thread.
+   */
+  portalEdgeMemos?: PortalEdgeMemo[];
+};
+
+/** Serializable door↔door walk memo (one directed portal adjacency). */
+export type PortalEdgeMemo = {
+  fromId: string;
+  toId: string;
+  viaRegion: string;
+  cost: number;
+  path: Point2D[] | null;
 };
 
 function polygonCentroid(poly: Point2D[]): Point2D {
@@ -210,6 +225,13 @@ export function buildStoreyNavmesh(
     doorById?: Map<string, DoorPortal>;
     edgeById?: Map<string, GraphEdge>;
     edgesByPair?: Map<string, GraphEdge[]>;
+    /**
+     * When true, precompute door↔door walk costs into
+     * {@link StoreyNavmesh.portalEdgeMemos} before returning. Used by the
+     * full-building / dirty-storey builders so click routing starts warm.
+     * Off by default for cheap display-only meshes (floorplan overlay).
+     */
+    warmPortalCosts?: boolean;
   } = {},
 ): StoreyNavmesh {
   const excludedNodes = opts.excludedNodeIds ?? new Set<string>();
@@ -344,7 +366,11 @@ export function buildStoreyNavmesh(
     });
   }
 
-  return { storeyId, regions, portals };
+  const mesh: StoreyNavmesh = { storeyId, regions, portals };
+  if (opts.warmPortalCosts) {
+    bakePortalEdgeMemos(mesh, footprints);
+  }
+  return mesh;
 }
 
 /** Every storey that has walkable regions (for stacked 3D display). */
@@ -380,6 +406,9 @@ export function buildAllStoreyNavmeshes(
     .map((id) =>
       buildStoreyNavmesh(footprints, graph, id, {
         ...opts,
+        // Walk costs warm asynchronously after build (see useNavmeshRouting) —
+        // baking here inside the worker froze Trapelo-scale loads so meshes
+        // never arrived and click-to-click looked "broken".
         display,
         spaceById,
         doorById,
@@ -534,6 +563,8 @@ export function buildStoreyNavmeshesIncremental(
   const buildOpts = {
     ...(opts.excludedNodeIds ? { excludedNodeIds: opts.excludedNodeIds } : {}),
     ...(opts.excludedEdgeIds ? { excludedEdgeIds: opts.excludedEdgeIds } : {}),
+    // Same as buildAllStoreyNavmeshes: don't bake walk costs on the main
+    // thread during an exclusion patch — warm async afterward.
     display,
     spaceById,
     doorById,
@@ -620,74 +651,6 @@ type PortalGraph = {
   adjacency: Map<string, PortalAdj[]>;
 };
 
-const CLEAR_LINE_SAMPLES = 14;
-
-/** Obstacles for a region — memoized on the portal core so door pairs don't re-scan footprints. */
-function obstaclesForRegion(
-  core: PortalCoreCache,
-  region: NavmeshRegion,
-): Point2D[][] {
-  const hit = core.obstaclesByRegion.get(region.spaceId);
-  if (hit) return hit;
-  const space = spaceFootprintForRegion(core.footprints, region);
-  // Furniture only for portal-chord costing. Wall hulls are already baked into
-  // region polygons/holes; scanning every overlapping wall on each door pair
-  // was the main reason unedited routing felt slower than straight-line A*.
-  const obstacles =
-    space && core.footprints
-      ? furnitureOverlappingSpace(core.footprints, space)
-      : [];
-  core.obstaclesByRegion.set(region.spaceId, obstacles);
-  return obstacles;
-}
-
-/** True when the chord stays in the region and misses walls/furniture (no full A*). */
-function straightLineClear(
-  a: Point2D,
-  b: Point2D,
-  region: NavmeshRegion,
-  obstacles: Point2D[][],
-): boolean {
-  for (let i = 0; i <= CLEAR_LINE_SAMPLES; i++) {
-    const t = i / CLEAR_LINE_SAMPLES;
-    const x = a.x + (b.x - a.x) * t;
-    const y = a.y + (b.y - a.y) * t;
-    if (!pointInSpace(x, y, region.polygon, region.holes)) return false;
-  }
-  if (!obstacles.length) return true;
-  for (let i = 0; i <= CLEAR_LINE_SAMPLES; i++) {
-    const t = i / CLEAR_LINE_SAMPLES;
-    const x = a.x + (b.x - a.x) * t;
-    const y = a.y + (b.y - a.y) * t;
-    for (const obs of obstacles) {
-      if (obs.length >= 3 && pointInSpace(x, y, obs)) return false;
-    }
-  }
-  return true;
-}
-
-/**
- * Edge cost between two portal points that share a walkable region.
- *
- * Clear chords stay euclidean (pre-localWalk snappiness). Blocked chords get
- * a soft length penalty so A* prefers clear door sequences — without running
- * grid A* during neighbour expansion (that was the multi-second stall on
- * furnished Trapelo rooms). Stitch still {@link localWalk}s blocked hops for
- * geometry.
- */
-function resolveWalkEdge(
-  a: Point2D,
-  b: Point2D,
-  region: NavmeshRegion,
-  obstacles: Point2D[][],
-): { cost: number; path: Point2D[] } {
-  const d = dist(a, b);
-  if (!obstacles.length || straightLineClear(a, b, region, obstacles)) {
-    return { cost: d, path: [a, b] };
-  }
-  return { cost: d * 3, path: [] };
-}
-
 function blockedPortalKey(blocked?: ReadonlySet<string>): string {
   if (!blocked?.size) return "";
   return [...blocked].sort().join("\0");
@@ -698,8 +661,6 @@ type PortalCoreCache = {
   footprints: FootprintsDocument | null | undefined;
   blockedKey: string;
   regionById: Map<string, NavmeshRegion>;
-  /** Lazily filled per region — avoids re-scanning footprints on every door pair. */
-  obstaclesByRegion: Map<string, Point2D[][]>;
   /** Portal nodes only — no __start/__end. */
   graph: PortalGraph;
   /** True once every door↔door edge has a concrete cost. */
@@ -735,8 +696,9 @@ export function invalidatePortalEdgeCosts(
 }
 
 /**
- * Resolve (and memoize) a portal-graph edge cost. Clear chords are euclidean;
- * obstructed chords run localWalk once and cache length + polyline.
+ * Resolve (and memoize) a portal-graph edge cost as straight-line distance
+ * between the two doors. `path` stays null so the stitch draws the chosen
+ * legs with {@link localWalk} around furniture.
  */
 function resolvePortalEdgeCost(
   core: PortalCoreCache,
@@ -747,24 +709,17 @@ function resolvePortalEdgeCost(
   const from = core.graph.nodes.get(fromId);
   const to = core.graph.nodes.get(edge.id);
   const region = core.regionById.get(edge.viaRegion);
-  if (!from || !to || !region) {
-    edge.cost = Infinity;
-    edge.path = null;
-    return Infinity;
-  }
-  const obstacles = obstaclesForRegion(core, region);
-  const resolved = resolveWalkEdge(from.point, to.point, region, obstacles);
-  edge.cost = resolved.cost;
-  edge.path = resolved.path.length >= 2 ? resolved.path : null;
+  const cost = from && to && region ? dist(from.point, to.point) : Infinity;
+  edge.cost = cost;
+  edge.path = null;
   const rev = core.graph.adjacency
     .get(edge.id)
     ?.find((e) => e.id === fromId && e.viaRegion === edge.viaRegion);
   if (rev && rev.cost == null) {
-    rev.cost = resolved.cost;
-    rev.path =
-      resolved.path.length >= 2 ? [...resolved.path].reverse() : null;
+    rev.cost = cost;
+    rev.path = null;
   }
-  return resolved.cost;
+  return cost;
 }
 
 function warmPortalCore(core: PortalCoreCache): void {
@@ -778,18 +733,91 @@ function warmPortalCore(core: PortalCoreCache): void {
 }
 
 /**
- * Precompute door↔door walk weights for the given meshes. Optional — routing
- * resolves lazily. Full warm runs local A* for every portal pair and can hang
- * Trapelo-scale models on the main thread; prefer not to call it there.
+ * Run door↔door resolves and store them on the mesh as plain data so a worker
+ * structured-clone still delivers warm costs to the main thread (WeakMap
+ * memos on the worker die with the clone).
+ */
+function bakePortalEdgeMemos(
+  mesh: StoreyNavmesh,
+  footprints: FootprintsDocument,
+): void {
+  const core = getPortalCoreGraph(mesh, footprints);
+  warmPortalCore(core);
+  const memos: PortalEdgeMemo[] = [];
+  for (const [fromId, edges] of core.graph.adjacency) {
+    for (const edge of edges) {
+      if (edge.cost == null) continue;
+      memos.push({
+        fromId,
+        toId: edge.id,
+        viaRegion: edge.viaRegion,
+        cost: edge.cost,
+        path: edge.path
+          ? edge.path.map((p) => ({ x: p.x, y: p.y }))
+          : null,
+      });
+    }
+  }
+  mesh.portalEdgeMemos = memos;
+}
+
+/** Seed adjacency from {@link StoreyNavmesh.portalEdgeMemos}. Returns true if every edge got a cost. */
+function seedPortalEdgesFromMemos(
+  graph: PortalGraph,
+  memos: PortalEdgeMemo[] | undefined,
+): boolean {
+  if (!memos?.length) return false;
+  const byKey = new Map<string, PortalEdgeMemo>();
+  for (const m of memos) {
+    byKey.set(`${m.fromId}\0${m.toId}\0${m.viaRegion}`, m);
+  }
+  let complete = true;
+  for (const [fromId, edges] of graph.adjacency) {
+    for (const edge of edges) {
+      const m = byKey.get(`${fromId}\0${edge.id}\0${edge.viaRegion}`);
+      if (!m) {
+        complete = false;
+        continue;
+      }
+      edge.cost = m.cost;
+      edge.path = m.path;
+    }
+  }
+  return complete;
+}
+
+/**
+ * Precompute door↔door walk weights into each mesh's
+ * {@link StoreyNavmesh.portalEdgeMemos} (and the live WeakMap cache).
+ * Prefer calling this off the main thread after {@link buildAllStoreyNavmeshes}
+ * returns — baking inside the build itself hung Trapelo-scale worker loads.
  */
 export function warmPortalCoreGraphs(
   meshes: readonly StoreyNavmesh[],
   footprints: FootprintsDocument | null | undefined,
   blockedPortalIds?: ReadonlySet<string>,
 ): void {
+  if (!footprints) return;
   for (const mesh of meshes) {
+    if (!blockedPortalIds?.size) {
+      bakePortalEdgeMemos(mesh, footprints);
+      continue;
+    }
     warmPortalCore(getPortalCoreGraph(mesh, footprints, blockedPortalIds));
   }
+}
+
+/**
+ * Worker-friendly warm: bake walk memos onto `meshes` and return them so the
+ * structured-clone hop delivers {@link StoreyNavmesh.portalEdgeMemos} to the
+ * main thread. Same meshes mutated in place when run inline.
+ */
+export function warmStoreyNavmeshWalkCosts(
+  meshes: StoreyNavmesh[],
+  footprints: FootprintsDocument,
+): StoreyNavmesh[] {
+  warmPortalCoreGraphs(meshes, footprints);
+  return meshes;
 }
 
 /** Build portal nodes + unloaded adjacency for a storey (no walk costs yet). */
@@ -895,7 +923,6 @@ function adoptPortalCoreForBlockedChange(
     footprints: prev.footprints,
     blockedKey,
     regionById,
-    obstaclesByRegion: prev.obstaclesByRegion,
     graph,
     warmed: false,
   };
@@ -904,8 +931,9 @@ function adoptPortalCoreForBlockedChange(
 }
 
 /**
- * Door↔door portal graph adjacency. Edge costs start null and are filled
- * lazily on first resolve (or by {@link warmPortalCoreGraphs}).
+ * Door↔door portal graph adjacency. Edge costs come from
+ * {@link StoreyNavmesh.portalEdgeMemos} when the mesh was baked at build
+ * time (worker-safe); otherwise they fill lazily on first resolve.
  *
  * Cache key is mesh identity + blocked set — not the footprints object
  * reference. React often hands a new footprints wrapper for the same model;
@@ -926,14 +954,16 @@ function getPortalCoreGraph(
   }
 
   const { regionById, graph } = buildPortalCoreAdjacency(mesh, blockedPortalIds);
+  const warmed =
+    !blockedPortalIds?.size &&
+    seedPortalEdgesFromMemos(graph, mesh.portalEdgeMemos);
   const entry: PortalCoreCache = {
     mesh,
     footprints,
     blockedKey,
     regionById,
-    obstaclesByRegion: new Map(),
     graph,
-    warmed: false,
+    warmed,
   };
   portalCoreCacheByMesh.set(mesh, entry);
   return entry;
@@ -945,8 +975,8 @@ function getPortalCoreGraph(
  *
  * Terminal↔portal edges use plain euclidean distance — pins move every click,
  * so walk-weighting them would re-run local A* against every door in the room
- * on each pick (not snappy). Door↔door weights stay lazy walk lengths on the
- * shared core; stitch still localWalks the chosen pin→door segments.
+ * on each pick (not snappy). Door↔door weights are straight-line too; stitch
+ * localWalks the chosen segments.
  */
 function withPortalTerminals(
   core: PortalCoreCache,

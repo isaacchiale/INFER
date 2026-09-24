@@ -87,21 +87,20 @@ export type DisplayGraph = {
 };
 
 /**
- * Hide door nodes for readability; collapse space–door–space into direct viz edges.
- * Keep stairs/lifts as portal nodes.
+ * Hide door nodes for readability; replace each space–door–space bridge with
+ * a direct viz edge. Multiple doors between the same room pair stay as
+ * separate edges (drawn as parallel links in the graph viewer / separate
+ * navmesh portals) — rooms can genuinely have more than one door between them.
  */
 export function toDisplayGraph(graph: ConnectivityGraph): DisplayGraph {
   const nodes = graph.nodes.filter((n) => n.kind === "space" || n.kind === "stair" || n.kind === "lift");
   const visible = new Set(nodes.map((n) => n.id));
   const edges: DisplayGraph["edges"] = [];
-  const seen = new Set<string>();
+  const seenIds = new Set<string>();
 
   const pushEdge = (edge: DisplayGraph["edges"][number]) => {
-    const a = edge.source < edge.target ? edge.source : edge.target;
-    const b = edge.source < edge.target ? edge.target : edge.source;
-    const key = `${edge.kind}:${a}|${b}`;
-    if (seen.has(key)) return;
-    seen.add(key);
+    if (seenIds.has(edge.id)) return;
+    seenIds.add(edge.id);
     edges.push(edge);
   };
 
@@ -146,10 +145,13 @@ export function toDisplayGraph(graph: ConnectivityGraph): DisplayGraph {
         const a = spaces[i];
         const b = spaces[j];
         if (!a || !b) continue;
-        // Yellow if either door↔space side was geometry-healed (partial IFC top-up too).
+        // Door heal channel if either door↔space side was geometry-healed.
         const inferred = Boolean(flags?.get(a) || flags?.get(b));
+        // Stable endpoint order in the id so A–B and B–A don't fork two ids.
+        const lo = a < b ? a : b;
+        const hi = a < b ? b : a;
         pushEdge({
-          id: `viz-door:${doorId}:${a}:${b}`,
+          id: `viz-door:${doorId}:${lo}:${hi}`,
           kind: "space_door",
           source: a,
           target: b,

@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { buildAllStoreyNavmeshesAsync } from "@/lib/navmesh-worker-client";
+import {
+  buildAllStoreyNavmeshesAsync,
+  warmStoreyNavmeshWalkCostsAsync,
+} from "@/lib/navmesh-worker-client";
 import {
   buildStoreyNavmeshesIncremental,
   findMultiStoreyNavmeshPath,
@@ -23,12 +26,13 @@ import type { NavmeshRoute } from "@/state/infer-store";
  * returned/passed here.
  *
  * Initial / full-building mesh builds run in a Web Worker so Trapelo-scale
- * loads don't freeze the tab. Exclusion toggles use
+ * loads don't freeze the tab. Door?door walk costs warm in a second worker
+ * pass after meshes are already usable (baking inside the build hung the
+ * worker so navigation never came back). Exclusion toggles use
  * {@link buildStoreyNavmeshesIncremental} on the main thread (usually one
- * dirty storey). Path searches run sync on the main thread against the
- * stable mesh objects in React state so the WeakMap portal-core cache
- * actually hits across clicks (a worker structured-clone would miss every
- * time). Building-wide evacuation load stays on the worker.
+ * dirty storey), then warm those dirty meshes off-thread. Path searches run
+ * sync on the main thread against the stable mesh objects in React state so
+ * the WeakMap portal-core cache actually hits across clicks.
  */
 export function useNavmeshRouting({
   footprintsId,
@@ -52,6 +56,8 @@ export function useNavmeshRouting({
   const [isExitRoute, setIsExitRoute] = useState(false);
   /** Hazard/what-if: portals excluded from routing without removing them from the graph. */
   const [blockedPortalIds, setBlockedPortalIds] = useState<Set<string>>(() => new Set());
+  /** Mesh build and/or door?door cost warm in flight ? drives the floorplan chip. */
+  const [navmeshBusy, setNavmeshBusy] = useState(false);
 
   // Every storey's mesh ? needed once the end pin can land on a different
   // floor than the start (stairs/lifts bridge them via findMultiStoreyNavmeshPath).
@@ -63,11 +69,14 @@ export function useNavmeshRouting({
     excludedEdges: ReadonlySet<string>;
     meshes: StoreyNavmesh[];
   } | null>(null);
+  /** Bumps on each effect run so stale warm results don't overwrite newer meshes. */
+  const buildGenRef = useRef(0);
 
   useEffect(() => {
     if (!footprintsDocument || !connectivityGraph) {
       navmeshCacheRef.current = null;
       setAllStoreyNavmeshes([]);
+      setNavmeshBusy(false);
       return;
     }
 
@@ -85,7 +94,8 @@ export function useNavmeshRouting({
           excludedEdgeIds,
         );
 
-    // Exclusion-only: patch dirty storeys on the main thread (cheap).
+    // Exclusion-only: patch dirty storeys on the main thread (cheap geometry),
+    // then warm walk costs for those storeys off-thread.
     if (dirty !== "all" && prev) {
       if (dirty.size === 0) {
         navmeshCacheRef.current = {
@@ -97,6 +107,8 @@ export function useNavmeshRouting({
         };
         return;
       }
+      const gen = ++buildGenRef.current;
+      setNavmeshBusy(true);
       const meshes = buildStoreyNavmeshesIncremental(
         prev.meshes,
         footprintsDocument,
@@ -115,25 +127,74 @@ export function useNavmeshRouting({
         meshes,
       };
       setAllStoreyNavmeshes(meshes);
+
+      const dirtyMeshes = meshes.filter((m) => dirty.has(m.storeyId));
+      void warmStoreyNavmeshWalkCostsAsync(dirtyMeshes, footprintsDocument)
+        .then((warmedDirty) => {
+          if (gen !== buildGenRef.current) return;
+          const byId = new Map(warmedDirty.map((m) => [m.storeyId, m]));
+          const next = meshes.map((m) => byId.get(m.storeyId) ?? m);
+          navmeshCacheRef.current = {
+            footprints: footprintsDocument,
+            graph: connectivityGraph,
+            excludedNodes: excludedNodeIds,
+            excludedEdges: excludedEdgeIds,
+            meshes: next,
+          };
+          setAllStoreyNavmeshes(next);
+        })
+        .catch(() => {
+          /* keep unwarmed meshes ? routing still works via lazy resolve */
+        })
+        .finally(() => {
+          if (gen === buildGenRef.current) setNavmeshBusy(false);
+        });
       return;
     }
 
     // Full rebuild (model load / graph identity change) ? off the main thread.
+    const gen = ++buildGenRef.current;
     let cancelled = false;
+    setNavmeshBusy(true);
     void buildAllStoreyNavmeshesAsync(footprintsDocument, connectivityGraph, {
       excludedNodeIds,
       excludedEdgeIds,
-    }).then((meshes) => {
-      if (cancelled) return;
-      navmeshCacheRef.current = {
-        footprints: footprintsDocument,
-        graph: connectivityGraph,
-        excludedNodes: excludedNodeIds,
-        excludedEdges: excludedEdgeIds,
-        meshes,
-      };
-      setAllStoreyNavmeshes(meshes);
-    });
+    })
+      .then(async (meshes) => {
+        if (cancelled || gen !== buildGenRef.current) return;
+        navmeshCacheRef.current = {
+          footprints: footprintsDocument,
+          graph: connectivityGraph,
+          excludedNodes: excludedNodeIds,
+          excludedEdges: excludedEdgeIds,
+          meshes,
+        };
+        // Publish meshes immediately so click-to-click works; warm costs next.
+        setAllStoreyNavmeshes(meshes);
+        try {
+          const warmed = await warmStoreyNavmeshWalkCostsAsync(
+            meshes,
+            footprintsDocument,
+          );
+          if (cancelled || gen !== buildGenRef.current) return;
+          navmeshCacheRef.current = {
+            footprints: footprintsDocument,
+            graph: connectivityGraph,
+            excludedNodes: excludedNodeIds,
+            excludedEdges: excludedEdgeIds,
+            meshes: warmed,
+          };
+          setAllStoreyNavmeshes(warmed);
+        } catch {
+          /* keep unwarmed ? lazy resolve still routes */
+        }
+      })
+      .catch(() => {
+        /* leave previous meshes if any */
+      })
+      .finally(() => {
+        if (!cancelled && gen === buildGenRef.current) setNavmeshBusy(false);
+      });
     return () => {
       cancelled = true;
     };
@@ -214,7 +275,9 @@ export function useNavmeshRouting({
     const startMesh = allStoreyNavmeshes.find((m) => m.storeyId === navmeshRoute.storeyId);
     const endMesh = allStoreyNavmeshes.find((m) => m.storeyId === navmeshRoute.endStoreyId);
     if (!startMesh || !endMesh) {
-      setNavmeshPathNote("Storey mesh unavailable");
+      setNavmeshPathNote(
+        navmeshBusy ? "Recalculating navmesh?" : "Storey mesh unavailable",
+      );
       return;
     }
 
@@ -299,6 +362,7 @@ export function useNavmeshRouting({
     connectivityGraph,
     footprintsDocument,
     isExitRoute,
+    navmeshBusy,
     navmeshRoute?.storeyId,
     navmeshRoute?.endStoreyId,
     navmeshRoute?.start.x,
@@ -334,5 +398,6 @@ export function useNavmeshRouting({
     setBlockedPortalIds,
     allStoreyNavmeshes,
     clearNavmeshRoute,
+    navmeshBusy,
   };
 }

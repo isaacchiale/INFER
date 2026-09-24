@@ -25,6 +25,7 @@ import type {
 } from "@thatopen/components";
 import type { FragmentsModel } from "@thatopen/fragments";
 import type { ExportableGeometrySource } from "@/lib/live-scene-export";
+import { LEGEND } from "@/lib/legend-colors";
 
 export type ViewerStatusKind = "info" | "error" | "loading";
 
@@ -42,7 +43,7 @@ export type NavmeshThreeRegion = {
 
 export type NavmeshThreePortal = {
   id: string;
-  kind: "door" | "space";
+  kind: "door" | "space" | "exit";
   /** Door: false = IFC, true = geometry heal. */
   inferred?: boolean;
   point: { x: number; y: number; z: number };
@@ -404,7 +405,7 @@ export async function createThatOpenRuntime(
       false,
     );
     const material = new THREE.MeshBasicMaterial({
-      color: 0x3b82f6,
+      color: parseInt(LEGEND.route.replace("#", ""), 16),
       transparent: true,
       opacity: 0.85,
       depthWrite: false,
@@ -732,12 +733,15 @@ export async function createThatOpenRuntime(
     }
 
     for (const portal of data.portals) {
-      const color =
-        portal.kind === "space"
-          ? 0x22c55e
-          : portal.inferred
-            ? 0xeab308
-            : 0xf97316;
+      const hex =
+        portal.kind === "exit"
+          ? LEGEND.exit
+          : portal.kind === "space"
+            ? LEGEND.spaceHeal
+            : portal.inferred
+              ? LEGEND.doorHeal
+              : LEGEND.ifcDoor;
+      const color = parseInt(hex.replace("#", ""), 16);
       const marker = new THREE.Mesh(
         new THREE.SphereGeometry(0.25, 12, 10),
         new THREE.MeshBasicMaterial({ color }),

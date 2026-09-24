@@ -551,7 +551,7 @@ function InferModelViewportImpl({
     }> = [];
     const portals: Array<{
       id: string;
-      kind: "door" | "space";
+      kind: "door" | "space" | "exit";
       inferred?: boolean;
       point: { x: number; y: number; z: number };
     }> = [];
@@ -569,10 +569,7 @@ function InferModelViewportImpl({
         if (!point) continue;
         portals.push({
           id: `${mesh.storeyId}:${p.id}`,
-          // The 3D overlay (that-open-runtime.ts) only distinguishes door vs
-          // space portals; render exit portals as doors there rather than
-          // touching that renderer's portal-kind type.
-          kind: p.kind === "exit" ? "door" : p.kind,
+          kind: p.kind,
           inferred: p.inferred,
           point,
         });

@@ -19,10 +19,12 @@ import {
   findMultiStoreyNavmeshPath,
   findNavmeshPath,
   findNearestExitPath,
+  warmStoreyNavmeshWalkCosts,
 } from "@/lib/navmesh";
 
 const handlers = {
   buildAllStoreyNavmeshes,
+  warmStoreyNavmeshWalkCosts,
   findNavmeshPath,
   findNearestExitPath,
   findMultiStoreyNavmeshPath,

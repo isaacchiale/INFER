@@ -32,6 +32,12 @@ export type NavmeshRoute = {
   points: Point2D[] | null;
   /** Set when the pins are on different storeys and a path was found — one entry per storey it crosses. */
   segments: { storeyId: string; points: Point2D[] }[] | null;
+  /**
+   * Ordered graph node ids (`space:` / `stair:` / `lift:`) for the hops this
+   * route crosses — Graph Viewer highlights them with the route ring.
+   * Null when no path (or only a start pin).
+   */
+  graphNodeIds: string[] | null;
 };
 
 /**
