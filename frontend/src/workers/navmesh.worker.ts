@@ -21,9 +21,11 @@ import {
   findNearestExitPath,
   warmStoreyNavmeshWalkCosts,
 } from "@/lib/navmesh";
+import { buildStoreyGrids } from "@/lib/storey-grid";
 
 const handlers = {
   buildAllStoreyNavmeshes,
+  buildStoreyGrids,
   warmStoreyNavmeshWalkCosts,
   findNavmeshPath,
   findNearestExitPath,

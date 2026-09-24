@@ -85,7 +85,7 @@ export type FurnitureFootprint = {
   storey_global_id: string | null;
   polygon: Point2D[];
   incomplete: boolean;
-  method: "ifc_mesh_xy_hull" | "ifc_placement_bbox" | "unavailable";
+  method: "ifc_mesh_xy_outline" | "ifc_mesh_xy_hull" | "ifc_placement_bbox" | "unavailable";
 };
 
 export type FootprintsDocument = {

@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
+import { Inspector } from "@/components/panels/Inspector";
 import { InferProvider } from "@/state/infer-store";
 import { TopBar } from "./TopBar";
 import { IngestDialog } from "@/components/ingest/IngestDialog";
@@ -16,7 +17,9 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
         </div>
         <IngestDialog />
-        <Toaster position="bottom-right" />
+        {/* Selection card — screen-level like toasts, not tied to the 3D pane. */}
+        <Inspector />
+        <Toaster position="bottom-right" offset="16px" />
       </TooltipProvider>
     </InferProvider>
   );

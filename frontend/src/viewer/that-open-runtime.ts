@@ -1055,6 +1055,9 @@ export async function createThatOpenRuntime(
   const keys = new Set<string>();
   let raf = 0;
   let lastT = 0;
+  /** Fly WASD/Space/Shift only while the pointer is over this pane — otherwise
+   * Shift held for floorplan rotate (Shift+scroll) also descends the 3D camera. */
+  let pointerInside = false;
 
   const isTypingTarget = (el: EventTarget | null) => {
     if (!(el instanceof HTMLElement)) return false;
@@ -1062,8 +1065,16 @@ export async function createThatOpenRuntime(
     return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
   };
 
+  const onPointerEnter = () => {
+    pointerInside = true;
+  };
+  const onPointerLeave = () => {
+    pointerInside = false;
+    keys.clear();
+  };
+
   const onKeyDown = (e: KeyboardEvent) => {
-    if (navMode !== "fly" || isTypingTarget(e.target)) return;
+    if (navMode !== "fly" || !pointerInside || isTypingTarget(e.target)) return;
     const k = e.code;
     if (
       k === "KeyW" ||
@@ -1132,6 +1143,8 @@ export async function createThatOpenRuntime(
 
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
+  container.addEventListener("pointerenter", onPointerEnter);
+  container.addEventListener("pointerleave", onPointerLeave);
 
   const clear = async () => {
     clearRouteTubeMeshes();
@@ -1334,6 +1347,8 @@ export async function createThatOpenRuntime(
       evacuationGlowTextures.square.dispose();
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      container.removeEventListener("pointerenter", onPointerEnter);
+      container.removeEventListener("pointerleave", onPointerLeave);
       window.removeEventListener("resize", resize);
       ro.disconnect();
       try {

@@ -1,7 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { InferModelViewport } from "@/components/viewer/InferModelViewport";
 import { FootprintModelViewport } from "@/components/viewer/FootprintModelViewport";
-import { Inspector } from "@/components/panels/Inspector";
 import { SplitWorkspace } from "@/components/workspace/SplitWorkspace";
 import { useModelData, useViewport } from "@/state/infer-store";
 
@@ -32,16 +31,12 @@ function WorkspaceScreen() {
       <SplitWorkspace
         modelPane={
           sourceFormat === "indoorgml" ? (
-            <FootprintModelViewport>
-              <Inspector />
-            </FootprintModelViewport>
+            <FootprintModelViewport />
           ) : (
             <InferModelViewport
               modelId={backendModelId ?? "model"}
               selectedElementIds={selectedElementIds}
-            >
-              <Inspector />
-            </InferModelViewport>
+            />
           )
         }
       />

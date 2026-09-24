@@ -1627,7 +1627,7 @@ const VERTICAL_HOP_FALLBACK_COST = 4;
  * make the whole thing O(pairs × storeys) instead of just O(pairs) on a
  * building with many storeys.
  */
-function storeyElevationLookup(
+export function storeyElevationLookup(
   footprints: FootprintsDocument | null | undefined,
 ): ReadonlyMap<string, number> {
   const map = new Map<string, number>();
@@ -1637,7 +1637,7 @@ function storeyElevationLookup(
   return map;
 }
 
-function verticalHopCost(
+export function verticalHopCost(
   storeyElevationByGlobalId: ReadonlyMap<string, number>,
   storeyA: string,
   storeyB: string,

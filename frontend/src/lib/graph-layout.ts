@@ -1,5 +1,6 @@
 import type { EntitiesExtract } from "@/api/models";
 import type { ConnectivityGraph, GraphEdge, GraphNode, StoreyBand } from "@/types/graph";
+import { LEGEND } from "@/lib/legend-colors";
 
 /** Minimum center-to-center gap in layout units (prevents overlap after framing). */
 export const LAYOUT_NODE_W = 72;
@@ -20,9 +21,12 @@ export function healKindForEdge(
   method: GraphEdge["method"],
   kind: GraphEdge["kind"],
   inferred: boolean,
-): "door" | "space" | "stair" | undefined {
+): "ifc" | "door" | "space" | "stair" | undefined {
+  // Authored IFC door links (and collapsed viz-door from IFC) → orange channel.
+  if (kind === "space_door" || method === "geom_door_space") {
+    return inferred || method === "geom_door_space" ? "door" : "ifc";
+  }
   if (!inferred) return undefined;
-  if (method === "geom_door_space" || kind === "space_door") return "door";
   if (method === "geom_stair_space" || kind === "vertical") return "stair";
   if (
     method === "geom_opening_space" ||
@@ -170,11 +174,11 @@ export function toDisplayGraph(graph: ConnectivityGraph): DisplayGraph {
 /**
  * Map soft-disabled display edges to real graph edge ids for routing.
  *
- * The viewer collapses door↔space↔door into synthetic `viz-door:…` edges and
- * may show only one line when several mechanisms connect the same pair. Blocking
- * those display ids alone does nothing on the backend — expand to:
+ * The viewer collapses each door↔space↔door into a synthetic `viz-door:…`
+ * edge (one per door). Blocking a display id expands to:
  * - every direct graph edge between the display endpoints
- * - both legs of every door that links those two spaces
+ * - both legs of that door (and any other door bridging the same pair when
+ *   the blocked id is a pair-level space_space edge)
  */
 const pairKey = (a: string, b: string): string => (a < b ? `${a}|${b}` : `${b}|${a}`);
 
@@ -288,7 +292,7 @@ export type LayoutEdge = {
   vertical: boolean;
   inferred?: boolean;
   /** Heal colour channel: door=yellow, space=green, stair=purple. */
-  heal?: "door" | "space" | "stair";
+  heal?: "ifc" | "door" | "space" | "stair";
   /** Soft-removed (right-click): drawn dashed, ignored by routing. */
   excluded?: boolean;
 };
@@ -878,14 +882,12 @@ export function buildGraphLayout(
 
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const edges: LayoutEdge[] = [];
-  const seen = new Set<string>();
+  const seenEdgeIds = new Set<string>();
   for (const edge of display.edges) {
     if (excludedIds.has(edge.source) || excludedIds.has(edge.target)) continue;
     if (!byId.has(edge.source) || !byId.has(edge.target)) continue;
-    const key = `${edge.source}|${edge.target}`;
-    const rev = `${edge.target}|${edge.source}`;
-    if (seen.has(key) || seen.has(rev)) continue;
-    seen.add(key);
+    if (seenEdgeIds.has(edge.id)) continue;
+    seenEdgeIds.add(edge.id);
     const inferred =
       Boolean(edge.inferred) || edge.method !== "ifc_rel_space_boundary";
     const heal = healKindForEdge(edge.method, edge.kind, inferred);
@@ -928,8 +930,16 @@ export type GraphThemePalette = {
   vertical: string;
   verticalOpacity: number;
   path: string;
-  pathNode: string;
+  /** Blue hop ring (underlay) — not a fill. */
   pathUnderlay: string;
+  /** Selected node fill (sky). */
+  selectedFill: string;
+  selectedLabel: string;
+  ifcDoor: string;
+  doorHeal: string;
+  spaceHeal: string;
+  stairHeal: string;
+  disabled: string;
 };
 
 export function graphPalette(theme: "light" | "dark"): GraphThemePalette {
@@ -940,16 +950,22 @@ export function graphPalette(theme: "light" | "dark"): GraphThemePalette {
       spaceFill: "#2D3748",
       spaceLabel: "#E2E8F0",
       spaceBorder: "#475569",
-      portalFill: "#7C2D12",
-      portalLabel: "#FFEDD5",
-      portalBorder: "#9A3412",
+      portalFill: "#4C1D95",
+      portalLabel: "#EDE9FE",
+      portalBorder: LEGEND.stair,
       edge: "#64748B",
       edgeOpacity: 0.9,
-      vertical: "#F59E0B",
+      vertical: LEGEND.stair,
       verticalOpacity: 0.55,
-      path: "#3B82F6",
-      pathNode: "#60A5FA",
-      pathUnderlay: "#60A5FA",
+      path: LEGEND.routeSoft,
+      pathUnderlay: LEGEND.routeSoft,
+      selectedFill: LEGEND.selected,
+      selectedLabel: "#0C4A6E",
+      ifcDoor: LEGEND.ifcDoor,
+      doorHeal: LEGEND.doorHeal,
+      spaceHeal: LEGEND.spaceHeal,
+      stairHeal: LEGEND.stair,
+      disabled: LEGEND.disabled,
     };
   }
   return {
@@ -958,16 +974,22 @@ export function graphPalette(theme: "light" | "dark"): GraphThemePalette {
     spaceFill: "#E2E8F0",
     spaceLabel: "#1E293B",
     spaceBorder: "#CBD5E1",
-    portalFill: "#FFEDD5",
-    portalLabel: "#9A3412",
-    portalBorder: "#FDBA74",
+    portalFill: "#EDE9FE",
+    portalLabel: "#5B21B6",
+    portalBorder: LEGEND.stair,
     edge: "#94A3B8",
     edgeOpacity: 0.95,
-    vertical: "#F97316",
+    vertical: LEGEND.stair,
     verticalOpacity: 0.55,
-    path: "#1D4ED8",
-    pathNode: "#2563EB",
-    pathUnderlay: "#2563EB",
+    path: LEGEND.route,
+    pathUnderlay: LEGEND.route,
+    selectedFill: LEGEND.selectedFill,
+    selectedLabel: "#0C4A6E",
+    ifcDoor: LEGEND.ifcDoor,
+    doorHeal: LEGEND.doorHeal,
+    spaceHeal: LEGEND.spaceHeal,
+    stairHeal: LEGEND.stair,
+    disabled: LEGEND.disabled,
   };
 }
 

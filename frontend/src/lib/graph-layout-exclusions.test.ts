@@ -156,4 +156,63 @@ describe("blockedEdgeIdsFromExclusions", () => {
     assert.equal(blocked.has("space_door:B:D2:geom"), false);
     assert.equal(blocked.has("space_door:C:D2:geom"), false);
   });
+
+  it("emits a separate viz-door edge for every door between the same rooms", () => {
+    const g = graph({
+      nodes: [
+        { id: "space:A", kind: "space", global_id: "A", name: "A", storey_global_id: "S1" },
+        { id: "space:B", kind: "space", global_id: "B", name: "B", storey_global_id: "S1" },
+        { id: "door:D1", kind: "door", global_id: "D1", name: "D1", storey_global_id: "S1" },
+        { id: "door:D2", kind: "door", global_id: "D2", name: "D2", storey_global_id: "S1" },
+      ],
+      edges: [
+        {
+          id: "space_door:A:D1",
+          kind: "space_door",
+          source: "space:A",
+          target: "door:D1",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+        {
+          id: "space_door:B:D1",
+          kind: "space_door",
+          source: "space:B",
+          target: "door:D1",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+        {
+          id: "space_door:A:D2",
+          kind: "space_door",
+          source: "space:A",
+          target: "door:D2",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+        {
+          id: "space_door:B:D2",
+          kind: "space_door",
+          source: "space:B",
+          target: "door:D2",
+          method: "ifc_rel_space_boundary",
+          inferred: false,
+        },
+      ],
+    });
+
+    const display = toDisplayGraph(g);
+    const abDoors = display.edges.filter(
+      (e) =>
+        e.id.startsWith("viz-door:") &&
+        ((e.source === "space:A" && e.target === "space:B") ||
+          (e.source === "space:B" && e.target === "space:A")),
+    );
+    assert.equal(abDoors.length, 2);
+    const ids = abDoors.map((e) => e.id).sort();
+    assert.deepEqual(ids, [
+      "viz-door:door:D1:space:A:space:B",
+      "viz-door:door:D2:space:A:space:B",
+    ]);
+  });
 });

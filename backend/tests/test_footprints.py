@@ -187,10 +187,10 @@ def test_footprints_placement_bbox_happy_path(tmp_path):
 
 
 def test_footprints_furniture_placement_bbox_and_tiny_items_dropped(tmp_path, monkeypatch):
-    """IfcFurnishingElement/IfcFurniture extract via the same bbox waterfall as
-    walls; a placement with no OverallWidth/OverallDepth defaults to a 1x1 m
-    box (well above the drop threshold) while an explicit sub-threshold hull
-    (via a degenerate mesh) is dropped rather than kept."""
+    """IfcFurnishingElement/IfcFurniture keep the mesh-hull path, but the
+    placement-bbox fallback requires real OverallWidth+OverallDepth (no
+    invented 1×1 m square). Undimensioned IFC4 furnishings and sub-threshold
+    hulls are dropped."""
     ifc_path = tmp_path / "furniture.ifc"
     f = ifcopenshell.file(schema="IFC4")
     project = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="T")
@@ -232,33 +232,90 @@ def test_footprints_furniture_placement_bbox_and_tiny_items_dropped(tmp_path, mo
 
     f.write(str(ifc_path))
 
+    # IfcFurnishingElement has no OverallWidth/Depth → skipped (avoids fake 1×1).
     doc = footprints_service.build_footprints("test-furniture", str(ifc_path))
-    assert len(doc.furniture) == 2
-    by_name = {ff.name: ff for ff in doc.furniture}
+    assert doc.furniture == []
 
-    desk_fp = by_name["Desk"]
-    assert desk_fp.incomplete is False
-    assert desk_fp.method == "ifc_placement_bbox"
-    xs = [p.x for p in desk_fp.polygon]
-    ys = [p.y for p in desk_fp.polygon]
+    # Pretend the desk has a 1×1 m plan size → kept via placement bbox.
+    monkeypatch.setattr(
+        footprints_service, "_furniture_plan_size_m", lambda element: (1.0, 1.0)
+    )
+    kept = footprints_service._furniture_footprint({}, f, desk, [])
+    assert kept is not None
+    assert kept.method == "ifc_placement_bbox"
+    xs = [p.x for p in kept.polygon]
+    ys = [p.y for p in kept.polygon]
     assert min(xs) == pytest.approx(3.5)
     assert max(xs) == pytest.approx(4.5)
     assert min(ys) == pytest.approx(5.5)
     assert max(ys) == pytest.approx(6.5)
 
-    # IfcFurniture (IFC4 subtype of IfcFurnishingElement) is picked up by the
-    # same IfcFurnishingElement query, not double-counted.
-    cabinet_fp = by_name["Cabinet"]
-    assert cabinet_fp.incomplete is False
-    assert cabinet_fp.method == "ifc_placement_bbox"
+    # IfcFurniture subtype is also accepted by the same extractor when sized.
+    cabinet = footprints_service._furniture_footprint({}, f, furniture_typed, [])
+    assert cabinet is not None
+    assert cabinet.method == "ifc_placement_bbox"
 
-    # A mesh hull well under _MIN_FURNITURE_AREA_M2 (e.g. a wall-mounted
-    # clock) is dropped entirely rather than kept as a tiny obstacle — force
-    # the mesh path to return a small square so build_footprints must fall
-    # through to it (also confirms it beats the always-succeeding bbox path).
+    # Tiny plan size under _MIN_FURNITURE_AREA_M2 is dropped on the mesh path.
     tiny_hull_xy = [(0.0, 0.0), (0.05, 0.0), (0.05, 0.05), (0.0, 0.05)]
     monkeypatch.setattr(footprints_service, "_mesh_xy_points", lambda index, element: tiny_hull_xy)
-    assert footprints_service._furniture_footprint({}, f, desk) is None
+    assert footprints_service._furniture_footprint({}, f, desk, []) is None
+
+
+def test_furniture_outline_preserves_l_shape_concavity(tmp_path, monkeypatch):
+    """Furniture mesh outline must keep L indents — not fill them with a hull."""
+    ifc_path = tmp_path / "l_desk.ifc"
+    f = ifcopenshell.file(schema="IFC4")
+    project = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="T")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    site = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcSite", name="S")
+    building = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcBuilding", name="B")
+    storey = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingStorey", name="L1"
+    )
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=project, products=[site])
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=site, products=[building])
+    ifcopenshell.api.run(
+        "aggregate.assign_object", f, relating_object=building, products=[storey]
+    )
+    desk = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcFurnishingElement", name="L-Desk"
+    )
+    ifcopenshell.api.run(
+        "spatial.assign_container", f, relating_structure=storey, products=[desk]
+    )
+    f.write(str(ifc_path))
+
+    # Flat L: vertical bar 0..2 x 0..6 + horizontal 2..6 x 0..2 (same as outline unit test).
+    verts = [
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (0.0, 2.0, 0.0),
+        (2.0, 6.0, 0.0),
+        (0.0, 6.0, 0.0),
+        (6.0, 0.0, 0.0),
+        (6.0, 2.0, 0.0),
+    ]
+    faces = [
+        (0, 1, 2),
+        (0, 2, 3),
+        (3, 2, 4),
+        (3, 4, 5),
+        (1, 6, 7),
+        (1, 7, 2),
+    ]
+    monkeypatch.setattr(
+        footprints_service, "_mesh_verts_faces", lambda index, element: (verts, faces)
+    )
+
+    fp = footprints_service._furniture_footprint({}, f, desk, [])
+    assert fp is not None
+    assert fp.method == "ifc_mesh_xy_outline"
+    exterior = [(p.x, p.y) for p in fp.polygon]
+    # Inner corner of the L near (2,2) on the outline; convex hull would fill (4,4).
+    assert footprints_service._point_in_ring(1.0, 4.0, exterior)
+    assert footprints_service._point_in_ring(4.0, 1.0, exterior)
+    assert not footprints_service._point_in_ring(4.0, 4.0, exterior)
 
 
 def test_furniture_with_no_geometry_at_all_warns_and_is_dropped(tmp_path, caplog):
@@ -303,6 +360,105 @@ def test_furniture_with_no_geometry_at_all_warns_and_is_dropped(tmp_path, caplog
         "no extractable footprint" in record.message and ghost_chair.GlobalId in record.message
         for record in caplog.records
     )
+
+
+def test_overlaps_walk_band_basic():
+    # Floor at 0: band is [0.15, 2.10]
+    assert footprints_service._overlaps_walk_band(0.0, 0.8, 0.0)
+    assert footprints_service._overlaps_walk_band(1.0, 1.5, 0.0)
+    assert not footprints_service._overlaps_walk_band(2.5, 2.8, 0.0)  # ceiling
+    # Floor at 3.0: band [3.15, 5.10] — L1 ceiling light must not count as L2 desk
+    assert not footprints_service._overlaps_walk_band(2.6, 2.9, 3.0)
+    assert footprints_service._overlaps_walk_band(3.0, 3.9, 3.0)
+
+
+def test_furniture_walk_band_drops_ceiling_keeps_desk(tmp_path, monkeypatch):
+    """Ceiling fixtures (Z above walk band) are dropped; floor desks kept.
+
+    Mirrors Trapelo: an L1 ceiling light whose Z is nearer L2 elevation used
+    to land on the upper plan via nearest-storey / containment — walk-band
+    filter removes it from furniture obstacles entirely.
+    """
+    from app.schemas.footprints import StoreyFootprintMeta
+
+    ifc_path = tmp_path / "walk_band_furniture.ifc"
+    f = ifcopenshell.file(schema="IFC4")
+    project = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="T")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    site = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcSite", name="S")
+    building = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcBuilding", name="B")
+    storey_l1 = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingStorey", name="L1"
+    )
+    storey_l2 = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingStorey", name="L2"
+    )
+    storey_l1.Elevation = 0.0
+    storey_l2.Elevation = 3.0
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=project, products=[site])
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=site, products=[building])
+    ifcopenshell.api.run(
+        "aggregate.assign_object", f, relating_object=building, products=[storey_l1, storey_l2]
+    )
+
+    desk = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcFurnishingElement", name="Desk"
+    )
+    light = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcFurnishingElement", name="CeilingLight"
+    )
+    # Mis-tag the light onto L2 (Trapelo-style); desk correctly on L1.
+    ifcopenshell.api.run(
+        "spatial.assign_container", f, relating_structure=storey_l1, products=[desk]
+    )
+    ifcopenshell.api.run(
+        "spatial.assign_container", f, relating_structure=storey_l2, products=[light]
+    )
+    f.write(str(ifc_path))
+
+    storeys = [
+        StoreyFootprintMeta(global_id=storey_l1.GlobalId, name="L1", elevation=0.0),
+        StoreyFootprintMeta(global_id=storey_l2.GlobalId, name="L2", elevation=3.0),
+    ]
+
+    desk_verts = [
+        (0.0, 0.0, 0.0),
+        (1.2, 0.0, 0.0),
+        (1.2, 0.7, 0.0),
+        (0.0, 0.7, 0.0),
+        (0.0, 0.0, 0.75),
+        (1.2, 0.0, 0.75),
+        (1.2, 0.7, 0.75),
+        (0.0, 0.7, 0.75),
+    ]
+    light_verts = [
+        (0.0, 0.0, 2.7),
+        (0.4, 0.0, 2.7),
+        (0.4, 0.4, 2.7),
+        (0.0, 0.4, 2.7),
+        (0.0, 0.0, 2.85),
+        (0.4, 0.0, 2.85),
+        (0.4, 0.4, 2.85),
+        (0.0, 0.4, 2.85),
+    ]
+    faces = [
+        (0, 1, 2),
+        (0, 2, 3),
+        (4, 5, 6),
+        (4, 6, 7),
+    ]
+
+    def fake_mesh(_index, element):
+        if element is desk:
+            return desk_verts, faces
+        if element is light:
+            return light_verts, faces
+        return [], []
+
+    monkeypatch.setattr(footprints_service, "_mesh_verts_faces", fake_mesh)
+
+    assert footprints_service._furniture_footprint({}, f, desk, storeys) is not None
+    assert footprints_service._furniture_footprint({}, f, light, storeys) is None
 
 
 def test_door_operation_type_extracted_when_set(tmp_path):

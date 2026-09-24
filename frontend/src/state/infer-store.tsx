@@ -336,14 +336,21 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
     setExcludedNodeIds(new Set());
   }, []);
 
-  const toggleExcludedEdge = useCallback((edgeId: string) => {
-    setExcludedEdgeIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(edgeId)) next.delete(edgeId);
-      else next.add(edgeId);
-      return next;
-    });
-  }, []);
+  const toggleExcludedEdge = useCallback(
+    (edgeId: string) => {
+      setExcludedEdgeIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(edgeId)) next.delete(edgeId);
+        else next.add(edgeId);
+        return next;
+      });
+      const portalSel = `portal:${edgeId}`;
+      setSelectedElementIds((prev) =>
+        prev.includes(portalSel) ? prev.filter((id) => id !== portalSel) : prev,
+      );
+    },
+    [setSelectedElementIds],
+  );
 
   const clearExcludedEdges = useCallback(() => {
     setExcludedEdgeIds(new Set());

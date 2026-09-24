@@ -19,9 +19,11 @@ import type {
   findNearestExitPath,
   warmStoreyNavmeshWalkCosts,
 } from "@/lib/navmesh";
+import type { buildStoreyGrids } from "@/lib/storey-grid";
 
 type Handlers = {
   buildAllStoreyNavmeshes: typeof buildAllStoreyNavmeshes;
+  buildStoreyGrids: typeof buildStoreyGrids;
   warmStoreyNavmeshWalkCosts: typeof warmStoreyNavmeshWalkCosts;
   findNavmeshPath: typeof findNavmeshPath;
   findNearestExitPath: typeof findNearestExitPath;
@@ -74,7 +76,9 @@ async function call<F extends FnName>(fn: F, args: Parameters<Handlers[F]>): Pro
   const w = getWorker();
   if (!w) {
     // No Worker support in this environment — run inline, still async.
-    inlineHandlers ??= import("@/lib/navmesh");
+    inlineHandlers ??= Promise.all([import("@/lib/navmesh"), import("@/lib/storey-grid")]).then(
+      ([navmesh, grid]) => ({ ...navmesh, ...grid }) as unknown as Handlers,
+    );
     const handlers = (await inlineHandlers) as unknown as Handlers;
     return (handlers[fn] as (...a: unknown[]) => unknown)(...args) as ReturnType<Handlers[F]>;
   }
@@ -87,6 +91,9 @@ async function call<F extends FnName>(fn: F, args: Parameters<Handlers[F]>): Pro
 
 export const buildAllStoreyNavmeshesAsync = (...args: Parameters<typeof buildAllStoreyNavmeshes>) =>
   call("buildAllStoreyNavmeshes", args);
+
+export const buildStoreyGridsAsync = (...args: Parameters<typeof buildStoreyGrids>) =>
+  call("buildStoreyGrids", args);
 
 export const warmStoreyNavmeshWalkCostsAsync = (
   ...args: Parameters<typeof warmStoreyNavmeshWalkCosts>

@@ -15,14 +15,32 @@ export type PlanView = {
 export type Point2 = { x: number; y: number };
 
 export type Camera = {
-  /** World-space pan (applied after Y-flip, in the same XY as footprints). */
+  /**
+   * Pan in the Y-up flip group, axis-aligned to the SVG (applied after
+   * rotate+zoom about the building centre). Dragging right always increases
+   * panX regardless of {@link rotation}.
+   */
   panX: number;
   panY: number;
   /** 1 = fit to building bounds. */
   zoom: number;
+  /**
+   * Plan rotation in radians, counterclockwise in world Y-up (same sense as
+   * SVG `rotate` inside the Y-flip group). 0 = north-up as authored.
+   */
+  rotation: number;
 };
 
-export const IDENTITY_CAMERA: Camera = { panX: 0, panY: 0, zoom: 1 };
+export const IDENTITY_CAMERA: Camera = { panX: 0, panY: 0, zoom: 1, rotation: 0 };
+
+/** Snap `radians` onto (−π, π] so the Fit/reset path and UI stay tidy. */
+export function normalizeRotation(radians: number): number {
+  if (!Number.isFinite(radians)) return 0;
+  let r = radians % (Math.PI * 2);
+  if (r > Math.PI) r -= Math.PI * 2;
+  if (r <= -Math.PI) r += Math.PI * 2;
+  return r;
+}
 
 export function viewWidth(v: PlanView) {
   return Math.max(v.maxX - v.minX, 1e-6);
@@ -37,32 +55,52 @@ export function toViewBox(v: PlanView) {
 }
 
 /**
- * Smooth an ordered polyline into a Catmull-Rom-through-cubic-Bezier SVG path
- * (uniform parametrization, tension 1/6, clamped end tangents by duplicating
- * the first/last point). A plain `M..L..L..` polyline shows every A*
- * waypoint as a hard corner; the 3D viewer draws the exact same route point
- * data through THREE.CatmullRomCurve3 for its tube, so without this the flat
- * 2D route reads as noticeably more jagged than 3D even though the
- * underlying path is identical (and already string-pulled — see
- * simplifyLocalPath in geometric-path.ts). Purely a display curve: the
- * points it interpolates between are unchanged, so it doesn't affect
- * anything but how the line is drawn.
+ * Smooth an ordered polyline into a centripetal Catmull-Rom curve, emitted as
+ * cubic-Bezier SVG segments — the same curve the 3D viewer's route tube uses
+ * (THREE.CatmullRomCurve3 "centripetal"), so both panes draw the route with
+ * the same shape. Centripetal (not uniform) parametrization matters: grid
+ * routes put short hops next to long runs around doorways, and a uniform
+ * curve overshoots there into visible kinks. Purely a display curve: it
+ * passes through every original point.
  */
 export function smoothPolylinePathD(points: Point2[]): string {
   const n = points.length;
   if (n < 2) return "";
   if (n === 2) return `M${points[0]!.x} ${points[0]!.y} L${points[1]!.x} ${points[1]!.y}`;
   const at = (i: number) => points[Math.max(0, Math.min(n - 1, i))]!;
+  const knot = (a: Point2, b: Point2) => Math.sqrt(Math.hypot(b.x - a.x, b.y - a.y));
   let d = `M${points[0]!.x} ${points[0]!.y}`;
   for (let i = 0; i < n - 1; i++) {
     const p0 = at(i - 1);
     const p1 = at(i);
     const p2 = at(i + 1);
     const p3 = at(i + 2);
-    const c1x = p1.x + (p2.x - p0.x) / 6;
-    const c1y = p1.y + (p2.y - p0.y) / 6;
-    const c2x = p2.x - (p3.x - p1.x) / 6;
-    const c2y = p2.y - (p3.y - p1.y) / 6;
+    const d1 = knot(p0, p1);
+    const d2 = knot(p1, p2);
+    const d3 = knot(p2, p3);
+    let c1x: number;
+    let c1y: number;
+    let c2x: number;
+    let c2y: number;
+    // Conversion from Yuksel et al., "Parameterization and Applications of Catmull-Rom Curves".
+    if (d1 < 1e-9 || d2 < 1e-9) {
+      c1x = p1.x + (p2.x - p1.x) / 3;
+      c1y = p1.y + (p2.y - p1.y) / 3;
+    } else {
+      const a = 2 * d1 * d1 + 3 * d1 * d2 + d2 * d2;
+      const m = 3 * d1 * (d1 + d2);
+      c1x = (d1 * d1 * p2.x - d2 * d2 * p0.x + a * p1.x) / m;
+      c1y = (d1 * d1 * p2.y - d2 * d2 * p0.y + a * p1.y) / m;
+    }
+    if (d3 < 1e-9 || d2 < 1e-9) {
+      c2x = p2.x - (p2.x - p1.x) / 3;
+      c2y = p2.y - (p2.y - p1.y) / 3;
+    } else {
+      const b = 2 * d3 * d3 + 3 * d3 * d2 + d2 * d2;
+      const m = 3 * d3 * (d3 + d2);
+      c2x = (d3 * d3 * p1.x - d2 * d2 * p3.x + b * p2.x) / m;
+      c2y = (d3 * d3 * p1.y - d2 * d2 * p3.y + b * p2.y) / m;
+    }
     d += ` C${c1x} ${c1y} ${c2x} ${c2y} ${p2.x} ${p2.y}`;
   }
   return d;
@@ -117,21 +155,75 @@ export function clientToView(
 
   const svgX = bounds.minX + ((clientX - ox) / contentW) * vw;
   const svgY = -bounds.maxY + ((clientY - oy) / contentH) * vh;
+  // Undo the root Y-flip group, then undo pan → rotate → zoom about centre.
   const p1x = svgX;
   const p1y = -svgY;
   const cx = (bounds.minX + bounds.maxX) / 2;
   const cy = (bounds.minY + bounds.maxY) / 2;
-  return {
-    x: (p1x - cx - cam.panX) / cam.zoom + cx,
-    y: (p1y - cy - cam.panY) / cam.zoom + cy,
-  };
+  const qx = p1x - cx - cam.panX;
+  const qy = p1y - cy - cam.panY;
+  const cos = Math.cos(cam.rotation);
+  const sin = Math.sin(cam.rotation);
+  // R(−θ) · q, then undo scale.
+  const rx = qx * cos + qy * sin;
+  const ry = -qx * sin + qy * cos;
+  const z = Math.max(cam.zoom, 1e-6);
+  return { x: rx / z + cx, y: ry / z + cy };
 }
 
 export function cameraTransform(bounds: PlanView, cam: Camera): string {
   const cx = (bounds.minX + bounds.maxX) / 2;
   const cy = (bounds.minY + bounds.maxY) / 2;
-  // Zoom about building centre, then pan in world XY (inside the Y-flip group).
-  return `translate(${cam.panX} ${cam.panY}) translate(${cx} ${cy}) scale(${cam.zoom}) translate(${-cx} ${-cy})`;
+  const deg = (cam.rotation * 180) / Math.PI;
+  // Zoom + rotate about building centre, then pan (inside the Y-flip group).
+  return `translate(${cam.panX} ${cam.panY}) translate(${cx} ${cy}) rotate(${deg}) scale(${cam.zoom}) translate(${-cx} ${-cy})`;
+}
+
+/**
+ * Pan delta that keeps `worldUnderCursor` fixed when zoom changes (with
+ * rotation). `dz = oldZoom - newZoom`.
+ */
+export function panDeltaForZoomAt(
+  bounds: PlanView,
+  cam: Camera,
+  worldUnderCursor: Point2,
+  newZoom: number,
+): Point2 {
+  const cx = (bounds.minX + bounds.maxX) / 2;
+  const cy = (bounds.minY + bounds.maxY) / 2;
+  const dx = worldUnderCursor.x - cx;
+  const dy = worldUnderCursor.y - cy;
+  const dz = cam.zoom - newZoom;
+  const cos = Math.cos(cam.rotation);
+  const sin = Math.sin(cam.rotation);
+  // R(θ) · (world − centre) · dz
+  return { x: (cos * dx - sin * dy) * dz, y: (sin * dx + cos * dy) * dz };
+}
+
+/**
+ * Pan delta that keeps `worldPivot` fixed when rotation changes by
+ * `deltaRotation` (new − old), at the current zoom.
+ */
+export function panDeltaForRotationAt(
+  bounds: PlanView,
+  cam: Camera,
+  worldPivot: Point2,
+  deltaRotation: number,
+): Point2 {
+  const cx = (bounds.minX + bounds.maxX) / 2;
+  const cy = (bounds.minY + bounds.maxY) / 2;
+  const dx = (worldPivot.x - cx) * cam.zoom;
+  const dy = (worldPivot.y - cy) * cam.zoom;
+  const cos0 = Math.cos(cam.rotation);
+  const sin0 = Math.sin(cam.rotation);
+  const next = cam.rotation + deltaRotation;
+  const cos1 = Math.cos(next);
+  const sin1 = Math.sin(next);
+  // pan' = pan + R(θ)·z·v − R(θ')·z·v
+  return {
+    x: cos0 * dx - sin0 * dy - (cos1 * dx - sin1 * dy),
+    y: sin0 * dx + cos0 * dy - (sin1 * dx + cos1 * dy),
+  };
 }
 
 /** Screen-pixel drag → camera pan (viewBox units, Y-up inside the flip group). */

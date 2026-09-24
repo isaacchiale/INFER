@@ -17,6 +17,10 @@ export default defineConfig({
           target: "http://127.0.0.1:8000",
           changeOrigin: true,
           rewrite: (path: string) => path.replace(/^\/api/, ""),
+          // Trapelo footprints/geometry can take 30–90s; default proxy
+          // idle timeouts abort mid-ingest and leave only entities.json.
+          timeout: 600_000,
+          proxyTimeout: 600_000,
         },
       },
     },

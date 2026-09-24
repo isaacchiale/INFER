@@ -3,7 +3,7 @@ import { Box, Check, ChevronDown, FolderOpen, Move3d, Network, PersonStanding } 
 import { cn } from "@/lib/utils";
 import { GLASS } from "@/lib/floating-panel";
 import { Button } from "@/components/ui/button";
-import { buildAllStoreyNavmeshes, buildStoreyNavmesh } from "@/lib/navmesh";
+import { buildStoreyNavmesh, buildStoreyNavmeshesIncremental, storeysAffectedByExclusionChange, type StoreyNavmesh } from "@/lib/navmesh";
 import {
   buildPlanRouteTubePolylines,
   buildRouteTubePolylines,
@@ -20,6 +20,8 @@ import {
   type ThreeAabb,
 } from "@/lib/viewer-camera-pose";
 import { useModelData, useViewport, useViewerPose, type NavmeshRoute } from "@/state/infer-store";
+import type { FootprintsDocument } from "@/types/footprints";
+import type { ConnectivityGraph } from "@/types/graph";
 import {
   createThatOpenRuntime,
   type EvacuationLoadMarker3D,
@@ -105,6 +107,17 @@ function InferModelViewportImpl({
   const [engineError, setEngineError] = useState<string | null>(null);
   const [navMode, setNavMode] = useState<NavMode>("orbit");
   const [geometryMode, setGeometryMode] = useState<GeometryDisplayMode>("ifc");
+  /** Independent of floorplan `activeStoreyId` — each pane filters levels on its own. */
+  const [viewerStoreyId, setViewerStoreyId] = useState<string | "all">("all");
+
+  // Cache for stacked 3D navmeshes — exclusion toggles only rebuild dirty storeys.
+  const navmeshCacheRef = useRef<{
+    footprints: FootprintsDocument;
+    graph: ConnectivityGraph;
+    excludedNodes: ReadonlySet<string>;
+    excludedEdges: ReadonlySet<string>;
+    meshes: StoreyNavmesh[];
+  } | null>(null);
 
   const {
     backendModelId,
@@ -123,10 +136,6 @@ function InferModelViewportImpl({
     pendingIfc,
     setViewerStatus,
     setIngestOpen,
-    // Shared with FloorplanViewer — picking a storey in either pane now
-    // isolates the same floor in both, instead of two independent filters.
-    activeStoreyId: viewerStoreyId,
-    setActiveStoreyId: setViewerStoreyId,
     showEvacuationLoad,
   } = useViewport();
   const {
@@ -473,8 +482,39 @@ function InferModelViewportImpl({
     const opts = { excludedNodeIds, excludedEdgeIds };
     const meshes =
       viewerStoreyId === "all"
-        ? buildAllStoreyNavmeshes(footprintsDocument, connectivityGraph, opts)
+        ? (() => {
+            const prev = navmeshCacheRef.current;
+            const baseChanged =
+              !prev ||
+              prev.footprints !== footprintsDocument ||
+              prev.graph !== connectivityGraph;
+            const dirty: ReadonlySet<string> | "all" = baseChanged
+              ? "all"
+              : storeysAffectedByExclusionChange(
+                  footprintsDocument,
+                  connectivityGraph,
+                  prev.excludedNodes,
+                  excludedNodeIds,
+                  prev.excludedEdges,
+                  excludedEdgeIds,
+                );
+            const next = buildStoreyNavmeshesIncremental(
+              prev?.meshes ?? null,
+              footprintsDocument,
+              connectivityGraph,
+              { ...opts, dirtyStoreyIds: dirty },
+            );
+            navmeshCacheRef.current = {
+              footprints: footprintsDocument,
+              graph: connectivityGraph,
+              excludedNodes: excludedNodeIds,
+              excludedEdges: excludedEdgeIds,
+              meshes: next,
+            };
+            return next;
+          })()
         : (() => {
+            navmeshCacheRef.current = null;
             const one = buildStoreyNavmesh(
               footprintsDocument,
               connectivityGraph,
@@ -839,7 +879,7 @@ function InferModelViewportImpl({
                   GLASS,
                   "flex h-8 max-w-[220px] items-center gap-1.5 px-2.5 text-[12px] text-foreground transition-colors hover:bg-muted disabled:opacity-40",
                 )}
-                title="Storey — shared with the Floorplan pane; pick All levels to see every floor in 3D"
+                title="3D storey filter — independent of the floorplan level dropdown"
               >
                 <span className="min-w-0 truncate">{viewerStoreyLabel}</span>
                 <ChevronDown aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />

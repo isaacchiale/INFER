@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { smoothPolylinePathD } from "./floorplan-camera.ts";
+import {
+  cameraTransform,
+  normalizeRotation,
+  panDeltaForRotationAt,
+  panDeltaForZoomAt,
+  smoothPolylinePathD,
+  type Camera,
+  type PlanView,
+} from "./floorplan-camera.ts";
 import { localPathInPolygon, pointInPolygon } from "./geometric-path.ts";
 import type { Point2D } from "../types/footprints.ts";
 
@@ -204,5 +212,79 @@ describe("smoothPolylinePathD does not cut into routed-around obstacles", () => 
       { x: 0.5, y: 3 },
       { x: 13.5, y: 3 },
     );
+  });
+});
+
+describe("floorplan camera rotation", () => {
+  const bounds: PlanView = { minX: 0, minY: 0, maxX: 10, maxY: 10 };
+  const centre = { x: 5, y: 5 };
+
+  it("normalizes angles onto (−π, π]", () => {
+    assert.equal(normalizeRotation(0), 0);
+    assert.ok(Math.abs(normalizeRotation(Math.PI * 3) - Math.PI) < 1e-12);
+    // −3π ≡ −π ≡ π under (−π, π]
+    assert.ok(Math.abs(normalizeRotation(-Math.PI * 3) - Math.PI) < 1e-12);
+  });
+
+  it("emits rotate in the camera transform between pan and scale", () => {
+    const cam: Camera = { panX: 1, panY: 2, zoom: 1.5, rotation: Math.PI / 2 };
+    const t = cameraTransform(bounds, cam);
+    assert.equal(
+      t,
+      `translate(1 2) translate(5 5) rotate(90) scale(1.5) translate(-5 -5)`,
+    );
+  });
+
+  it("keeps a world point fixed when zooming with rotation", () => {
+    const cam: Camera = { panX: 0, panY: 0, zoom: 2, rotation: Math.PI / 4 };
+    const world = { x: 8, y: 3 };
+    const newZoom = 1;
+    const pan = panDeltaForZoomAt(bounds, cam, world, newZoom);
+    const next: Camera = {
+      ...cam,
+      zoom: newZoom,
+      panX: cam.panX + pan.x,
+      panY: cam.panY + pan.y,
+    };
+    // screen = pan + c + R(θ)·z·(world − c)
+    const project = (c: Camera, w: Point2D) => {
+      const dx = (w.x - centre.x) * c.zoom;
+      const dy = (w.y - centre.y) * c.zoom;
+      const cos = Math.cos(c.rotation);
+      const sin = Math.sin(c.rotation);
+      return {
+        x: c.panX + centre.x + cos * dx - sin * dy,
+        y: c.panY + centre.y + sin * dx + cos * dy,
+      };
+    };
+    const a = project(cam, world);
+    const b = project(next, world);
+    assert.ok(Math.hypot(a.x - b.x, a.y - b.y) < 1e-9);
+  });
+
+  it("keeps a world pivot fixed when rotating", () => {
+    const cam: Camera = { panX: 1, panY: -0.5, zoom: 1.25, rotation: 0.2 };
+    const pivot = { x: 7, y: 2 };
+    const delta = Math.PI / 6;
+    const pan = panDeltaForRotationAt(bounds, cam, pivot, delta);
+    const next: Camera = {
+      ...cam,
+      rotation: cam.rotation + delta,
+      panX: cam.panX + pan.x,
+      panY: cam.panY + pan.y,
+    };
+    const project = (c: Camera, w: Point2D) => {
+      const dx = (w.x - centre.x) * c.zoom;
+      const dy = (w.y - centre.y) * c.zoom;
+      const cos = Math.cos(c.rotation);
+      const sin = Math.sin(c.rotation);
+      return {
+        x: c.panX + centre.x + cos * dx - sin * dy,
+        y: c.panY + centre.y + sin * dx + cos * dy,
+      };
+    };
+    const a = project(cam, pivot);
+    const b = project(next, pivot);
+    assert.ok(Math.hypot(a.x - b.x, a.y - b.y) < 1e-9);
   });
 });

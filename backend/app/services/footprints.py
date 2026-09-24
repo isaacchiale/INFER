@@ -1,14 +1,20 @@
 """
 Build 2D footprints for every space (and door portal) that enters the navigation graph.
 
-Method (spaces):
+Method (spaces / furniture):
 1. Prefer ifcopenshell.geom mesh → keep nearly-horizontal faces (floor/ceiling) →
    project to XY → boundary-edge stitch → exterior + holes (ifc_mesh_xy_outline).
    Full 3D meshes are not used for boundary edges: floor+ceiling would double-count
-   every plan edge and force a convex-hull fallback.
+   every plan edge and force a convex-hull fallback. Furniture uses the exterior
+   ring only (obstacle polygon); tiny measured outlines are dropped.
 2. Fallback: convex hull of mesh XY (ifc_mesh_xy_hull).
 3. Fallback: local placement origin ± OverallWidth/Depth (ifc_placement_bbox).
-4. If neither works → incomplete=True, empty polygon.
+   Furniture requires both dimensions (no invented 1×1 m box).
+4. If neither works → incomplete=True, empty polygon (spaces/walls); furniture
+   returns None instead.
+5. Furniture that does not intersect a person-height band above its storey
+   floor (see `_WALK_BAND_*`) is dropped — ceiling fixtures must not appear
+   on the plan or block routing.
 
 Stairs stay on convex hull / bbox for plan overlay (v1).
 Door portals use mesh plan hull (thin rectangle + facing normal) when possible,
@@ -54,6 +60,17 @@ _SIMPLIFY_EPS_M = 0.05
 # frames, and other near-zero-footprint items that would clutter the local
 # pathfinding obstacle set without ever actually blocking a walkable route.
 _MIN_FURNITURE_AREA_M2 = 0.05
+# Person-height band above the storey's finished-floor elevation. Only
+# furniture whose mesh (or placement prism) intersects this band is kept as
+# a plan/nav obstacle — ceiling lights, sprinklers, and other overhead
+# IfcFurnishingElement junk are dropped even when IFC containment / nearest-
+# storey Z tagged them onto the wrong floor (3D still looks right because it
+# clips by real mesh height; the plan only had the label).
+_WALK_BAND_MIN_M = 0.15
+_WALK_BAND_MAX_M = 2.10
+# No tessellated mesh: treat ObjectPlacement Z as the base of a short prism
+# so floor-rooted desks with only a placement bbox still clear the band.
+_PLACEMENT_ASSUMED_HEIGHT_M = 1.0
 
 
 def _unique_xy(points: Iterable[tuple[float, float]], tol: float = 1e-6) -> list[tuple[float, float]]:
@@ -1001,6 +1018,26 @@ def _stair_xy_points(index: dict[str, _MeshData], stair, aggregated_parts: dict)
 _FootprintT = TypeVar("_FootprintT")
 
 
+def _furniture_plan_size_m(item) -> tuple[float, float] | None:
+    """Return (width, depth) when both OverallWidth and OverallDepth are set.
+
+    IfcFurnishingElement often has neither attribute (IFC4) — AttributeError or
+    nulls. Callers must not invent a 1×1 m default for those; return None so the
+    furniture bbox stage is skipped.
+    """
+    try:
+        width = item.OverallWidth
+        depth = item.OverallDepth
+    except AttributeError:
+        return None
+    if width is None or depth is None:
+        return None
+    w, d = float(width), float(depth)
+    if w <= 0 or d <= 0:
+        return None
+    return w, d
+
+
 def _hull_or_bbox_footprint(
     gid: str,
     name: str,
@@ -1009,6 +1046,7 @@ def _hull_or_bbox_footprint(
     bbox_element,
     model_cls: Callable[..., _FootprintT],
     min_area: float | None = None,
+    require_dimensions: bool = False,
 ) -> _FootprintT | None:
     """Shared hull -> placement-bbox -> incomplete waterfall behind
     walls/stairs/furniture footprints (they differ only in how `xy` and
@@ -1019,6 +1057,11 @@ def _hull_or_bbox_footprint(
     it's a *measured*, small footprint, not a missing one — and skips the
     final `incomplete=True` placeholder too: nothing here is worth flagging
     as broken data, just not worth keeping as an obstacle.
+
+    `require_dimensions` (furniture): the shared bbox helper invents a 1×1 m
+    square when OverallWidth/OverallDepth are missing. Furniture without both
+    attributes must not get that invented box — skip the bbox stage instead
+    (see {@link _furniture_plan_size_m}).
 
     That "skip the incomplete placeholder" path used to also silently
     swallow the *other* case min_area can hit: mesh tessellation AND the
@@ -1046,7 +1089,26 @@ def _hull_or_bbox_footprint(
                 method="ifc_mesh_xy_hull",
             )
 
-    bbox = _bbox_polygon_from_placement(bbox_element)
+    if require_dimensions:
+        size = _furniture_plan_size_m(bbox_element)
+        if size is None:
+            bbox = None
+        else:
+            origin = _placement_xy(bbox_element)
+            if origin is None:
+                bbox = None
+            else:
+                ox, oy = origin
+                w, d = size
+                hx, hy = w / 2.0, d / 2.0
+                bbox = [
+                    (ox - hx, oy - hy),
+                    (ox + hx, oy - hy),
+                    (ox + hx, oy + hy),
+                    (ox - hx, oy + hy),
+                ]
+    else:
+        bbox = _bbox_polygon_from_placement(bbox_element)
     if bbox is not None:
         return model_cls(
             global_id=gid,
@@ -1101,23 +1163,171 @@ def _wall_footprint(index: dict[str, _MeshData], ifc, wall) -> WallFootprint:
     )
 
 
-def _furniture_footprint(index: dict[str, _MeshData], ifc, item) -> FurnitureFootprint | None:
-    """Furniture uses the same hull / placement-bbox waterfall as walls, but a
-    *measured* hull under `_MIN_FURNITURE_AREA_M2` is dropped rather than kept
-    or re-approximated — most furniture-typed elements (wall art, small
-    fixtures) have no real footprint a person could collide with, and keeping
-    them would clutter the local pathfinding obstacle set for no benefit.
-    This only applies when the mesh gave us a real (small) measurement; if
-    there's no mesh at all we still fall through to the placement-bbox guess,
-    same as walls, rather than assuming "no mesh" means "tiny"."""
+def _mesh_z_mid(index: dict[str, _MeshData], element) -> float | None:
+    """Mean world Z of the element's tessellated verts, or None if no mesh."""
+    verts, _faces = _mesh_verts_faces(index, element)
+    if not verts:
+        return None
+    return sum(v[2] for v in verts) / len(verts)
+
+
+def _furniture_z_extent_m(
+    index: dict[str, _MeshData], ifc, element
+) -> tuple[float, float] | None:
+    """World-Z span (metres) for walk-band tests.
+
+    Prefer tessellated mesh min/max. With only ObjectPlacement, assume a short
+    vertical prism so floor-rooted placement-bbox desks still intersect the
+    walk band (origin alone often sits at Z = floor elevation).
+    """
+    verts, _faces = _mesh_verts_faces(index, element)
+    if verts:
+        zs = [float(v[2]) for v in verts]
+        return min(zs), max(zs)
+    z = _placement_z(element)
+    if z is None:
+        return None
+    z_m = length_to_metres(ifc, z)
+    if z_m is None:
+        return None
+    return float(z_m), float(z_m) + _PLACEMENT_ASSUMED_HEIGHT_M
+
+
+def _storey_elevation_m(
+    storeys: list[StoreyFootprintMeta], storey_gid: str | None
+) -> float | None:
+    if not storey_gid:
+        return None
+    for s in storeys:
+        if s.global_id == storey_gid and s.elevation is not None:
+            return float(s.elevation)
+    return None
+
+
+def _overlaps_walk_band(z_min: float, z_max: float, floor_elev_m: float) -> bool:
+    band_lo = floor_elev_m + _WALK_BAND_MIN_M
+    band_hi = floor_elev_m + _WALK_BAND_MAX_M
+    return z_min <= band_hi and z_max >= band_lo
+
+
+def _furniture_is_walk_obstacle(
+    index: dict[str, _MeshData],
+    ifc,
+    item,
+    storeys: list[StoreyFootprintMeta],
+    storey_gid: str | None,
+) -> bool:
+    """Keep only furnishings that intersect the person-height band on the
+    labeled storey. Unknown elevation or Z → keep (don't drop desks we
+    cannot measure). Overhead-only geometry → False (drop).
+    """
+    elev = _storey_elevation_m(storeys, storey_gid)
+    if elev is None:
+        return True
+    extent = _furniture_z_extent_m(index, ifc, item)
+    if extent is None:
+        return True
+    return _overlaps_walk_band(extent[0], extent[1], elev)
+
+
+def _placement_z(element) -> float | None:
+    if getattr(element, "ObjectPlacement", None) is None:
+        return None
+    try:
+        matrix = ifcopenshell.util.placement.get_local_placement(element.ObjectPlacement)
+        return float(matrix[2][3])
+    except Exception:  # noqa: BLE001
+        logger.debug("no placement z for %s", getattr(element, "GlobalId", "?"), exc_info=True)
+        return None
+
+
+def _nearest_storey_gid(
+    storeys: list[StoreyFootprintMeta], z: float | None
+) -> str | None:
+    """Pick the storey whose elevation is closest to ``z`` (metres)."""
+    if z is None or not storeys:
+        return None
+    best_gid: str | None = None
+    best_d = float("inf")
+    for s in storeys:
+        if s.elevation is None:
+            continue
+        d = abs(float(s.elevation) - z)
+        if d < best_d:
+            best_d = d
+            best_gid = s.global_id
+    return best_gid
+
+
+def _furniture_storey(
+    index: dict[str, _MeshData],
+    ifc,
+    item,
+    storeys: list[StoreyFootprintMeta],
+) -> str | None:
+    """Prefer IFC spatial containment; else nearest storey by mesh/placement Z."""
+    storey = _storey_gid(ifc, item)
+    if storey is not None:
+        return storey
+    z = _mesh_z_mid(index, item)
+    if z is None:
+        z = _placement_z(item)
+        if z is not None:
+            z = length_to_metres(ifc, z)
+    return _nearest_storey_gid(storeys, z)
+
+
+def _furniture_footprint(
+    index: dict[str, _MeshData],
+    ifc,
+    item,
+    storeys: list[StoreyFootprintMeta],
+) -> FurnitureFootprint | None:
+    """Furniture plan obstacle: prefer mesh XY outline (keeps concavities —
+    L-desks, U-sofas), then convex hull, then a *dimensioned* placement bbox.
+
+    A *measured* outline/hull under `_MIN_FURNITURE_AREA_M2` is dropped rather
+    than kept or re-approximated — wall art and small fixtures clutter the
+    local pathfinding obstacle set without blocking a walkable route.
+    Undimensioned furniture must not invent a 1×1 m square (the shared bbox
+    helper's default).
+
+    Items whose Z extent misses the storey's person-height walk band (ceiling
+    fixtures, etc.) are dropped so they neither draw on the plan nor feed
+    navmesh / storey-grid obstacles.
+    """
+    gid = _gid(item)
+    name = _name(item)
+    storey = _furniture_storey(index, ifc, item, storeys)
+    if not _furniture_is_walk_obstacle(index, ifc, item, storeys, storey):
+        return None
+
+    verts, faces = _mesh_verts_faces(index, item)
+    if verts and faces:
+        outlined = outline_from_mesh_xy(verts, faces)
+        if outlined is not None:
+            exterior, _holes = outlined
+            if abs(_signed_area(exterior)) >= _MIN_FURNITURE_AREA_M2 and len(exterior) >= 3:
+                return FurnitureFootprint(
+                    global_id=gid,
+                    name=name,
+                    storey_global_id=storey,
+                    polygon=_to_points(exterior),
+                    incomplete=False,
+                    method="ifc_mesh_xy_outline",
+                )
+            # Measured but tiny — drop rather than falling through to hull/bbox.
+            return None
+
     return _hull_or_bbox_footprint(
-        _gid(item),
-        _name(item),
-        _storey_gid(ifc, item),
-        _unique_xy(_mesh_xy_points(index, item)),
+        gid,
+        name,
+        storey,
+        _unique_xy((v[0], v[1]) for v in verts) if verts else _mesh_xy_points(index, item),
         item,
         FurnitureFootprint,
         min_area=_MIN_FURNITURE_AREA_M2,
+        require_dimensions=True,
     )
 
 
@@ -1202,7 +1412,7 @@ def build_footprints(model_id: str, ifc_file_path: str) -> FootprintsDocument:
 
     furniture: list[FurnitureFootprint] = []
     for item in furniture_elements:
-        footprint = _furniture_footprint(mesh_index, ifc, item)
+        footprint = _furniture_footprint(mesh_index, ifc, item, storeys)
         if footprint is not None:
             furniture.append(footprint)
 

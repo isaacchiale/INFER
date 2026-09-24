@@ -41,6 +41,7 @@
   --color-portal-blocked: var(--portal-blocked);
   --color-door-glyph: var(--door-glyph);
   --color-stair-glyph: var(--stair-glyph);
+  --color-selection: var(--selection);
   --color-furniture-fill: var(--furniture-fill);
   --color-furniture-stroke: var(--furniture-stroke);
   --color-evac-heat-low: var(--evac-heat-low);
@@ -142,20 +143,22 @@
   --sidebar-ring: oklch(0.47 0.09 232);
 
   /*
-   * Floorplan/navmesh marker colors. Fixed regardless of theme (same
-   * rationale as --viewport above): these are a colorblind-safe (Okabe-Ito)
-   * legend on a technical instrument, and their meaning must never shift
-   * just because the app theme toggled. Values are exact oklch conversions
-   * of the plan's original hand-picked hex swatches, not new choices.
-   */
-  --portal-door: oklch(0.5319 0.1313 244.05); /* was #0072B2 */
-  --portal-door-heal: oklch(0.7952 0.1617 86.05); /* was #eab308 */
-  --portal-space: oklch(0.6794 0.1177 346.32); /* was #CC79A7 */
-  --portal-blocked: oklch(0.7107 0.0351 256.79); /* was #94a3b8 */
-  --door-glyph: oklch(0.7686 0.1647 70.08); /* was #f59e0b */
-  --stair-glyph: oklch(0.5413 0.2466 293.01); /* was #7c3aed */
-  --furniture-fill: oklch(0.6002 0.1038 184.70); /* was #0d9488 */
-  --furniture-stroke: oklch(0.5109 0.0861 186.39); /* was #0f766e */
+   * Floorplan/navmesh/graph legend. Fixed regardless of theme (same
+   * rationale as --viewport): Okabe–Ito roles must not shift with app
+   * chrome. Hex mirrors live in `legend-colors.ts` for Cytoscape/Three.
+   *
+ *   IFC door = muted amber · Door heal = pink · Space heal = green ·
+ *   Stair = purple · Exit = red · Route = blue · Selected = sky
+ */
+  --portal-door: oklch(0.7686 0.1647 70.08); /* #F59E0B muted amber */
+  --portal-door-heal: oklch(0.6794 0.1177 346.32); /* #CC79A7 Okabe pink */
+  --portal-space: oklch(0.722 0.177 149.5); /* #22C55E space heal */
+  --portal-blocked: oklch(0.7107 0.0351 256.79); /* #94a3b8 */
+  --door-glyph: oklch(0.7686 0.1647 70.08); /* same as IFC door muted amber */
+  --stair-glyph: oklch(0.5413 0.2466 293.01); /* #7c3aed */
+  --selection: oklch(0.757 0.112 230.5); /* #56B4E9 Okabe sky */
+  --furniture-fill: oklch(0.6002 0.1038 184.70); /* #0d9488 */
+  --furniture-stroke: oklch(0.5109 0.0861 186.39); /* #0f766e */
   /*
    * Evacuation-load heat scale (see evacuationHeatColor): the familiar
    * traffic-light progression — green through --warning (yellow/orange)

@@ -17,6 +17,7 @@ export type CytoscapeRuntime = {
     pathNodeIds: string[],
     pathEdgeIds?: string[],
     selectedNodeIds?: string[],
+    selectedEdgeIds?: string[],
   ) => void;
   setTheme: (theme: "light" | "dark") => void;
   /** Soft-remove / restore edges without rebuilding node positions. */
@@ -25,6 +26,8 @@ export type CytoscapeRuntime = {
   fit: () => void;
   destroy: () => void;
   onSpaceTap: (handler: (nodeId: string) => void) => void;
+  /** Left-click toggle for connections (Inspector / floorplan portal selection). */
+  onEdgeTap: (handler: (edgeId: string) => void) => void;
   /** Right-click toggle for spaces / stairs / lifts (including excluded grid). */
   onNodeCxtTap: (handler: (nodeId: string) => void) => void;
   /** Right-click toggle soft-remove / restore for connections. */
@@ -93,20 +96,8 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       },
     },
     {
-      selector: "node[onPath = 1]",
-      style: {
-        "border-width": 5,
-        "border-color": p.pathNode,
-        "underlay-color": p.pathUnderlay,
-        "underlay-padding": 7,
-        "underlay-opacity": 0.35,
-        "underlay-shape": "ellipse",
-        "z-index": 50,
-      },
-    },
-    {
-      // Nested IfcSpace parents (geometry rules) — red circle; keep after onPath
-      // so flagged parents stay circled even when also on the route.
+      // Nested IfcSpace parents — red circle; before onPath so a hop's blue
+      // ring wins when the parent is also on the route.
       selector: "node[nestedParent = 1]",
       style: {
         "underlay-color": "#ef4444",
@@ -117,14 +108,50 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       },
     },
     {
+      // Hop on a calculated route — blue outline ring only (fill unchanged).
+      selector: "node[onPath = 1]",
+      style: {
+        "underlay-color": p.pathUnderlay,
+        "underlay-padding": 8,
+        "underlay-opacity": 0.55,
+        "underlay-shape": "ellipse",
+        "z-index": 50,
+      },
+    },
+    {
+      // Click selection — sky fill (orthogonal to hop ring).
+      selector: "node[selected = 1]",
+      style: {
+        "background-color": p.selectedFill,
+        color: p.selectedLabel,
+        "border-color": p.selectedFill,
+        "border-width": 2,
+        "z-index": 55,
+      },
+    },
+    {
       selector: "node[excluded = 1]",
       style: {
         "background-opacity": 0.45,
         "border-style": "dashed",
         "border-width": 2,
-        "border-color": "#94a3b8",
+        "border-color": p.disabled,
         opacity: 0.75,
         "z-index": 20,
+      },
+    },
+    {
+      // Excluded + selected: keep dashed “removed” look but sky selection wins.
+      selector: "node[excluded = 1][selected = 1]",
+      style: {
+        "background-color": p.selectedFill,
+        color: p.selectedLabel,
+        "border-color": p.selectedFill,
+        "border-style": "dashed",
+        "border-width": 2,
+        "background-opacity": 0.7,
+        opacity: 0.9,
+        "z-index": 56,
       },
     },
     {
@@ -132,7 +159,10 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       style: {
         width: 3.5,
         "line-color": p.edge,
+        // Bezier + step-size fans parallel edges (multiple doors between the
+        // same two rooms) into distinct curves instead of stacking on one line.
         "curve-style": "bezier",
+        "control-point-step-size": 28,
         "target-arrow-shape": "none",
         opacity: p.edgeOpacity,
         "z-index": 1,
@@ -142,12 +172,21 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
         events: "yes",
       },
     },
-    // Heal colours: door=yellow, space↔space=green, stair=purple.
+    // Legend channels: IFC door amber, door heal pink, space heal green, stair purple.
+    {
+      selector: "edge[heal = 'ifc']",
+      style: {
+        width: 3.25,
+        "line-color": p.ifcDoor,
+        opacity: 0.95,
+        "z-index": 2,
+      },
+    },
     {
       selector: "edge[heal = 'door']",
       style: {
         width: 3.25,
-        "line-color": "#eab308",
+        "line-color": p.doorHeal,
         opacity: 0.95,
         "z-index": 2,
       },
@@ -156,7 +195,7 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       selector: "edge[heal = 'space']",
       style: {
         width: 3.25,
-        "line-color": "#22c55e",
+        "line-color": p.spaceHeal,
         opacity: 0.95,
         "z-index": 2,
       },
@@ -165,7 +204,7 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       selector: "edge[heal = 'stair']",
       style: {
         width: 3.25,
-        "line-color": "#7c3aed",
+        "line-color": p.stairHeal,
         opacity: 0.95,
         "z-index": 2,
       },
@@ -184,7 +223,7 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       selector: "edge[vertical = 1][heal = 'stair']",
       style: {
         "line-style": "solid",
-        "line-color": "#7c3aed",
+        "line-color": p.stairHeal,
         width: 2.75,
         opacity: 0.95,
         "z-index": 2,
@@ -201,13 +240,54 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       },
     },
     {
+      // Route hop: solid heal-colour underlay + white marching dashes on top.
       selector: "edge[onPath = 1]",
       style: {
-        width: 5.5,
-        "line-color": p.path,
-        "line-style": "solid",
+        width: 2.75,
+        "line-color": "#ffffff",
+        "line-style": "dashed",
+        "line-dash-pattern": [7, 9],
+        "line-dash-offset": 0,
+        "underlay-color": p.edge,
+        "underlay-padding": 3.5,
+        "underlay-opacity": 0.95,
         opacity: 1,
         "z-index": 999,
+      },
+    },
+    {
+      selector: "edge[onPath = 1][heal = 'ifc']",
+      style: { "underlay-color": p.ifcDoor },
+    },
+    {
+      selector: "edge[onPath = 1][heal = 'door']",
+      style: { "underlay-color": p.doorHeal },
+    },
+    {
+      selector: "edge[onPath = 1][heal = 'space']",
+      style: { "underlay-color": p.spaceHeal },
+    },
+    {
+      selector: "edge[onPath = 1][heal = 'stair']",
+      style: { "underlay-color": p.stairHeal },
+    },
+    {
+      selector: "edge[onPath = 1][vertical = 1]",
+      style: { "underlay-color": p.vertical },
+    },
+    {
+      selector: "edge[onPath = 1][vertical = 1][heal = 'stair']",
+      style: { "underlay-color": p.stairHeal },
+    },
+    {
+      // Selection uses overlay (not underlay) so it still shows on route hops
+      // whose underlay is already the heal colour.
+      selector: "edge[selected = 1]",
+      style: {
+        "overlay-color": p.selectedFill,
+        "overlay-padding": 8,
+        "overlay-opacity": 0.4,
+        "z-index": 1000,
       },
     },
   ];
@@ -229,6 +309,7 @@ export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
         label: node.label,
         kind: node.kind,
         onPath: 0,
+        selected: 0,
         nestedParent: node.nestedParent ? 1 : 0,
         excluded: node.excluded ? 1 : 0,
       },
@@ -251,7 +332,10 @@ export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
         inferred: edge.inferred ? 1 : 0,
         heal: edge.heal ?? "",
         excluded: edge.excluded ? 1 : 0,
+        selected: 0,
         onPath: 0,
+        /** +1 path flows source→target; −1 target→source; 0 not on path. */
+        pathDir: 0,
       },
       selectable: true,
       grabbable: false,
@@ -414,8 +498,11 @@ export async function createCytoscapeRuntime(
       const sizeChanged = Math.abs(w - lastWh.w) > 4 || Math.abs(h - lastWh.h) > 4;
       lastWh = { w, h };
       if (!sizeChanged) return;
-      // Only auto-fit when we never framed a real-sized pane — never fight user zoom/pan.
-      if (!userAdjustedView && !hasFittedWithSize) {
+      // Graph Viewer mounts parked off-screen at a fixed KEEP_ALIVE size, so the
+      // first fit often frames 640×480 — not the real pane. Whenever the
+      // container size changes and the user hasn't zoomed/panned yet, re-fit
+      // so opening the pane zooms to fit by default.
+      if (!userAdjustedView) {
         fitViewport();
       }
     } catch {
@@ -427,15 +514,62 @@ export async function createCytoscapeRuntime(
   ro.observe(container);
   window.addEventListener("resize", resize);
 
+  /** Marching dash offset for on-path edges (floorplan-style flow cue). */
+  const PATH_DASH_PERIOD = 18;
+  let pathDashOffset = 0;
+  let pathAnimRaf = 0;
+  const prefersReducedMotion =
+    typeof window !== "undefined" &&
+    window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+
+  const stopPathAnim = () => {
+    if (pathAnimRaf) cancelAnimationFrame(pathAnimRaf);
+    pathAnimRaf = 0;
+    cy.edges().forEach((e) => {
+      try {
+        e.removeStyle("line-dash-offset");
+      } catch {
+        /* ignore */
+      }
+    });
+  };
+
+  const startPathAnim = () => {
+    if (prefersReducedMotion || pathAnimRaf) return;
+    const tick = () => {
+      const onPath = cy.edges("[onPath = 1]");
+      if (onPath.length === 0) {
+        pathAnimRaf = 0;
+        return;
+      }
+      // Negative offset moves dashes source→target in Cytoscape; flip with
+      // pathDir so flow always matches the route order (start → end).
+      pathDashOffset = (pathDashOffset + 0.65) % PATH_DASH_PERIOD;
+      onPath.forEach((e) => {
+        const dir = Number(e.data("pathDir")) || 1;
+        e.style("line-dash-offset", -dir * pathDashOffset);
+      });
+      pathAnimRaf = requestAnimationFrame(tick);
+    };
+    pathAnimRaf = requestAnimationFrame(tick);
+  };
+
   let spaceHandler: ((nodeId: string) => void) | null = null;
+  let edgeTapHandler: ((edgeId: string) => void) | null = null;
   let cxtHandler: ((nodeId: string) => void) | null = null;
   let edgeCxtHandler: ((edgeId: string) => void) | null = null;
   cy.on("tap", "node", (evt) => {
     const id = String(evt.target.id());
     if (!id.startsWith("space:")) return;
-    // Left-click toggles live (non-excluded) spaces in the multi-selection.
-    if (Number(evt.target.data("excluded")) === 1) return;
+    // Live and soft-excluded spaces both toggle into the Inspector selection
+    // (excluded rooms stay on the canvas so they can be restored from there).
     spaceHandler?.(id);
+  });
+  cy.on("tap", "edge", (evt) => {
+    evt.stopPropagation();
+    const id = String(evt.target.id());
+    if (!id) return;
+    edgeTapHandler?.(id);
   });
   cy.on("cxttap", "node", (evt) => {
     evt.preventDefault();
@@ -521,17 +655,18 @@ export async function createCytoscapeRuntime(
         }
       });
     },
-    setPath(pathNodeIds, pathEdgeIds = [], selectedNodeIds = []) {
+    setPath(pathNodeIds, pathEdgeIds = [], selectedNodeIds = [], selectedEdgeIds = []) {
       const pathNodes = new Set(pathNodeIds);
       const selected = new Set(selectedNodeIds);
+      const selectedEdges = new Set(selectedEdgeIds);
       const displayPath = pathNodeIds.filter(
         (id) =>
           id.startsWith("space:") || id.startsWith("stair:") || id.startsWith("lift:"),
       );
-      const consecutive = new Set<string>();
+      // Ordered hops only (a→b), not the reverse — drives dash flow direction.
+      const flowForward = new Set<string>();
       for (let i = 0; i < displayPath.length - 1; i++) {
-        consecutive.add(`${displayPath[i]}|${displayPath[i + 1]}`);
-        consecutive.add(`${displayPath[i + 1]}|${displayPath[i]}`);
+        flowForward.add(`${displayPath[i]}|${displayPath[i + 1]}`);
       }
       const edgeIds = new Set(pathEdgeIds);
 
@@ -539,16 +674,22 @@ export async function createCytoscapeRuntime(
         cy.nodes().forEach((n) => {
           if (n.data("kind") === "label") return;
           const id = n.id();
-          n.data("onPath", pathNodes.has(id) || selected.has(id) ? 1 : 0);
+          n.data("onPath", pathNodes.has(id) ? 1 : 0);
+          n.data("selected", selected.has(id) ? 1 : 0);
         });
         cy.edges().forEach((e) => {
-          const key = `${e.data("source")}|${e.data("target")}`;
-          e.data(
-            "onPath",
-            edgeIds.has(e.id()) || consecutive.has(key) ? 1 : 0,
-          );
+          const src = String(e.data("source"));
+          const tgt = String(e.data("target"));
+          const forward = flowForward.has(`${src}|${tgt}`);
+          const reverse = flowForward.has(`${tgt}|${src}`);
+          const onPath = edgeIds.has(e.id()) || forward || reverse;
+          e.data("onPath", onPath ? 1 : 0);
+          e.data("pathDir", forward ? 1 : reverse ? -1 : 0);
+          e.data("selected", selectedEdges.has(e.id()) ? 1 : 0);
         });
       });
+      if (cy.edges("[onPath = 1]").length > 0) startPathAnim();
+      else stopPathAnim();
     },
     setExcludedEdges(edgeIds) {
       cy.batch(() => {
@@ -569,6 +710,7 @@ export async function createCytoscapeRuntime(
       fitViewport();
     },
     destroy() {
+      stopPathAnim();
       container.removeEventListener("wheel", onWheel, true);
       window.removeEventListener("resize", resize);
       ro.disconnect();
@@ -580,6 +722,9 @@ export async function createCytoscapeRuntime(
     },
     onSpaceTap(handler) {
       spaceHandler = handler;
+    },
+    onEdgeTap(handler) {
+      edgeTapHandler = handler;
     },
     onNodeCxtTap(handler) {
       cxtHandler = handler;

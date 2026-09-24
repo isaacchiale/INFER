@@ -124,8 +124,9 @@ class WallFootprint(BaseModel):
 
 
 class FurnitureFootprint(BaseModel):
-    """2D plan outline for an IfcFurnishingElement/IfcFurniture (top-down hull),
-    used as a local-pathfinding obstacle alongside walls."""
+    """2D plan outline for an IfcFurnishingElement/IfcFurniture, used as a
+    local-pathfinding obstacle alongside walls. Prefer mesh XY outline
+    (concave-capable) over convex hull / placement bbox."""
 
     global_id: str
     name: str = ""
@@ -133,6 +134,7 @@ class FurnitureFootprint(BaseModel):
     polygon: list[Point2D] = Field(default_factory=list)
     incomplete: bool = False
     method: Literal[
+        "ifc_mesh_xy_outline",
         "ifc_mesh_xy_hull",
         "ifc_placement_bbox",
         "unavailable",

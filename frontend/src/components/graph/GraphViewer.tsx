@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronDown, FolderOpen, Maximize2 } from "lucide-react";
+import { Check, ChevronDown, FolderOpen, Layers, Maximize2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   buildModelGraph,
@@ -13,6 +13,7 @@ import {
   deriveStoreyBands,
   graphPalette,
 } from "@/lib/graph-layout";
+import { exclusionNodeLabel, toastExclusionToggle } from "@/lib/exclusion-toast";
 import {
   createCytoscapeRuntime,
   type CytoscapeRuntime,
@@ -25,6 +26,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
@@ -48,6 +50,7 @@ export function GraphViewer({ className }: { className?: string }) {
     toggleExcludedNode,
     excludedEdgeIds,
     toggleExcludedEdge,
+    navmeshRoute,
   } = useModelData();
   const { selectedElementIds, selectElement, setIngestOpen } = useViewport();
   const theme = useAppTheme();
@@ -100,6 +103,12 @@ export function GraphViewer({ className }: { className?: string }) {
   toggleExcludedRef.current = toggleExcludedNode;
   const toggleExcludedEdgeRef = useRef(toggleExcludedEdge);
   toggleExcludedEdgeRef.current = toggleExcludedEdge;
+  const excludedNodeIdsRef = useRef(excludedNodeIds);
+  excludedNodeIdsRef.current = excludedNodeIds;
+  const excludedEdgeIdsRef = useRef(excludedEdgeIds);
+  excludedEdgeIdsRef.current = excludedEdgeIds;
+  const graphRef = useRef(graph);
+  graphRef.current = graph;
   const selectElementRef = useRef(selectElement);
   selectElementRef.current = selectElement;
   const [engineReady, setEngineReady] = useState(false);
@@ -208,11 +217,36 @@ export function GraphViewer({ className }: { className?: string }) {
         runtime.onSpaceTap((id) => {
           selectElementRef.current(id);
         });
+        runtime.onEdgeTap((id) => {
+          selectElementRef.current(`portal:${id}`);
+        });
         runtime.onNodeCxtTap((id) => {
+          const wasExcluded = excludedNodeIdsRef.current.has(id);
           toggleExcludedRef.current(id);
+          const node = graphRef.current?.nodes.find((n) => n.id === id);
+          toastExclusionToggle({
+            label: exclusionNodeLabel(id, node?.name),
+            wasExcluded,
+            kind: "node",
+            onUndo: () => toggleExcludedRef.current(id),
+          });
         });
         runtime.onEdgeCxtTap((id) => {
+          const wasExcluded = excludedEdgeIdsRef.current.has(id);
           toggleExcludedEdgeRef.current(id);
+          const layoutEdge = layoutRef.current?.edges.find((e) => e.id === id);
+          const sourceName = graphRef.current?.nodes.find((n) => n.id === layoutEdge?.source)?.name;
+          const targetName = graphRef.current?.nodes.find((n) => n.id === layoutEdge?.target)?.name;
+          const label =
+            sourceName?.trim() && targetName?.trim()
+              ? `${sourceName.trim()} ↔ ${targetName.trim()}`
+              : "Connection";
+          toastExclusionToggle({
+            label,
+            wasExcluded,
+            kind: "edge",
+            onUndo: () => toggleExcludedEdgeRef.current(id),
+          });
         });
         runtime.setTheme(themeRef.current);
         // Layout + fit come only from the layout effect — avoid a double setLayout
@@ -257,11 +291,18 @@ export function GraphViewer({ className }: { className?: string }) {
 
   useEffect(() => {
     if (!engineReady || !runtimeRef.current) return;
-    const selected = selectedElementIds.filter(
-      (id) => id.startsWith("space:") && !excludedNodeIds.has(id),
-    );
-    runtimeRef.current.setPath([], [], selected);
-  }, [selectedElementIds, excludedNodeIds, engineReady]);
+    const selected = selectedElementIds.filter((id) => id.startsWith("space:"));
+    const selectedEdges = selectedElementIds
+      .filter((id) => id.startsWith("portal:"))
+      .map((id) => id.slice("portal:".length));
+    const pathIds = (navmeshRoute?.graphNodeIds ?? []).filter((id) => !excludedNodeIds.has(id));
+    runtimeRef.current.setPath(pathIds, [], selected, selectedEdges);
+  }, [
+    selectedElementIds,
+    excludedNodeIds,
+    engineReady,
+    navmeshRoute?.graphNodeIds,
+  ]);
 
   return (
     <div
@@ -280,7 +321,7 @@ export function GraphViewer({ className }: { className?: string }) {
             overscrollBehavior: "contain",
           }}
           aria-label="Connectivity graph canvas"
-          title="Left-click space: select/deselect (multi). Right-click node: remove or restore. Right-click link: disable or restore (dashed). Pathfinding: right-click start/end on the floorplan navmesh."
+          title="Left-click space or link: select/deselect (multi). Right-click node: remove or restore. Right-click link: disable or restore (dashed). Pathfinding: right-click start/end on the floorplan navmesh."
         />
         <div className="pointer-events-none absolute left-2 top-2 z-50 flex flex-col items-start gap-1.5">
           <DropdownMenu>
@@ -318,37 +359,6 @@ export function GraphViewer({ className }: { className?: string }) {
               })}
             </DropdownMenuContent>
           </DropdownMenu>
-          {variant === "geometry" && (
-            <div className="pointer-events-none flex flex-wrap gap-2 rounded-md border border-border/80 bg-background/90 px-2 py-1 text-[10px] text-muted-foreground backdrop-blur-sm">
-              <span className="inline-flex items-center gap-1">
-                <span className="inline-block h-0.5 w-3 bg-slate-500" /> IFC
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="inline-block h-0.5 w-3 bg-[#eab308]" /> Door heal
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="inline-block h-0.5 w-3 bg-[#22c55e]" /> Space↔space
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="inline-block h-0.5 w-3 bg-[#7c3aed]" /> Stair heal
-              </span>
-            </div>
-          )}
-          {(excludedNodeIds.size > 0 || excludedEdgeIds.size > 0) && (
-            <span className="rounded-md border border-border/80 bg-background/90 px-2 py-1 text-[10px] text-muted-foreground backdrop-blur-sm">
-              {[
-                excludedNodeIds.size > 0
-                  ? `${excludedNodeIds.size} node${excludedNodeIds.size === 1 ? "" : "s"} removed`
-                  : null,
-                excludedEdgeIds.size > 0
-                  ? `${excludedEdgeIds.size} link${excludedEdgeIds.size === 1 ? "" : "s"} disabled`
-                  : null,
-              ]
-                .filter(Boolean)
-                .join(" · ")}{" "}
-              — right-click to restore
-            </span>
-          )}
           {variantBusy && (
             <span className="text-[10px] text-muted-foreground">
               {variant === "geometry" && excludedNodeIds.size > 0
@@ -388,30 +398,93 @@ export function GraphViewer({ className }: { className?: string }) {
           </div>
         )}
         {cyError && (
-          <div className="absolute inset-x-0 bottom-2 z-50 mx-3 rounded-md border border-destructive/40 bg-background/95 px-3 py-2 text-[11px] text-destructive">
+          <div className="pointer-events-none absolute bottom-2 left-2 right-2 z-50 rounded-md border border-destructive/40 bg-background/95 px-2 py-1.5 text-[11px] text-destructive backdrop-blur-sm">
             Graph render error: {cyError}
           </div>
         )}
-      </div>
+        {!cyError && (
+          <div className="pointer-events-none absolute bottom-2 left-2 right-2 z-20 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-border/80 bg-background/90 px-2 py-1.5 text-[11px] text-muted-foreground backdrop-blur-sm">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="pointer-events-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground transition-colors hover:bg-muted"
+                >
+                  <Layers className="size-3" aria-hidden />
+                  Legend
+                  <ChevronDown className="size-3 text-muted-foreground" aria-hidden />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-52 text-[12px]">
+                <DropdownMenuLabel className="text-[11px] text-muted-foreground">
+                  Legend
+                </DropdownMenuLabel>
+                <div className="flex flex-col gap-1.5 px-2 pb-2 text-foreground">
+                  {variant === "geometry" ? (
+                    <>
+                      <div className="flex items-center gap-1.5">
+                        <span className="inline-block h-0.5 w-3 bg-portal-door" /> IFC door
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="inline-block h-0.5 w-3 bg-portal-door-heal" /> Door heal
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="inline-block h-0.5 w-3 bg-portal-space" /> Space heal
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="inline-block h-0.5 w-3 bg-stair-glyph" /> Stair
+                      </div>
+                    </>
+                  ) : (
+                    <div className="flex items-center gap-1.5">
+                      <span className="inline-block h-0.5 w-3 bg-portal-door" /> IFC relation
+                    </div>
+                  )}
+                  <div className="flex items-center gap-1.5">
+                    <span className="inline-block size-2.5 rounded-full border-2 border-[var(--route-normal)] bg-transparent" />
+                    Route hop
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="inline-block size-2.5 rounded-sm bg-selection" /> Selected
+                  </div>
+                </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
 
-      <div className="relative z-10 shrink-0 border-t border-border bg-surface-raised px-3 py-2 text-[12px]">
-        <div className="mb-1 flex items-center justify-end gap-2">
-          <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
-            {graphSource === "model"
-              ? `Live · ${VARIANT_OPTIONS.find((o) => o.id === variant)?.label ?? variant}`
-              : EMPTY}
-          </span>
-        </div>
-        <div className="flex flex-wrap gap-x-3 gap-y-1">
-          <span>
-            Topology Size:{" "}
-            <strong>{hasGraph ? `${spaceCount} rooms` : EMPTY}</strong>
-          </span>
-          <span>
-            Network Connections:{" "}
-            <strong>{hasGraph ? `${graph!.edges.length} links` : EMPTY}</strong>
-          </span>
-        </div>
+            <span>
+              <span className="font-medium text-foreground">
+                {hasGraph ? spaceCount : EMPTY}
+              </span>{" "}
+              rooms
+            </span>
+            <span>
+              <span className="font-medium text-foreground">
+                {hasGraph ? graph!.edges.length : EMPTY}
+              </span>{" "}
+              links
+            </span>
+            <span className="text-muted-foreground/80">
+              {graphSource === "model"
+                ? `Live · ${VARIANT_OPTIONS.find((o) => o.id === variant)?.label ?? variant}`
+                : EMPTY}
+            </span>
+            {(excludedNodeIds.size > 0 || excludedEdgeIds.size > 0) && (
+              <span className="min-w-0 truncate">
+                {[
+                  excludedNodeIds.size > 0
+                    ? `${excludedNodeIds.size} node${excludedNodeIds.size === 1 ? "" : "s"} removed`
+                    : null,
+                  excludedEdgeIds.size > 0
+                    ? `${excludedEdgeIds.size} link${excludedEdgeIds.size === 1 ? "" : "s"} disabled`
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}{" "}
+                — right-click to restore
+              </span>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

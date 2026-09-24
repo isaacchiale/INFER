@@ -12,18 +12,13 @@ import type {
 import type { EvacuationLoadResult, NavmeshPortal, NavmeshRegion, StoreyNavmesh } from "@/lib/navmesh";
 
 /**
- * Navmesh portal kind colours — picked from the Okabe–Ito colorblind-safe
- * set. The old palette (orange door / yellow heal / green space / red exit)
- * put both a red↔green pair and an orange↔yellow pair in the same legend,
- * the two classic confusable pairs under red-green color blindness. Blocked
- * stays gray with its own slash mark, which doesn't rely on hue at all.
- * Values live in styles.css (`--portal-*`) so this is the app's real design
- * token system, not a second palette maintained by hand in this file.
+ * Navmesh portal kind colours — Okabe–Ito roles via `styles.css` tokens.
+ * Blue is reserved for routes; IFC doors are orange; space heal is green.
  */
 export const PORTAL_COLORS = {
-  door: "var(--portal-door)", // blue
-  doorHeal: "var(--portal-door-heal)", // yellow
-  spacePortal: "var(--portal-space)", // reddish purple
+  door: "var(--portal-door)", // muted amber — IFC door
+  doorHeal: "var(--portal-door-heal)", // pink — door heal
+  spacePortal: "var(--portal-space)", // green — space heal
   exit: "var(--hazard)", // red — same "danger" token the rest of the app uses
   blocked: "var(--portal-blocked)", // gray
 } as const;
@@ -142,37 +137,87 @@ function scalePolygon(polygon: Point2[], factor: number): Point2[] {
 /**
  * Evenly-spaced tread lines across a stair's plan footprint, perpendicular
  * to its longer (run) axis — the standard plan symbol, approximated from
- * the footprint's own bounding box since there's no per-tread geometry to
- * draw from. No up/down arrow: which way a given stair actually goes isn't
- * derivable from this footprint alone, so this doesn't claim a direction.
+ * the footprint's own geometry since there's no per-tread data to draw from.
+ *
+ * Uses the polygon's principal axes (not an axis-aligned bbox) so a rotated
+ * stair gets treads across its true run. Callers should still clip to the
+ * polygon: the OBB can slightly overshoot a non-rectangular footprint.
  */
 function stairTreadLinesD(polygon: Point2[], treadSpacing: number): string {
   if (polygon.length < 3) return "";
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
+  let cx = 0;
+  let cy = 0;
   for (const p of polygon) {
-    minX = Math.min(minX, p.x);
-    maxX = Math.max(maxX, p.x);
-    minY = Math.min(minY, p.y);
-    maxY = Math.max(maxY, p.y);
+    cx += p.x;
+    cy += p.y;
   }
-  const w = maxX - minX;
-  const h = maxY - minY;
-  if (w < 1e-6 || h < 1e-6) return "";
+  cx /= polygon.length;
+  cy /= polygon.length;
+
+  let xx = 0;
+  let xy = 0;
+  let yy = 0;
+  for (const p of polygon) {
+    const dx = p.x - cx;
+    const dy = p.y - cy;
+    xx += dx * dx;
+    xy += dx * dy;
+    yy += dy * dy;
+  }
+  // Largest-eigenvalue eigenvector of the 2×2 covariance — major (run) axis.
+  const det = Math.sqrt(Math.max(0, (xx - yy) * (xx - yy) + 4 * xy * xy));
+  let ux = 2 * xy;
+  let uy = yy - xx + det;
+  if (Math.abs(ux) + Math.abs(uy) < 1e-12) {
+    ux = 1;
+    uy = 0;
+  }
+  const ul = Math.hypot(ux, uy) || 1;
+  ux /= ul;
+  uy /= ul;
+  // Minor (across-tread) axis.
+  const vx = -uy;
+  const vy = ux;
+
+  let uMin = Infinity;
+  let uMax = -Infinity;
+  let vMin = Infinity;
+  let vMax = -Infinity;
+  for (const p of polygon) {
+    const dx = p.x - cx;
+    const dy = p.y - cy;
+    const u = dx * ux + dy * uy;
+    const v = dx * vx + dy * vy;
+    uMin = Math.min(uMin, u);
+    uMax = Math.max(uMax, u);
+    vMin = Math.min(vMin, v);
+    vMax = Math.max(vMax, v);
+  }
+  const run = uMax - uMin;
+  const across = vMax - vMin;
+  if (run < 1e-6 || across < 1e-6) return "";
+
   const segments: string[] = [];
-  if (w >= h) {
-    const count = Math.max(2, Math.round(w / treadSpacing));
+  // Treads run perpendicular to the longer axis (along the flight).
+  if (run >= across) {
+    const count = Math.max(2, Math.round(run / treadSpacing));
     for (let i = 1; i < count; i++) {
-      const x = minX + (w * i) / count;
-      segments.push(`M${x} ${minY} L${x} ${maxY}`);
+      const u = uMin + (run * i) / count;
+      const x0 = cx + ux * u + vx * vMin;
+      const y0 = cy + uy * u + vy * vMin;
+      const x1 = cx + ux * u + vx * vMax;
+      const y1 = cy + uy * u + vy * vMax;
+      segments.push(`M${x0} ${y0} L${x1} ${y1}`);
     }
   } else {
-    const count = Math.max(2, Math.round(h / treadSpacing));
+    const count = Math.max(2, Math.round(across / treadSpacing));
     for (let i = 1; i < count; i++) {
-      const y = minY + (h * i) / count;
-      segments.push(`M${minX} ${y} L${maxX} ${y}`);
+      const v = vMin + (across * i) / count;
+      const x0 = cx + ux * uMin + vx * v;
+      const y0 = cy + uy * uMin + vy * v;
+      const x1 = cx + ux * uMax + vx * v;
+      const y1 = cy + uy * uMax + vy * v;
+      segments.push(`M${x0} ${y0} L${x1} ${y1}`);
     }
   }
   return segments.join(" ");
@@ -261,6 +306,8 @@ export type FloorplanSvgLayersProps = {
   doorsByGlobalId: Map<string, DoorPortal>;
   palette: FloorplanPalette;
   selectedSpaces: SpaceFootprint[];
+  /** Portal ids currently in graph/floorplan selection (blue outline). */
+  selectedPortalIds: ReadonlySet<string>;
   roomStroke: number;
   markerBase: number;
   doorR: number;
@@ -302,6 +349,7 @@ function FloorplanSvgLayersImpl({
   doorsByGlobalId,
   palette,
   selectedSpaces,
+  selectedPortalIds,
   roomStroke,
   markerBase,
   doorR,
@@ -318,6 +366,7 @@ function FloorplanSvgLayersImpl({
   // useId()'s colons are valid in a url(#...) fragment reference, but
   // stripped anyway to sidestep any doubt rather than rely on that.
   const heatClipId = `evac-heat-clip-${useId().replace(/[^a-zA-Z0-9-]/g, "")}`;
+  const stairClipPrefix = `stair-tread-clip-${useId().replace(/[^a-zA-Z0-9-]/g, "")}`;
   const routeD = smoothPolylinePathD(pathPoints);
   const portalLoad = evacuationLoad?.portalLoad ?? null;
   const stairNodes = evacuationLoad?.stairNodes ?? [];
@@ -484,25 +533,34 @@ function FloorplanSvgLayersImpl({
               })
             : null}
           {layers.stairs
-            ? stairs.map((s) => (
-                <g key={`stair:${s.global_id}`}>
-                  <path
-                    d={polygonPathD(s.polygon)}
-                    fill="none"
-                    stroke="var(--stair-glyph)"
-                    strokeWidth={roomStroke * 1.4}
-                  >
-                    <title>{s.name ? `Stair: ${s.name}` : "Stair"}</title>
-                  </path>
-                  <path
-                    d={stairTreadLinesD(s.polygon, STAIR_TREAD_SPACING_M)}
-                    fill="none"
-                    stroke="var(--stair-glyph)"
-                    strokeWidth={roomStroke * 0.8}
-                    className="pointer-events-none"
-                  />
-                </g>
-              ))
+            ? stairs.map((s) => {
+                const clipId = `${stairClipPrefix}-${s.global_id}`;
+                return (
+                  <g key={`stair:${s.global_id}`}>
+                    <defs>
+                      <clipPath id={clipId}>
+                        <path d={polygonPathD(s.polygon)} />
+                      </clipPath>
+                    </defs>
+                    <path
+                      d={polygonPathD(s.polygon)}
+                      fill="none"
+                      stroke="var(--stair-glyph)"
+                      strokeWidth={roomStroke * 1.4}
+                    >
+                      <title>{s.name ? `Stair: ${s.name}` : "Stair"}</title>
+                    </path>
+                    <path
+                      d={stairTreadLinesD(s.polygon, STAIR_TREAD_SPACING_M)}
+                      fill="none"
+                      stroke="var(--stair-glyph)"
+                      strokeWidth={roomStroke * 0.8}
+                      clipPath={`url(#${clipId})`}
+                      className="pointer-events-none"
+                    />
+                  </g>
+                );
+              })
             : null}
           {layers.furniture
             ? furniture.map((item) => (
@@ -659,8 +717,26 @@ function FloorplanSvgLayersImpl({
               </g>
             );
           })}
+          {/* Furniture obstacles sit on top of regions so route pins aren't
+              dropped onto desks that the grid treats as non-walkable. */}
+          {layers.furniture
+            ? furniture.map((item) => (
+                <path
+                  key={`furniture:${item.global_id}`}
+                  d={polygonPathD(item.polygon)}
+                  fill={FURNITURE_FILL}
+                  fillOpacity={0.55}
+                  stroke={FURNITURE_STROKE}
+                  strokeWidth={roomStroke}
+                  className="pointer-events-none"
+                >
+                  <title>{item.name ? `Furniture: ${item.name}` : "Furniture"}</title>
+                </path>
+              ))
+            : null}
           {storeyNavmesh?.portals.map((p: NavmeshPortal) => {
             const blocked = blockedPortalIds.has(p.id);
+            const selected = selectedPortalIds.has(p.id);
             const load = portalLoad?.get(p.id) ?? 0;
             const door = p.doorGlobalId ? doorsByGlobalId.get(p.doorGlobalId) : null;
             const glyph =
@@ -671,6 +747,14 @@ function FloorplanSvgLayersImpl({
                     door.operation_type,
                   )
                 : null;
+            const kindLabel =
+              p.kind === "exit"
+                ? "Exit"
+                : p.kind === "space"
+                  ? "Space portal"
+                  : p.inferred
+                    ? "Door heal"
+                    : "IFC door";
             return (
               <g key={p.id}>
                 {glyph ? (
@@ -701,6 +785,17 @@ function FloorplanSvgLayersImpl({
                     plain kind color/size, evacuation mode or not, so it
                     reads as "what kind of portal" rather than competing
                     with the field underneath as a second heat encoding. */}
+                {selected ? (
+                  <circle
+                    cx={p.point.x}
+                    cy={p.point.y}
+                    r={portalR * 1.45}
+                    fill="none"
+                    stroke="var(--selection)"
+                    strokeWidth={selectedStroke}
+                    className="pointer-events-none"
+                  />
+                ) : null}
                 <circle
                   cx={p.point.x}
                   cy={p.point.y}
@@ -723,16 +818,8 @@ function FloorplanSvgLayersImpl({
                     {portalLoad
                       ? `${load} evacuation route${load === 1 ? "" : "s"} cross this portal`
                       : blocked
-                        ? "Blocked — click to unblock"
-                        : `${
-                            p.kind === "exit"
-                              ? "Exit"
-                              : p.kind === "space"
-                                ? "Space portal"
-                                : p.inferred
-                                  ? "Door heal"
-                                  : "IFC door"
-                          } — click to block`}
+                        ? `${kindLabel} — blocked · double-click to unblock`
+                        : `${kindLabel} — click to select · double-click to block`}
                     : {p.spaceA}
                     {p.spaceB ? ` ↔ ${p.spaceB}` : ""}
                   </title>
@@ -746,6 +833,7 @@ function FloorplanSvgLayersImpl({
                     stroke="#0f172a"
                     strokeWidth={doorStroke * 0.6}
                     strokeLinecap="round"
+                    className="pointer-events-none"
                   />
                 ) : null}
               </g>
@@ -835,9 +923,9 @@ function FloorplanSvgLayersImpl({
         <path
           key={`sel:${space.global_id}`}
           d={spacePathD(space.polygon, space.holes)}
-          fill="color-mix(in oklch, var(--ring) 28%, transparent)"
+          fill="color-mix(in oklch, var(--selection) 32%, transparent)"
           fillRule="evenodd"
-          stroke="var(--ring)"
+          stroke="var(--selection)"
           strokeWidth={selectedStroke}
         >
           <title>Selected: {space.name || space.global_id}</title>
