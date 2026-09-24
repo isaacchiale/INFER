@@ -17,7 +17,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
         </div>
         <IngestDialog />
-        {/* Selection card — screen-level like toasts, not tied to the 3D pane. */}
+        {/* Control panel — browse / details, screen-level like toasts. */}
         <Inspector />
         <Toaster position="bottom-right" offset="16px" />
       </TooltipProvider>

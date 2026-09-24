@@ -82,6 +82,10 @@ interface ViewportState {
   /** Raw setter — used by ModelDataState to drop a selection when its node is excluded. */
   setSelectedElementIds: (ids: string[] | ((prev: string[]) => string[])) => void;
 
+  /** Control panel (browse / details) open — TopBar + floating chip share this. */
+  controlPanelOpen: boolean;
+  setControlPanelOpen: (open: boolean) => void;
+
   ingestOpen: boolean;
   setIngestOpen: (v: boolean) => void;
 
@@ -212,6 +216,7 @@ function ViewportProvider({ children }: { children: ReactNode }) {
   const [activeStoreyId, setActiveStoreyId] = useState<string | "all">("all");
   const [showEvacuationLoad, setShowEvacuationLoad] = useState(false);
   const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
+  const [controlPanelOpen, setControlPanelOpen] = useState(false);
   const [ingestOpen, setIngestOpen] = useState(false);
   const [pendingIfc, setPendingIfc] = useState<{ name: string; buffer: Uint8Array } | null>(
     null,
@@ -256,6 +261,8 @@ function ViewportProvider({ children }: { children: ReactNode }) {
       selectedElementIds,
       selectElement,
       setSelectedElementIds,
+      controlPanelOpen,
+      setControlPanelOpen,
       ingestOpen,
       setIngestOpen,
       pendingIfc,
@@ -270,6 +277,7 @@ function ViewportProvider({ children }: { children: ReactNode }) {
       showEvacuationLoad,
       selectedElementIds,
       selectElement,
+      controlPanelOpen,
       ingestOpen,
       pendingIfc,
       queueIfcFile,
