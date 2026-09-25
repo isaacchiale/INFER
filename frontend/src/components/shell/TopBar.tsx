@@ -1,4 +1,4 @@
-import { Check, ChevronDown, SlidersHorizontal } from "lucide-react";
+import { Check, ChevronDown } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -6,20 +6,19 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { useInfer, useModelData, useViewport } from "@/state/infer-store";
+import { useInfer, useModelData } from "@/state/infer-store";
+import { ShareRouteButton } from "@/components/floorplan/ShareRouteButton";
 import { ThemeToggle } from "./ThemeToggle";
-import { cn } from "@/lib/utils";
 
 export function TopBar() {
   const { setIngestOpen, viewerStatus, viewerStatusKind, pendingIfc } = useInfer();
-  const { footprintsDocument, connectivityGraph } = useModelData();
-  const { controlPanelOpen, setControlPanelOpen } = useViewport();
+  const { footprintsDocument, connectivityGraph, navmeshRoute } = useModelData();
   const modelName =
     pendingIfc?.name.replace(/\.(ifc|ifczip|gml|indoorgml)$/i, "") || "No model loaded";
   const hasModel = Boolean(footprintsDocument || connectivityGraph);
 
   return (
-    <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background px-3">
+    <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-surface-raised px-3">
       <span className="text-[13px] font-semibold tracking-[0.14em] text-foreground">INFER</span>
 
       <DropdownMenu>
@@ -53,23 +52,10 @@ export function TopBar() {
         {viewerStatus}
       </p>
 
-      <div className="ml-auto flex items-center gap-0.5">
-        <button
-          type="button"
-          disabled={!hasModel}
-          aria-pressed={controlPanelOpen}
-          onClick={() => setControlPanelOpen(!controlPanelOpen)}
-          className={cn(
-            "inline-flex h-8 items-center gap-1.5 rounded-[5px] px-2 text-[12px] font-medium transition-colors disabled:opacity-40",
-            controlPanelOpen
-              ? "bg-muted text-foreground"
-              : "text-muted-foreground hover:bg-muted hover:text-foreground",
-          )}
-          title={controlPanelOpen ? "Minimize control panel" : "Expand control panel"}
-        >
-          <SlidersHorizontal className="size-3.5" aria-hidden />
-          Control
-        </button>
+      <div className="ml-auto flex items-center gap-1.5">
+        {hasModel ? (
+          <ShareRouteButton navmeshRoute={navmeshRoute} footprintsDocument={footprintsDocument} />
+        ) : null}
         <ThemeToggle />
       </div>
     </header>

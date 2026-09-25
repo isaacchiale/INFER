@@ -52,7 +52,8 @@ export function GraphViewer({ className }: { className?: string }) {
     toggleExcludedEdge,
     navmeshRoute,
   } = useModelData();
-  const { selectedElementIds, selectElement, setIngestOpen } = useViewport();
+  const { selectedElementIds, focusedElementId, selectElement, setFocusedElementId, setIngestOpen } =
+    useViewport();
   const theme = useAppTheme();
   const graph = connectivityGraph;
   const hasGraph = Boolean(graph && graph.nodes.length > 0);
@@ -111,6 +112,8 @@ export function GraphViewer({ className }: { className?: string }) {
   graphRef.current = graph;
   const selectElementRef = useRef(selectElement);
   selectElementRef.current = selectElement;
+  const setFocusedElementIdRef = useRef(setFocusedElementId);
+  setFocusedElementIdRef.current = setFocusedElementId;
   const [engineReady, setEngineReady] = useState(false);
   const [cyError, setCyError] = useState<string | null>(null);
 
@@ -220,6 +223,9 @@ export function GraphViewer({ className }: { className?: string }) {
         runtime.onEdgeTap((id) => {
           selectElementRef.current(`portal:${id}`);
         });
+        runtime.onBackgroundTap(() => {
+          setFocusedElementIdRef.current(null);
+        });
         runtime.onNodeCxtTap((id) => {
           const wasExcluded = excludedNodeIdsRef.current.has(id);
           toggleExcludedRef.current(id);
@@ -296,9 +302,13 @@ export function GraphViewer({ className }: { className?: string }) {
       .filter((id) => id.startsWith("portal:"))
       .map((id) => id.slice("portal:".length));
     const pathIds = (navmeshRoute?.graphNodeIds ?? []).filter((id) => !excludedNodeIds.has(id));
-    runtimeRef.current.setPath(pathIds, [], selected, selectedEdges);
+    const focused = focusedElementId?.startsWith("portal:")
+      ? focusedElementId.slice("portal:".length)
+      : focusedElementId;
+    runtimeRef.current.setPath(pathIds, [], selected, selectedEdges, focused);
   }, [
     selectedElementIds,
+    focusedElementId,
     excludedNodeIds,
     engineReady,
     navmeshRoute?.graphNodeIds,

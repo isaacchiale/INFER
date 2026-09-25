@@ -82,7 +82,15 @@ interface ViewportState {
   /** Raw setter — used by ModelDataState to drop a selection when its node is excluded. */
   setSelectedElementIds: (ids: string[] | ((prev: string[]) => string[])) => void;
 
-  /** Control panel (browse / details) open — TopBar + floating chip share this. */
+  /**
+   * The one selected item the Control tray is expanded on (or hovering) —
+   * drawn with a heavier highlight than the rest of the selection on the
+   * plan and graph. Always either null or a member of selectedElementIds.
+   */
+  focusedElementId: string | null;
+  setFocusedElementId: (id: string | null) => void;
+
+  /** Control tray expanded (docked right); collapsed leaves a thin strip. */
   controlPanelOpen: boolean;
   setControlPanelOpen: (open: boolean) => void;
 
@@ -216,7 +224,8 @@ function ViewportProvider({ children }: { children: ReactNode }) {
   const [activeStoreyId, setActiveStoreyId] = useState<string | "all">("all");
   const [showEvacuationLoad, setShowEvacuationLoad] = useState(false);
   const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
-  const [controlPanelOpen, setControlPanelOpen] = useState(false);
+  const [focusedElementId, setFocusedElementId] = useState<string | null>(null);
+  const [controlPanelOpen, setControlPanelOpen] = useState(true);
   const [ingestOpen, setIngestOpen] = useState(false);
   const [pendingIfc, setPendingIfc] = useState<{ name: string; buffer: Uint8Array } | null>(
     null,
@@ -229,11 +238,18 @@ function ViewportProvider({ children }: { children: ReactNode }) {
   const selectElement = useCallback((id: string | null) => {
     if (!id) {
       setSelectedElementIds([]);
+      setFocusedElementId(null);
       return;
     }
-    setSelectedElementIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-    );
+    setSelectedElementIds((prev) => {
+      if (prev.includes(id)) {
+        const next = prev.filter((x) => x !== id);
+        setFocusedElementId((f) => (f === id ? null : f));
+        return next;
+      }
+      setFocusedElementId(id);
+      return [...prev, id];
+    });
   }, []);
 
   const queueIfcFile = useCallback(async (file: File) => {
@@ -261,6 +277,8 @@ function ViewportProvider({ children }: { children: ReactNode }) {
       selectedElementIds,
       selectElement,
       setSelectedElementIds,
+      focusedElementId,
+      setFocusedElementId,
       controlPanelOpen,
       setControlPanelOpen,
       ingestOpen,
@@ -277,6 +295,7 @@ function ViewportProvider({ children }: { children: ReactNode }) {
       showEvacuationLoad,
       selectedElementIds,
       selectElement,
+      focusedElementId,
       controlPanelOpen,
       ingestOpen,
       pendingIfc,
@@ -300,7 +319,7 @@ export function useViewport(): ViewportState {
 const ModelDataCtx = createContext<ModelDataState | null>(null);
 
 function ModelDataProvider({ children }: { children: ReactNode }) {
-  const { setActiveStoreyId, setSelectedElementIds } = useViewport();
+  const { setActiveStoreyId, setSelectedElementIds, setFocusedElementId } = useViewport();
   const { setViewerCameraPose, setViewerModelBounds, setViewerCoordInverse } = useViewerPose();
 
   const [backendModelId, setBackendModelId] = useState<string | null>(null);
@@ -326,18 +345,19 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
 
   const toggleExcludedNode = useCallback(
     (nodeId: string) => {
+      const willExclude = !excludedNodeIds.has(nodeId);
       setExcludedNodeIds((prev) => {
         const next = new Set(prev);
-        if (next.has(nodeId)) next.delete(nodeId);
-        else next.add(nodeId);
+        if (willExclude) next.add(nodeId);
+        else next.delete(nodeId);
         return next;
       });
-      // Drop floorplan/graph highlight when the node is removed (or restored).
-      setSelectedElementIds((prev) =>
-        prev.includes(nodeId) ? prev.filter((id) => id !== nodeId) : prev,
-      );
+      if (willExclude) {
+        setSelectedElementIds((sel) => sel.filter((id) => id !== nodeId));
+        setFocusedElementId((f) => (f === nodeId ? null : f));
+      }
     },
-    [setSelectedElementIds],
+    [excludedNodeIds, setSelectedElementIds, setFocusedElementId],
   );
 
   const clearExcludedNodes = useCallback(() => {
@@ -346,18 +366,20 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
 
   const toggleExcludedEdge = useCallback(
     (edgeId: string) => {
+      const willExclude = !excludedEdgeIds.has(edgeId);
       setExcludedEdgeIds((prev) => {
         const next = new Set(prev);
-        if (next.has(edgeId)) next.delete(edgeId);
-        else next.add(edgeId);
+        if (willExclude) next.add(edgeId);
+        else next.delete(edgeId);
         return next;
       });
-      const portalSel = `portal:${edgeId}`;
-      setSelectedElementIds((prev) =>
-        prev.includes(portalSel) ? prev.filter((id) => id !== portalSel) : prev,
-      );
+      if (willExclude) {
+        const portalSel = `portal:${edgeId}`;
+        setSelectedElementIds((sel) => sel.filter((id) => id !== portalSel));
+        setFocusedElementId((f) => (f === portalSel ? null : f));
+      }
     },
-    [setSelectedElementIds],
+    [excludedEdgeIds, setSelectedElementIds, setFocusedElementId],
   );
 
   const clearExcludedEdges = useCallback(() => {

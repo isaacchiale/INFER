@@ -26,6 +26,8 @@ import {
   type EvacuationLoadMarker,
 } from "@/state/infer-store";
 import { continuousPolylineForStorey, pointInSpace } from "@/lib/geometric-path";
+import { toDisplayGraph } from "@/lib/graph-layout";
+import type { ConnectivityGraph } from "@/types/graph";
 import { buildStoreyNavmesh, regionAtPoint, type BuildingEvacuationLoadResult } from "@/lib/navmesh";
 import { computeBuildingEvacuationLoadAsync } from "@/lib/navmesh-worker-client";
 import type { FootprintsDocument, Point2D, SpaceFootprint } from "@/types/footprints";
@@ -82,8 +84,8 @@ import {
 import { useNavmeshRouting } from "./useNavmeshRouting";
 
 /** Same canvas colours as Graph Viewer (`graphPalette`). */
-const PLAN_CANVAS = "bg-[#F8FAFC] dark:bg-[#0F1117]";
-const PLAN_CANVAS_HEX: Record<AppTheme, string> = { light: "#F8FAFC", dark: "#0F1117" };
+const PLAN_CANVAS = "bg-white dark:bg-[#0F1117]";
+const PLAN_CANVAS_HEX: Record<AppTheme, string> = { light: "#FFFFFF", dark: "#0F1117" };
 
 /**
  * Wall poché inverts light/dark rather than reusing one hex — the whole
@@ -189,6 +191,36 @@ function spaceAtWorldPoint(
   return best;
 }
 
+function storeyIdForFocusedElement(
+  rawId: string | null,
+  footprints: FootprintsDocument | null,
+  graph: ConnectivityGraph | null,
+): string | null {
+  if (!rawId || !footprints) return null;
+  if (rawId.startsWith("space:")) {
+    const gid = rawId.slice("space:".length);
+    return footprints.spaces.find((s) => s.global_id === gid)?.storey_global_id ?? null;
+  }
+  if (!rawId.startsWith("portal:")) return null;
+  const portalId = rawId.slice("portal:".length);
+  const exit = /^viz-exit:door:[^:]+:space:(.+)$/.exec(portalId);
+  if (exit?.[1]) {
+    return footprints.spaces.find((s) => s.global_id === exit[1])?.storey_global_id ?? null;
+  }
+  if (!graph) return null;
+  const edge = toDisplayGraph(graph).edges.find((e) => e.id === portalId);
+  if (!edge) return null;
+  const spaceId = edge.source.startsWith("space:")
+    ? edge.source
+    : edge.target.startsWith("space:")
+      ? edge.target
+      : null;
+  if (!spaceId) return null;
+  return (
+    footprints.spaces.find((s) => `space:${s.global_id}` === spaceId)?.storey_global_id ?? null
+  );
+}
+
 export function FloorplanViewer({ className }: { className?: string }) {
   const {
     footprintsDocument,
@@ -206,6 +238,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
     activeStoreyId,
     setActiveStoreyId,
     selectedElementIds,
+    focusedElementId,
+    setFocusedElementId,
     selectElement,
     setIngestOpen,
     // Shared with InferModelViewport for evacuation-load markers only —
@@ -331,6 +365,25 @@ export function FloorplanViewer({ className }: { className?: string }) {
     }
     return storeys[0]?.global_id ?? null;
   }, [activeStoreyId, storeys]);
+
+  useEffect(() => {
+    const storeyId = storeyIdForFocusedElement(
+      focusedElementId,
+      footprintsDocument,
+      connectivityGraph,
+    );
+    if (!storeyId) return;
+    if (storeyId === activeStoreyId) return;
+    if (!storeys.some((s) => s.global_id === storeyId)) return;
+    setActiveStoreyId(storeyId);
+  }, [
+    focusedElementId,
+    footprintsDocument,
+    connectivityGraph,
+    activeStoreyId,
+    storeys,
+    setActiveStoreyId,
+  ]);
 
   const buildingPoints = useMemo(() => {
     if (!footprintsDocument) return [] as Point2[];
@@ -988,6 +1041,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
 
   const selectElementRef = useRef(selectElement);
   selectElementRef.current = selectElement;
+  const setFocusedElementIdRef = useRef(setFocusedElementId);
+  setFocusedElementIdRef.current = setFocusedElementId;
   /** Single-click selects after a short delay; double-click cancels and blocks. */
   const pendingPortalSelectRef = useRef<{
     id: string;
@@ -1358,7 +1413,10 @@ export function FloorplanViewer({ className }: { className?: string }) {
         }
         clearPendingPortalSelect();
         const region = regionAtPoint(pick.mesh, world);
-        if (!region) return;
+        if (!region) {
+          setFocusedElementIdRef.current(null);
+          return;
+        }
         selectElementRef.current(region.spaceId);
         return;
       }
@@ -1377,7 +1435,10 @@ export function FloorplanViewer({ className }: { className?: string }) {
           pick.storeyId,
           pick.excludedNodeIds,
         );
-        if (!space) return;
+        if (!space) {
+          setFocusedElementIdRef.current(null);
+          return;
+        }
         selectElementRef.current(`space:${space.global_id}`);
       }
     };
@@ -1623,6 +1684,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     palette={palette}
                     selectedSpaces={selectedSpaces}
                     selectedPortalIds={selectedPortalIds}
+                    focusedElementId={focusedElementId}
                     roomStroke={roomStroke}
                     markerBase={markerBase}
                     doorR={doorR}

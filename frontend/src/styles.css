@@ -91,7 +91,11 @@
 
 :root {
   --radius: 0.375rem;
-  --background: oklch(0.995 0.001 247);
+  /*
+   * Light chrome is a grey frame; 2D/graph paper and cards stay nearer
+   * white. Same roles as dark (canvas vs raised chrome), inverted.
+   */
+  --background: oklch(0.94 0.003 247);
   --foreground: oklch(0.21 0.015 250);
   --card: oklch(1 0 0);
   --card-foreground: oklch(0.21 0.015 250);
@@ -99,20 +103,20 @@
   --popover-foreground: oklch(0.21 0.015 250);
   --primary: oklch(0.52 0.13 255);
   --primary-foreground: oklch(0.99 0.002 247);
-  --secondary: oklch(0.955 0.004 247);
+  --secondary: oklch(0.88 0.004 247);
   --secondary-foreground: oklch(0.3 0.015 250);
-  --muted: oklch(0.958 0.004 247);
-  --muted-foreground: oklch(0.47 0.014 253);
-  --accent: oklch(0.955 0.012 255);
-  --accent-foreground: oklch(0.36 0.09 255);
+  --muted: oklch(0.88 0.004 247);
+  --muted-foreground: oklch(0.40 0.014 253);
+  --accent: oklch(0.84 0.012 255);
+  --accent-foreground: oklch(0.28 0.09 255);
   --destructive: oklch(0.52 0.19 27);
   --destructive-foreground: oklch(0.99 0.002 247);
-  --border: oklch(0.925 0.004 250);
-  --input: oklch(0.895 0.006 250);
+  --border: oklch(0.78 0.008 250);
+  --input: oklch(0.70 0.010 250);
   --ring: oklch(0.52 0.13 255);
 
-  --surface: oklch(0.975 0.003 247);
-  --surface-raised: oklch(1 0 0);
+  --surface: oklch(0.90 0.003 247);
+  --surface-raised: oklch(0.88 0.004 247);
   /* Viewport stays graphite-dark in both themes (CAD/GeoBIM readability) */
   --viewport: oklch(0.1854 0.0052 248.1);
   --viewport-grid: oklch(0.2958 0.0084 255.6);
@@ -133,13 +137,13 @@
   --chart-3: oklch(0.58 0.11 88);
   --chart-4: oklch(0.56 0.19 32);
   --chart-5: oklch(0.47 0.014 253);
-  --sidebar: oklch(0.97 0.003 247);
+  --sidebar: oklch(0.90 0.003 247);
   --sidebar-foreground: oklch(0.28 0.015 250);
   --sidebar-primary: oklch(0.47 0.09 232);
   --sidebar-primary-foreground: oklch(0.99 0.002 247);
-  --sidebar-accent: oklch(0.93 0.012 232);
+  --sidebar-accent: oklch(0.90 0.012 232);
   --sidebar-accent-foreground: oklch(0.34 0.05 232);
-  --sidebar-border: oklch(0.9 0.006 250);
+  --sidebar-border: oklch(0.84 0.006 250);
   --sidebar-ring: oklch(0.47 0.09 232);
 
   /*
@@ -157,8 +161,8 @@
   --door-glyph: oklch(0.7686 0.1647 70.08); /* same as IFC door muted amber */
   --stair-glyph: oklch(0.5413 0.2466 293.01); /* #7c3aed */
   --selection: oklch(0.757 0.112 230.5); /* #56B4E9 Okabe sky */
-  --furniture-fill: oklch(0.6002 0.1038 184.70); /* #0d9488 */
-  --furniture-stroke: oklch(0.5109 0.0861 186.39); /* #0f766e */
+  --furniture-fill: oklch(0.92 0.045 92); /* #F3E6C4 cream */
+  --furniture-stroke: oklch(0.74 0.055 80); /* #C4A36A tan edge */
   /*
    * Evacuation-load heat scale (see evacuationHeatColor): the familiar
    * traffic-light progression — green through --warning (yellow/orange)
@@ -316,6 +320,55 @@
  * `stroke-dasharray` + this offset animation on the path element itself. */
 @utility route-flow {
   animation: route-flow 900ms linear infinite;
+}
+
+/** Focused room fill — light / dark pulse. */
+@utility selection-glow {
+  animation: selection-glow 2.4s ease-in-out infinite;
+}
+
+@keyframes selection-glow {
+  0%,
+  100% {
+    fill-opacity: 0.22;
+  }
+  50% {
+    fill-opacity: 0.72;
+  }
+}
+
+/** Focused removed-space outline — pulse the stroke only, no fill. */
+@utility selection-glow-stroke {
+  animation: selection-glow-stroke 2.4s ease-in-out infinite;
+}
+
+@keyframes selection-glow-stroke {
+  0%,
+  100% {
+    stroke-opacity: 0.35;
+  }
+  50% {
+    stroke-opacity: 1;
+  }
+}
+
+/** Focused portal / link ring — grows and the outline fades. */
+@utility selection-glow-ring {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: selection-glow-ring 2.4s ease-in-out infinite;
+}
+
+@keyframes selection-glow-ring {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.45;
+  }
+  50% {
+    transform: scale(1.14);
+    opacity: 1;
+  }
 }
 
 @keyframes route-flow {

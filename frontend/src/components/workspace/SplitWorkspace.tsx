@@ -6,10 +6,8 @@ import {
 } from "react-resizable-panels";
 import { Box, GitFork, LayoutGrid, X } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useModelData } from "@/state/infer-store";
 import { GraphViewer } from "@/components/graph/GraphViewer";
 import { FloorplanViewer } from "@/components/floorplan/FloorplanViewer";
-import { ShareRouteButton } from "@/components/floorplan/ShareRouteButton";
 
 export type PaneId = "model3d" | "floorplan" | "graph";
 
@@ -19,7 +17,7 @@ type PaneState = {
 
 const PANE_META: Record<PaneId, { title: string; icon: ReactNode }> = {
   model3d: { title: "3D Viewer", icon: <Box className="size-3.5" /> },
-  floorplan: { title: "Floorplan Viewer", icon: <LayoutGrid className="size-3.5" /> },
+  floorplan: { title: "2D Viewer", icon: <LayoutGrid className="size-3.5" /> },
   graph: { title: "Graph Viewer", icon: <GitFork className="size-3.5" /> },
 };
 
@@ -143,7 +141,6 @@ const PARKED_STYLE: CSSProperties = {
 };
 
 export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
-  const { navmeshRoute, footprintsDocument } = useModelData();
   // Graph Viewer starts closed — it's a power-user/debugging tool now that
   // Floorplan covers selection (Inspector handles soft-exclude). 3D +
   // Floorplan are the default working view; Graph is opt-in via the PANES row.
@@ -273,9 +270,6 @@ export function SplitWorkspace({ modelPane }: { modelPane: ReactNode }) {
           );
         })}
 
-        <div className="ml-auto flex items-center">
-          <ShareRouteButton navmeshRoute={navmeshRoute} footprintsDocument={footprintsDocument} />
-        </div>
       </div>
 
       <div ref={workspaceRef} className="relative min-h-0 flex-1 overflow-hidden">

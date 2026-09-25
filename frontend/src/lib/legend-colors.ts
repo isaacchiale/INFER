@@ -22,6 +22,6 @@ export const LEGEND = {
   selectedFill: "#7DD3FC",
   /** Soft-removed / blocked. */
   disabled: "#94A3B8",
-  /** Furniture (unchanged teal). */
-  furniture: "#0D9488",
+  /** Furniture — cream, so it recedes against blue path / sky selection. */
+  furniture: "#F3E6C4",
 } as const;

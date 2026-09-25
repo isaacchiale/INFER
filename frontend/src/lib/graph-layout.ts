@@ -969,7 +969,7 @@ export function graphPalette(theme: "light" | "dark"): GraphThemePalette {
     };
   }
   return {
-    bg: "#F8FAFC",
+    bg: "#FFFFFF",
     label: "#64748B",
     spaceFill: "#E2E8F0",
     spaceLabel: "#1E293B",

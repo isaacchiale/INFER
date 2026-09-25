@@ -14,12 +14,11 @@ export function AppShell({ children }: { children: ReactNode }) {
           <TopBar />
           <div className="flex min-h-0 flex-1">
             <main className="flex min-w-0 flex-1 flex-col overflow-hidden">{children}</main>
+            <Inspector />
           </div>
         </div>
         <IngestDialog />
-        {/* Control panel — browse / details, screen-level like toasts. */}
-        <Inspector />
-        <Toaster position="bottom-right" offset="16px" />
+        <Toaster position="bottom-left" offset="16px" />
       </TooltipProvider>
     </InferProvider>
   );

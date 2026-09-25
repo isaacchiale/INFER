@@ -70,8 +70,8 @@ export function evacuationHeatColor(t: number): string {
 
 /** Fixed regardless of theme, like doors' amber — furniture obstacles need
  * to read distinctly from both wall poché shades (light and dark). */
-const FURNITURE_FILL = "var(--furniture-fill)"; // teal
-const FURNITURE_STROKE = "var(--furniture-stroke)"; // teal, darker
+const FURNITURE_FILL = "var(--furniture-fill)"; // cream
+const FURNITURE_STROKE = "var(--furniture-stroke)"; // tan edge
 
 /** Typical tread depth (metres) — world-space, same units as the footprint geometry. */
 const STAIR_TREAD_SPACING_M = 0.28;
@@ -308,6 +308,8 @@ export type FloorplanSvgLayersProps = {
   selectedSpaces: SpaceFootprint[];
   /** Portal ids currently in graph/floorplan selection (blue outline). */
   selectedPortalIds: ReadonlySet<string>;
+  /** Raw selection id (`space:…` / `portal:…`) the Control tray is focused on. */
+  focusedElementId: string | null;
   roomStroke: number;
   markerBase: number;
   doorR: number;
@@ -350,6 +352,7 @@ function FloorplanSvgLayersImpl({
   palette,
   selectedSpaces,
   selectedPortalIds,
+  focusedElementId,
   roomStroke,
   markerBase,
   doorR,
@@ -737,16 +740,8 @@ function FloorplanSvgLayersImpl({
           {storeyNavmesh?.portals.map((p: NavmeshPortal) => {
             const blocked = blockedPortalIds.has(p.id);
             const selected = selectedPortalIds.has(p.id);
+            const focused = focusedElementId === `portal:${p.id}`;
             const load = portalLoad?.get(p.id) ?? 0;
-            const door = p.doorGlobalId ? doorsByGlobalId.get(p.doorGlobalId) : null;
-            const glyph =
-              door && door.segment.length === 2 && door.normal
-                ? buildDoorGlyph(
-                    [door.segment[0]!, door.segment[1]!],
-                    door.normal,
-                    door.operation_type,
-                  )
-                : null;
             const kindLabel =
               p.kind === "exit"
                 ? "Exit"
@@ -757,45 +752,11 @@ function FloorplanSvgLayersImpl({
                     : "IFC door";
             return (
               <g key={p.id}>
-                {glyph ? (
-                  <g className="pointer-events-none">
-                    {glyph.arcs.map((arc, i) => (
-                      <path
-                        key={`arc:${i}`}
-                        d={arc}
-                        fill="none"
-                        stroke={palette.wallStroke}
-                        strokeWidth={doorStroke}
-                      />
-                    ))}
-                    {glyph.leaves.map((leaf, i) => (
-                      <path
-                        key={`leaf:${i}`}
-                        d={leaf}
-                        fill="none"
-                        stroke={palette.wallStroke}
-                        strokeWidth={doorStroke}
-                        strokeLinecap="round"
-                      />
-                    ))}
-                  </g>
-                ) : null}
                 {/* Traffic is now shown by the heatmap texture itself (see
                     evacuationHeatTexture) — this marker always keeps its
                     plain kind color/size, evacuation mode or not, so it
                     reads as "what kind of portal" rather than competing
                     with the field underneath as a second heat encoding. */}
-                {selected ? (
-                  <circle
-                    cx={p.point.x}
-                    cy={p.point.y}
-                    r={portalR * 1.45}
-                    fill="none"
-                    stroke="var(--selection)"
-                    strokeWidth={selectedStroke}
-                    className="pointer-events-none"
-                  />
-                ) : null}
                 <circle
                   cx={p.point.x}
                   cy={p.point.y}
@@ -834,6 +795,28 @@ function FloorplanSvgLayersImpl({
                     strokeWidth={doorStroke * 0.6}
                     strokeLinecap="round"
                     className="pointer-events-none"
+                  />
+                ) : null}
+                {selected && !focused ? (
+                  <circle
+                    cx={p.point.x}
+                    cy={p.point.y}
+                    r={portalR + selectedStroke * 0.6}
+                    fill="none"
+                    stroke="var(--selection)"
+                    strokeWidth={selectedStroke}
+                    className="pointer-events-none"
+                  />
+                ) : null}
+                {focused ? (
+                  <circle
+                    cx={p.point.x}
+                    cy={p.point.y}
+                    r={portalR + selectedStroke * 0.85}
+                    fill="none"
+                    stroke="var(--selection)"
+                    strokeWidth={selectedStroke * 3.4}
+                    className="pointer-events-none selection-glow-ring"
                   />
                 ) : null}
               </g>
@@ -919,18 +902,31 @@ function FloorplanSvgLayersImpl({
         />
       ) : null}
 
-      {selectedSpaces.map((space) => (
+      {selectedSpaces.map((space) => {
+        const focused = focusedElementId === `space:${space.global_id}`;
+        const excluded = excludedNodeIds.has(`space:${space.global_id}`);
+        const sw = selectedStroke * (focused ? 2.2 : 1);
+        return (
         <path
           key={`sel:${space.global_id}`}
           d={spacePathD(space.polygon, space.holes)}
-          fill="color-mix(in oklch, var(--selection) 32%, transparent)"
+          fill={
+            excluded
+              ? "none"
+              : `color-mix(in oklch, var(--selection) ${focused ? 70 : 22}%, transparent)`
+          }
           fillRule="evenodd"
           stroke="var(--selection)"
-          strokeWidth={selectedStroke}
+          strokeWidth={sw}
+          strokeDasharray={excluded ? `${sw * 3} ${sw * 2}` : undefined}
+          className={
+            focused ? (excluded ? "selection-glow-stroke" : "selection-glow") : undefined
+          }
         >
           <title>Selected: {space.name || space.global_id}</title>
         </path>
-      ))}
+        );
+      })}
     </>
   );
 }

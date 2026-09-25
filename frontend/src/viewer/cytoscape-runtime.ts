@@ -18,6 +18,8 @@ export type CytoscapeRuntime = {
     pathEdgeIds?: string[],
     selectedNodeIds?: string[],
     selectedEdgeIds?: string[],
+    /** Node or edge id the Control tray is focused on — drawn heavier than plain selection. */
+    focusedId?: string | null,
   ) => void;
   setTheme: (theme: "light" | "dark") => void;
   /** Soft-remove / restore edges without rebuilding node positions. */
@@ -32,6 +34,8 @@ export type CytoscapeRuntime = {
   onNodeCxtTap: (handler: (nodeId: string) => void) => void;
   /** Right-click toggle soft-remove / restore for connections. */
   onEdgeCxtTap: (handler: (edgeId: string) => void) => void;
+  /** Empty canvas click — unfocus, keep selection (same as 2D viewer). */
+  onBackgroundTap: (handler: () => void) => void;
 };
 
 function stylesheet(p: GraphThemePalette): StylesheetJson {
@@ -290,6 +294,28 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
         "z-index": 1000,
       },
     },
+    // Focused (Control tray row) — last so it wins over selected / excluded.
+    {
+      selector: "node[focused = 1]",
+      style: {
+        "overlay-color": p.selectedFill,
+        "overlay-padding": 10,
+        "overlay-opacity": 0.55,
+        "overlay-shape": "ellipse",
+        "border-width": 5,
+        "border-color": p.selectedFill,
+        "z-index": 80,
+      },
+    },
+    {
+      selector: "edge[focused = 1]",
+      style: {
+        "overlay-color": p.selectedFill,
+        "overlay-padding": 14,
+        "overlay-opacity": 0.8,
+        "z-index": 1100,
+      },
+    },
   ];
 }
 
@@ -310,6 +336,7 @@ export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
         kind: node.kind,
         onPath: 0,
         selected: 0,
+        focused: 0,
         nestedParent: node.nestedParent ? 1 : 0,
         excluded: node.excluded ? 1 : 0,
       },
@@ -333,6 +360,7 @@ export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
         heal: edge.heal ?? "",
         excluded: edge.excluded ? 1 : 0,
         selected: 0,
+        focused: 0,
         onPath: 0,
         /** +1 path flows source→target; −1 target→source; 0 not on path. */
         pathDir: 0,
@@ -554,10 +582,157 @@ export async function createCytoscapeRuntime(
     pathAnimRaf = requestAnimationFrame(tick);
   };
 
+  let focusGlowRaf = 0;
+  const stopFocusGlow = () => {
+    if (focusGlowRaf) cancelAnimationFrame(focusGlowRaf);
+    focusGlowRaf = 0;
+    cy.elements("[focused = 1]").forEach((el) => {
+      try {
+        el.removeStyle("overlay-opacity");
+        el.removeStyle("overlay-padding");
+      } catch {
+        /* ignore */
+      }
+    });
+  };
+  const startFocusGlow = () => {
+    if (prefersReducedMotion) return;
+    if (cy.elements("[focused = 1]").length === 0) {
+      stopFocusGlow();
+      return;
+    }
+    if (focusGlowRaf) return;
+    const t0 = performance.now();
+    const tick = (now: number) => {
+      const focused = cy.elements("[focused = 1]");
+      if (focused.length === 0) {
+        focusGlowRaf = 0;
+        return;
+      }
+      const wave = 0.5 + 0.5 * Math.sin(((now - t0) / 2400) * Math.PI * 2);
+      focused.forEach((el) => {
+        const opacity = 0.28 + 0.67 * wave;
+        const pad = el.isEdge() ? 8 + 12 * wave : 6 + 8 * wave;
+        el.style({
+          "overlay-opacity": opacity,
+          "overlay-padding": pad,
+        });
+      });
+      focusGlowRaf = requestAnimationFrame(tick);
+    };
+    focusGlowRaf = requestAnimationFrame(tick);
+  };
+
   let spaceHandler: ((nodeId: string) => void) | null = null;
   let edgeTapHandler: ((edgeId: string) => void) | null = null;
   let cxtHandler: ((nodeId: string) => void) | null = null;
   let edgeCxtHandler: ((edgeId: string) => void) | null = null;
+  let backgroundTapHandler: (() => void) | null = null;
+
+  const isGraphElement = (target: unknown): boolean => {
+    if (!target || typeof target !== "object") return false;
+    const t = target as { group?: () => string };
+    try {
+      const g = typeof t.group === "function" ? t.group() : "";
+      return g === "nodes" || g === "edges";
+    } catch {
+      return false;
+    }
+  };
+
+  const distToSeg = (
+    px: number,
+    py: number,
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+  ) => {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len2 = dx * dx + dy * dy;
+    if (len2 === 0) return Math.hypot(px - x1, py - y1);
+    const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / len2));
+    return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+  };
+
+  /** True when the pointer is on a space / stair / door — not blank canvas. */
+  const hitsGraphElement = (clientX: number, clientY: number): boolean => {
+    try {
+      const r = cy.renderer() as {
+        projectIntoViewport?: (x: number, y: number) => [number, number];
+        findNearestElements?: (
+          x: number,
+          y: number,
+          add?: boolean,
+          tooClose?: boolean,
+        ) => { length: number; forEach?: (fn: (el: { data: (k: string) => unknown; isNode: () => boolean; isEdge: () => boolean }) => void) => void };
+      };
+      if (r.projectIntoViewport && r.findNearestElements) {
+        const [x, y] = r.projectIntoViewport(clientX, clientY);
+        const found = r.findNearestElements(x, y, true, false);
+        if (found && found.length > 0) {
+          let hit = false;
+          found.forEach?.((el) => {
+            if (el.data("kind") === "label") return;
+            if (el.isNode() || el.isEdge()) hit = true;
+          });
+          if (hit || (found.length > 0 && !found.forEach)) return true;
+        }
+      }
+    } catch {
+      /* use geometry fallback */
+    }
+    const rect = container.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    for (const n of cy.nodes()) {
+      if (n.data("kind") === "label") continue;
+      const bb = n.renderedBoundingBox({ includeOverlays: true, includeLabels: false });
+      const cx = (bb.x1 + bb.x2) / 2;
+      const cy0 = (bb.y1 + bb.y2) / 2;
+      const rx = Math.max((bb.x2 - bb.x1) / 2, 1);
+      const ry = Math.max((bb.y2 - bb.y1) / 2, 1);
+      const dx = (x - cx) / rx;
+      const dy = (y - cy0) / ry;
+      if (dx * dx + dy * dy <= 1) return true;
+    }
+    for (const e of cy.edges()) {
+      const src = e.renderedSourceEndpoint();
+      const tgt = e.renderedTargetEndpoint();
+      const mid = e.renderedMidpoint();
+      if (
+        distToSeg(x, y, src.x, src.y, tgt.x, tgt.y) <= 16 ||
+        Math.hypot(x - mid.x, y - mid.y) <= 16
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Cytoscape `tap` often never fires on a real click — a 1–2px jitter is a
+  // pan. Mirror the 2D viewer: pointer-up without a drag, and no node/edge
+  // under the cursor, clears focus.
+  let pointerDown: { x: number; y: number } | null = null;
+  const onPointerDown = (e: PointerEvent) => {
+    if (e.button !== 0) return;
+    pointerDown = { x: e.clientX, y: e.clientY };
+  };
+  const onPointerUp = (e: PointerEvent) => {
+    if (e.button !== 0 || !pointerDown) return;
+    const dx = e.clientX - pointerDown.x;
+    const dy = e.clientY - pointerDown.y;
+    pointerDown = null;
+    if (dx * dx + dy * dy > 16) return;
+    if (!hitsGraphElement(e.clientX, e.clientY)) backgroundTapHandler?.();
+  };
+  container.addEventListener("pointerdown", onPointerDown);
+  container.addEventListener("pointerup", onPointerUp);
+
+  cy.on("tap", (evt) => {
+    if (!isGraphElement(evt.target)) backgroundTapHandler?.();
+  });
   cy.on("tap", "node", (evt) => {
     const id = String(evt.target.id());
     if (!id.startsWith("space:")) return;
@@ -655,7 +830,13 @@ export async function createCytoscapeRuntime(
         }
       });
     },
-    setPath(pathNodeIds, pathEdgeIds = [], selectedNodeIds = [], selectedEdgeIds = []) {
+    setPath(
+      pathNodeIds,
+      pathEdgeIds = [],
+      selectedNodeIds = [],
+      selectedEdgeIds = [],
+      focusedId = null,
+    ) {
       const pathNodes = new Set(pathNodeIds);
       const selected = new Set(selectedNodeIds);
       const selectedEdges = new Set(selectedEdgeIds);
@@ -676,6 +857,7 @@ export async function createCytoscapeRuntime(
           const id = n.id();
           n.data("onPath", pathNodes.has(id) ? 1 : 0);
           n.data("selected", selected.has(id) ? 1 : 0);
+          n.data("focused", focusedId === id ? 1 : 0);
         });
         cy.edges().forEach((e) => {
           const src = String(e.data("source"));
@@ -686,10 +868,20 @@ export async function createCytoscapeRuntime(
           e.data("onPath", onPath ? 1 : 0);
           e.data("pathDir", forward ? 1 : reverse ? -1 : 0);
           e.data("selected", selectedEdges.has(e.id()) ? 1 : 0);
+          e.data("focused", focusedId === e.id() ? 1 : 0);
         });
       });
       if (cy.edges("[onPath = 1]").length > 0) startPathAnim();
       else stopPathAnim();
+      cy.elements("[focused != 1]").forEach((el) => {
+        try {
+          el.removeStyle("overlay-opacity");
+          el.removeStyle("overlay-padding");
+        } catch {
+          /* ignore */
+        }
+      });
+      startFocusGlow();
     },
     setExcludedEdges(edgeIds) {
       cy.batch(() => {
@@ -711,7 +903,10 @@ export async function createCytoscapeRuntime(
     },
     destroy() {
       stopPathAnim();
+      stopFocusGlow();
       container.removeEventListener("wheel", onWheel, true);
+      container.removeEventListener("pointerdown", onPointerDown);
+      container.removeEventListener("pointerup", onPointerUp);
       window.removeEventListener("resize", resize);
       ro.disconnect();
       try {
@@ -731,6 +926,9 @@ export async function createCytoscapeRuntime(
     },
     onEdgeCxtTap(handler) {
       edgeCxtHandler = handler;
+    },
+    onBackgroundTap(handler) {
+      backgroundTapHandler = handler;
     },
   };
 }
