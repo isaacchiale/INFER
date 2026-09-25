@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, Search, SlidersHorizontal, X } from "lucide-
 import { useModelData, useViewport } from "@/state/infer-store";
 import { toDisplayGraph } from "@/lib/graph-layout";
 import { doorIdFromVizEdge } from "@/lib/navmesh";
+import { toast } from "sonner";
 import { toastExclusionToggle, exclusionNodeLabel } from "@/lib/exclusion-toast";
 import { cn } from "@/lib/utils";
 import type { EntitiesExtract } from "@/api/models";
@@ -12,7 +13,14 @@ import type { ConnectivityGraph } from "@/types/graph";
 const TRAY_W = 300;
 const SEARCH_CAP = 24;
 
-type BrowseSection = "all" | "region" | "ifc_door" | "door_heal" | "space_heal" | "exit";
+type BrowseSection =
+  | "all"
+  | "region"
+  | "ifc_door"
+  | "door_heal"
+  | "space_heal"
+  | "exit"
+  | "stair";
 
 type SpaceItem = {
   kind: "space";
@@ -20,6 +28,7 @@ type SpaceItem = {
   globalId: string;
   footprint: SpaceFootprint | null;
   entity: EntitiesExtract["spaces"][number] | null;
+  connectedLinkNames: string[];
 };
 
 type PortalItem = {
@@ -32,10 +41,22 @@ type PortalItem = {
   doorGlobalId: string | null;
   spaceAName: string;
   spaceBName: string | null;
+  connectedSpaceNames: string[];
   storeyName: string | null;
 };
 
-type SelectableItem = SpaceItem | PortalItem;
+type ConnectorItem = {
+  kind: "connector";
+  rawId: string;
+  connectorKind: "stair" | "lift";
+  globalId: string;
+  name: string;
+  storeyIds: string[];
+  storeyNames: string[];
+  connectedSpaceNames: string[];
+};
+
+type SelectableItem = SpaceItem | PortalItem | ConnectorItem;
 
 type CatalogRow = {
   rawId: string;
@@ -62,6 +83,26 @@ function storeyNameForSpace(
   return footprints?.storeys?.find((s) => s.global_id === storeyId)?.name ?? null;
 }
 
+function spaceIdsTouchingDoor(graph: ConnectivityGraph, doorId: string): string[] {
+  const ids: string[] = [];
+  for (const edge of graph.edges) {
+    const door =
+      edge.source.startsWith("door:")
+        ? edge.source
+        : edge.target.startsWith("door:")
+          ? edge.target
+          : null;
+    const space =
+      edge.source.startsWith("space:")
+        ? edge.source
+        : edge.target.startsWith("space:")
+          ? edge.target
+          : null;
+    if (door === doorId && space && !ids.includes(space)) ids.push(space);
+  }
+  return ids;
+}
+
 function resolvePortalItem(
   rawId: string,
   footprints: FootprintsDocument | null,
@@ -75,6 +116,7 @@ function resolvePortalItem(
     const doorGid = exitMatch[1]!;
     const spaceId = `space:${exitMatch[2]!}`;
     const door = footprints?.doors.find((d) => d.global_id === doorGid) ?? null;
+    const spaceAName = spaceLabel(footprints, spaceId);
     return {
       kind: "portal",
       rawId,
@@ -83,8 +125,9 @@ function resolvePortalItem(
       inferred: false,
       doorName: door?.name || null,
       doorGlobalId: doorGid,
-      spaceAName: spaceLabel(footprints, spaceId),
+      spaceAName,
       spaceBName: null,
+      connectedSpaceNames: [spaceAName, "Exterior"],
       storeyName: storeyNameForSpace(footprints, spaceId),
     };
   }
@@ -94,6 +137,8 @@ function resolvePortalItem(
   if (!edge) return null;
 
   if (edge.kind === "vertical") {
+    const spaceAName = spaceLabel(footprints, edge.source);
+    const spaceBName = spaceLabel(footprints, edge.target);
     return {
       kind: "portal",
       rawId,
@@ -102,8 +147,9 @@ function resolvePortalItem(
       inferred: Boolean(edge.inferred),
       doorName: null,
       doorGlobalId: null,
-      spaceAName: spaceLabel(footprints, edge.source),
-      spaceBName: spaceLabel(footprints, edge.target),
+      spaceAName,
+      spaceBName,
+      connectedSpaceNames: [spaceAName, spaceBName],
       storeyName: storeyNameForSpace(footprints, edge.source),
     };
   }
@@ -121,6 +167,16 @@ function resolvePortalItem(
     edge.method === "geom_opening_space" ||
     (portalKind === "door" && edge.method !== "ifc_rel_space_boundary");
 
+  const spaceAName = spaceLabel(footprints, edge.source);
+  const spaceBName = spaceLabel(footprints, edge.target);
+  const doorSpaceNames = doorNodeId
+    ? spaceIdsTouchingDoor(graph, doorNodeId).map((id) => spaceLabel(footprints, id))
+    : [];
+  const connectedSpaceNames = (doorSpaceNames.length ? doorSpaceNames : [spaceAName, spaceBName])
+    .filter(Boolean)
+    .filter((name, i, all) => all.indexOf(name) === i)
+    .sort((a, b) => a.localeCompare(b));
+
   return {
     kind: "portal",
     rawId,
@@ -129,8 +185,9 @@ function resolvePortalItem(
     inferred,
     doorName: door?.name || null,
     doorGlobalId: doorGid,
-    spaceAName: spaceLabel(footprints, edge.source),
-    spaceBName: spaceLabel(footprints, edge.target),
+    spaceAName,
+    spaceBName,
+    connectedSpaceNames,
     storeyName: storeyNameForSpace(footprints, edge.source),
   };
 }
@@ -191,22 +248,192 @@ function matchesQuery(q: string, ...parts: Array<string | null | undefined>): bo
   return hay.includes(q);
 }
 
+function storeyNameById(
+  footprints: FootprintsDocument | null,
+  entities: EntitiesExtract | null,
+  storeyId: string | null,
+): string | null {
+  if (!storeyId) return null;
+  const storeys = footprints?.storeys ?? entities?.storeys ?? [];
+  return storeys.find((s) => s.global_id === storeyId)?.name ?? null;
+}
+
+function resolveConnectorItem(
+  rawId: string,
+  footprints: FootprintsDocument | null,
+  graph: ConnectivityGraph | null,
+  entities: EntitiesExtract | null,
+): ConnectorItem | null {
+  const connectorKind: ConnectorItem["connectorKind"] | null = rawId.startsWith("stair:")
+    ? "stair"
+    : rawId.startsWith("lift:")
+      ? "lift"
+      : null;
+  if (!connectorKind) return null;
+  const prefix = `${connectorKind}:`;
+  const globalId = rawId.startsWith(prefix) ? rawId.slice(prefix.length) : rawId;
+  const nodeId = `${connectorKind}:${globalId}`;
+  const node = graph?.nodes.find((n) => n.id === nodeId || n.global_id === globalId) ?? null;
+  const fp = (footprints?.stairs ?? []).filter((s) => s.global_id === globalId);
+  const entity =
+    connectorKind === "stair"
+      ? (entities?.stairs.find((s) => s.global_id === globalId) ?? null)
+      : (entities?.lifts.find((s) => s.global_id === globalId) ?? null);
+  if (!node && !fp.length && !entity) return null;
+
+  const spaceIds: string[] = [];
+  if (graph) {
+    for (const edge of graph.edges) {
+      if (edge.kind !== "vertical") continue;
+      const spaceId =
+        edge.source === nodeId && edge.target.startsWith("space:")
+          ? edge.target
+          : edge.target === nodeId && edge.source.startsWith("space:")
+            ? edge.source
+            : null;
+      if (spaceId && !spaceIds.includes(spaceId)) spaceIds.push(spaceId);
+    }
+  }
+
+  const storeyIds: string[] = [];
+  const pushStorey = (id: string | null | undefined) => {
+    if (id && !storeyIds.includes(id)) storeyIds.push(id);
+  };
+  pushStorey(node?.storey_global_id);
+  for (const s of fp) pushStorey(s.storey_global_id);
+  for (const spaceId of spaceIds) {
+    const gid = spaceId.slice("space:".length);
+    pushStorey(footprints?.spaces.find((s) => s.global_id === gid)?.storey_global_id);
+  }
+
+  const storeyNames = storeyIds
+    .map((id) => storeyNameById(footprints, entities, id) ?? id)
+    .sort((a, b) => a.localeCompare(b));
+  const connectedSpaceNames = spaceIds
+    .map((id) => spaceLabel(footprints, id))
+    .filter((name, i, all) => all.indexOf(name) === i)
+    .sort((a, b) => a.localeCompare(b));
+
+  return {
+    kind: "connector",
+    rawId: nodeId,
+    connectorKind,
+    globalId,
+    name: node?.name?.trim() || fp[0]?.name?.trim() || entity?.name?.trim() || globalId,
+    storeyIds,
+    storeyNames,
+    connectedSpaceNames,
+  };
+}
+
+function spaceConnectionLabels(
+  spaceId: string,
+  footprints: FootprintsDocument | null,
+  graph: ConnectivityGraph | null,
+  display: ReturnType<typeof toDisplayGraph> | null,
+): string[] {
+  if (!graph) return [];
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  const push = (label: string) => {
+    if (!label || seen.has(label)) return;
+    seen.add(label);
+    labels.push(label);
+  };
+
+  for (const edge of display?.edges ?? []) {
+    if (edge.source !== spaceId && edge.target !== spaceId) continue;
+    if (edge.kind === "vertical") {
+      const other = edge.source === spaceId ? edge.target : edge.source;
+      if (other.startsWith("stair:") || other.startsWith("lift:")) {
+        const connector = resolveConnectorItem(other, footprints, graph, null);
+        push(
+          connector
+            ? `${itemKindLabel(connector)} · ${connector.name}`
+            : other.startsWith("lift:")
+              ? "Lift"
+              : "Stair",
+        );
+        continue;
+      }
+      push(`Vertical · ${spaceLabel(footprints, other)}`);
+      continue;
+    }
+    const item = resolvePortalItem(`portal:${edge.id}`, footprints, graph);
+    const otherId = edge.source === spaceId ? edge.target : edge.source;
+    const otherName = spaceLabel(footprints, otherId);
+    if (item?.doorName) {
+      push(otherName ? `${item.doorName} · ${otherName}` : item.doorName);
+    } else if (item) {
+      push(otherName ? `${portalKindLabel(item)} · ${otherName}` : portalKindLabel(item));
+    } else if (otherName) {
+      push(otherName);
+    }
+  }
+
+  for (const exitId of listExitPortalIds(graph)) {
+    if (!exitId.endsWith(`:${spaceId}`)) continue;
+    const item = resolvePortalItem(`portal:${exitId}`, footprints, graph);
+    push(item?.doorName ? `${item.doorName} → Exterior` : "Exit → Exterior");
+  }
+
+  return labels.sort((a, b) => a.localeCompare(b));
+}
+
+function listConnectorIds(
+  graph: ConnectivityGraph | null,
+  footprints: FootprintsDocument | null,
+  entities: EntitiesExtract | null,
+): string[] {
+  const ids = new Set<string>();
+  if (graph) {
+    for (const n of graph.nodes) {
+      if (n.kind === "stair" || n.kind === "lift") ids.add(n.id);
+    }
+  }
+  for (const s of footprints?.stairs ?? []) ids.add(`stair:${s.global_id}`);
+  for (const s of entities?.stairs ?? []) ids.add(`stair:${s.global_id}`);
+  for (const s of entities?.lifts ?? []) ids.add(`lift:${s.global_id}`);
+  return [...ids];
+}
+
 function itemTitle(item: SelectableItem): string {
   if (item.kind === "space") {
     return item.footprint?.name || item.entity?.name || item.globalId;
   }
+  if (item.kind === "connector") return item.name;
   return portalTitle(item);
 }
 
 function itemKindLabel(item: SelectableItem): string {
-  return item.kind === "space" ? "Region" : portalKindLabel(item);
+  if (item.kind === "space") return "Region";
+  if (item.kind === "connector") return item.connectorKind === "lift" ? "Lift" : "Stair";
+  return portalKindLabel(item);
 }
 
 function itemStorey(item: SelectableItem, footprints: FootprintsDocument | null, entities: EntitiesExtract | null): string {
   if (item.kind === "portal") return item.storeyName ?? "Unknown level";
+  if (item.kind === "connector") {
+    return item.storeyNames.length ? item.storeyNames.join(" · ") : "Unknown level";
+  }
   const storeyId = item.footprint?.storey_global_id ?? item.entity?.storey_global_id ?? null;
-  const storeys = footprints?.storeys ?? entities?.storeys ?? [];
-  return storeys.find((s) => s.global_id === storeyId)?.name ?? "Unknown level";
+  return storeyNameById(footprints, entities, storeyId) ?? "Unknown level";
+}
+
+function portalPairLabel(item: PortalItem): string {
+  return item.spaceBName
+    ? `${item.spaceAName} ↔ ${item.spaceBName}`
+    : `${item.spaceAName} → Exterior`;
+}
+
+function itemRowSubtitle(
+  item: SelectableItem,
+  footprints: FootprintsDocument | null,
+  entities: EntitiesExtract | null,
+): string {
+  const storey = itemStorey(item, footprints, entities);
+  if (item.kind !== "portal") return storey;
+  return `${storey} · ${portalPairLabel(item)}`;
 }
 
 function itemExcluded(
@@ -218,7 +445,32 @@ function itemExcluded(
     const nodeId = item.rawId.startsWith("space:") ? item.rawId : `space:${item.globalId}`;
     return excludedNodeIds.has(nodeId);
   }
+  if (item.kind === "connector") return excludedNodeIds.has(item.rawId);
   return excludedEdgeIds.has(item.portalId);
+}
+
+function DetailNameList({ names }: { names: string[] }) {
+  if (!names.length) {
+    return <span className="text-muted-foreground">None linked</span>;
+  }
+  return (
+    <>
+      {names.map((name) => (
+        <span key={name} className="block min-w-0 truncate" title={name}>
+          {name}
+        </span>
+      ))}
+    </>
+  );
+}
+
+function routingActionLabel(item: SelectableItem, removed: boolean): string {
+  if (item.kind === "space") return removed ? "Restore space" : "Remove space";
+  if (item.kind === "connector") {
+    const noun = item.connectorKind === "lift" ? "lift" : "stair";
+    return removed ? `Restore ${noun}` : `Remove ${noun}`;
+  }
+  return removed ? "Restore connection" : "Remove connection";
 }
 
 /**
@@ -234,6 +486,7 @@ export function Inspector() {
     excludedEdgeIds,
     toggleExcludedNode,
     toggleExcludedEdge,
+    replaceExcluded,
   } = useModelData();
   const {
     selectedElementIds,
@@ -279,14 +532,37 @@ export function Inspector() {
         if (portal) out.push(portal);
         continue;
       }
+      if (rawId.startsWith("stair:") || rawId.startsWith("lift:")) {
+        const connector = resolveConnectorItem(
+          rawId,
+          footprintsDocument,
+          connectivityGraph,
+          entitiesExtract,
+        );
+        if (connector) out.push(connector);
+        continue;
+      }
       const globalId = rawId.startsWith("space:") ? rawId.slice("space:".length) : rawId;
       const footprint = footprintsDocument?.spaces.find((s) => s.global_id === globalId) ?? null;
       const entity = entitiesExtract?.spaces.find((s) => s.global_id === globalId) ?? null;
       if (!footprint && !entity) continue;
-      out.push({ kind: "space", rawId, globalId, footprint, entity });
+      const spaceId = rawId.startsWith("space:") ? rawId : `space:${globalId}`;
+      out.push({
+        kind: "space",
+        rawId,
+        globalId,
+        footprint,
+        entity,
+        connectedLinkNames: spaceConnectionLabels(
+          spaceId,
+          footprintsDocument,
+          connectivityGraph,
+          display,
+        ),
+      });
     }
     return out;
-  }, [selectedElementIds, footprintsDocument, entitiesExtract, connectivityGraph]);
+  }, [selectedElementIds, footprintsDocument, entitiesExtract, connectivityGraph, display]);
 
   const liveSelectedCount = useMemo(
     () =>
@@ -301,7 +577,8 @@ export function Inspector() {
     const q = query.trim().toLowerCase();
     const rows: CatalogRow[] = [];
     const wantRegions = browseSection === "all" || browseSection === "region";
-    const wantPortals = browseSection !== "region";
+    const wantPortals = browseSection !== "region" && browseSection !== "stair";
+    const wantConnectors = browseSection === "all" || browseSection === "stair";
 
     if (wantRegions) for (const s of footprintsDocument?.spaces ?? []) {
       if (s.incomplete || s.polygon.length < 3) continue;
@@ -383,12 +660,47 @@ export function Inspector() {
       });
     }
 
+    if (wantConnectors) {
+      for (const rawId of listConnectorIds(connectivityGraph, footprintsDocument, entitiesExtract)) {
+        const item = resolveConnectorItem(
+          rawId,
+          footprintsDocument,
+          connectivityGraph,
+          entitiesExtract,
+        );
+        if (!item) continue;
+        if (storeyFilter && item.storeyIds.length && !item.storeyIds.includes(storeyFilter)) {
+          continue;
+        }
+        const subtitle = item.storeyNames.length
+          ? item.storeyNames.join(" · ")
+          : "Unknown level";
+        if (!matchesQuery(q, item.name, item.globalId, subtitle, itemKindLabel(item))) continue;
+        rows.push({
+          rawId: item.rawId,
+          title: item.name,
+          subtitle,
+          kindLabel: itemKindLabel(item),
+          removed: excludedNodeIds.has(item.rawId),
+        });
+      }
+    }
+
     rows.sort((a, b) => a.title.localeCompare(b.title));
-    return rows.slice(0, SEARCH_CAP);
+    // Exits / stairs / lifts are few and sort late (or get crowded out by
+    // rooms). Reserve them in the cap so All-types still surfaces them.
+    const reservedLabels = new Set(["Exit", "Stair", "Lift"]);
+    const reserved = rows.filter((r) => reservedLabels.has(r.kindLabel));
+    const rest = rows.filter((r) => !reservedLabels.has(r.kindLabel));
+    const keepReserved = reserved.slice(0, SEARCH_CAP);
+    return [...rest.slice(0, Math.max(0, SEARCH_CAP - keepReserved.length)), ...keepReserved].sort(
+      (a, b) => a.title.localeCompare(b.title),
+    );
   }, [
     browseSection,
     query,
     footprintsDocument,
+    entitiesExtract,
     display,
     connectivityGraph,
     excludedNodeIds,
@@ -399,6 +711,17 @@ export function Inspector() {
   const removedRows = useMemo((): CatalogRow[] => {
     const rows: CatalogRow[] = [];
     for (const id of excludedNodeIds) {
+      if (id.startsWith("stair:") || id.startsWith("lift:")) {
+        const item = resolveConnectorItem(id, footprintsDocument, connectivityGraph, entitiesExtract);
+        rows.push({
+          rawId: id,
+          title: item?.name || id,
+          subtitle: item?.storeyNames.length ? item.storeyNames.join(" · ") : "Removed connector",
+          kindLabel: item ? itemKindLabel(item) : id.startsWith("lift:") ? "Lift" : "Stair",
+          removed: true,
+        });
+        continue;
+      }
       if (!id.startsWith("space:")) continue;
       const gid = id.slice("space:".length);
       const space = footprintsDocument?.spaces.find((s) => s.global_id === gid);
@@ -429,7 +752,7 @@ export function Inspector() {
     }
     rows.sort((a, b) => a.title.localeCompare(b.title));
     return rows;
-  }, [excludedNodeIds, excludedEdgeIds, footprintsDocument, connectivityGraph]);
+  }, [excludedNodeIds, excludedEdgeIds, footprintsDocument, entitiesExtract, connectivityGraph]);
 
   // Newest pick (plan / graph / search) becomes the expanded row. Only when
   // something is added — deselect must not jump expand/focus to another row.
@@ -491,8 +814,13 @@ export function Inspector() {
   };
 
   const toggleRouting = (item: SelectableItem) => {
-    if (item.kind === "space") {
-      const nodeId = item.rawId.startsWith("space:") ? item.rawId : `space:${item.globalId}`;
+    if (item.kind === "space" || item.kind === "connector") {
+      const nodeId =
+        item.kind === "space"
+          ? item.rawId.startsWith("space:")
+            ? item.rawId
+            : `space:${item.globalId}`
+          : item.rawId;
       const wasExcluded = excludedNodeIds.has(nodeId);
       toggleExcludedNode(nodeId);
       toastExclusionToggle({
@@ -534,6 +862,25 @@ export function Inspector() {
       kind: "node",
       onUndo: () => toggleExcludedNode(rawId),
     });
+  };
+
+  const restoreAll = () => {
+    const nodeSnap = new Set(excludedNodeIds);
+    const edgeSnap = new Set(excludedEdgeIds);
+    const count = nodeSnap.size + edgeSnap.size;
+    if (!count) return;
+    replaceExcluded(new Set(), new Set());
+    toast(
+      count === 1
+        ? "Restored 1 item to routing"
+        : `Restored ${count} items to routing`,
+      {
+        action: {
+          label: "Undo",
+          onClick: () => replaceExcluded(nodeSnap, edgeSnap),
+        },
+      },
+    );
   };
 
   const removeAllSelected = () => {
@@ -583,7 +930,7 @@ export function Inspector() {
     <aside
       aria-label="Control"
       style={{ width: TRAY_W }}
-      className="flex h-full shrink-0 flex-col border-l-2 border-input bg-muted"
+      className="flex h-full min-w-0 shrink-0 flex-col overflow-hidden border-l-2 border-input bg-muted"
     >
       <div className="flex shrink-0 items-center gap-2 px-3 py-2.5">
         <p className="min-w-0 flex-1 text-[13px] font-semibold text-foreground">Control</p>
@@ -636,6 +983,7 @@ export function Inspector() {
               <option value="door_heal">Door heal</option>
               <option value="space_heal">Space heal</option>
               <option value="exit">Exit</option>
+              <option value="stair">Stair / lift</option>
             </select>
           </label>
         </div>
@@ -652,7 +1000,7 @@ export function Inspector() {
                 setSearchOpen(true);
               }}
               onFocus={() => setSearchOpen(true)}
-              placeholder="Find space, door, exit…"
+              placeholder="Find space, door, stair, exit…"
               className="h-8 w-full rounded-[4px] border border-border bg-muted/40 pl-7 pr-2 text-[12px] text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-ring focus:bg-background"
             />
         </label>
@@ -668,15 +1016,24 @@ export function Inspector() {
                     <button
                       type="button"
                       onClick={() => addFromSearch(row.rawId)}
-                      className="flex w-full flex-col gap-0.5 px-3 py-1.5 text-left hover:bg-muted/70"
+                      className={cn(
+                        "flex w-full flex-col gap-0.5 px-3 py-1.5 text-left",
+                        already
+                          ? "bg-selection/20 hover:bg-selection/30"
+                          : "hover:bg-muted/70",
+                      )}
                     >
-                      <span className="flex items-center gap-1.5 truncate text-[12px] font-medium text-foreground">
-                        <span className="truncate">{row.title}</span>
-                        <span className="shrink-0 text-[10px] font-normal text-muted-foreground">
-                          {row.kindLabel}
+                      <span className="flex w-full min-w-0 items-center justify-between gap-1.5 text-[12px] font-medium text-foreground">
+                        <span className="flex min-w-0 items-center gap-1.5">
+                          <span className="truncate">{row.title}</span>
+                          <span className="shrink-0 text-[10px] font-normal text-muted-foreground">
+                            {row.kindLabel}
+                          </span>
                         </span>
                         {already ? (
-                          <span className="shrink-0 text-[10px] text-muted-foreground">In list</span>
+                          <span className="shrink-0 text-[10px] font-medium text-selection">
+                            Selected
+                          </span>
                         ) : null}
                       </span>
                       <span className="truncate text-[11px] text-muted-foreground">{row.subtitle}</span>
@@ -731,7 +1088,7 @@ export function Inspector() {
                 onMouseEnter={() => setHoverId(item.rawId)}
                 onMouseLeave={() => setHoverId(null)}
                 className={cn(
-                  "mb-0.5 rounded-[5px] border-l-2",
+                  "mb-0.5 min-w-0 overflow-hidden rounded-[5px] border-l-2",
                   focused
                     ? "border-l-[var(--selection)] bg-[color-mix(in_oklch,var(--selection)_22%,transparent)]"
                     : "border-l-transparent hover:bg-muted/40",
@@ -761,7 +1118,7 @@ export function Inspector() {
                         ) : null}
                       </span>
                       <span className="block truncate text-[11px] text-muted-foreground">
-                        {itemStorey(item, footprintsDocument, entitiesExtract)}
+                        {itemRowSubtitle(item, footprintsDocument, entitiesExtract)}
                       </span>
                     </span>
                   </button>
@@ -775,23 +1132,41 @@ export function Inspector() {
                   </button>
                 </div>
                 {open ? (
-                  <div className="px-3 pb-2 pl-8">
-                    <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
-                      <dt className="text-muted-foreground">Level</dt>
-                      <dd className="truncate text-right text-foreground">
-                        {itemStorey(item, footprintsDocument, entitiesExtract)}
-                      </dd>
-                      <dt className="text-muted-foreground">Routing</dt>
-                      <dd className="text-right text-foreground">{removed ? "Removed" : "Live"}</dd>
+                  <div className="min-w-0 px-3 pb-2 pl-8">
+                    <dl className="flex min-w-0 flex-col gap-2 text-[12px]">
+                      <div className="min-w-0">
+                        <dt className="text-muted-foreground">Level</dt>
+                        <dd className="min-w-0 truncate text-foreground">
+                          {itemStorey(item, footprintsDocument, entitiesExtract)}
+                        </dd>
+                      </div>
+                      <div className="min-w-0">
+                        <dt className="text-muted-foreground">Routing</dt>
+                        <dd className="text-foreground">{removed ? "Removed" : "Live"}</dd>
+                      </div>
                       {item.kind === "portal" ? (
-                        <>
-                          <dt className="text-muted-foreground">From</dt>
-                          <dd className="truncate text-right text-foreground">{item.spaceAName}</dd>
-                          <dt className="text-muted-foreground">To</dt>
-                          <dd className="truncate text-right text-foreground">
-                            {item.spaceBName ?? "Exterior"}
+                        <div className="min-w-0">
+                          <dt className="text-muted-foreground">Connections</dt>
+                          <dd className="min-w-0 text-foreground">
+                            <DetailNameList names={item.connectedSpaceNames} />
                           </dd>
-                        </>
+                        </div>
+                      ) : null}
+                      {item.kind === "connector" ? (
+                        <div className="min-w-0">
+                          <dt className="text-muted-foreground">Spaces</dt>
+                          <dd className="min-w-0 text-foreground">
+                            <DetailNameList names={item.connectedSpaceNames} />
+                          </dd>
+                        </div>
+                      ) : null}
+                      {item.kind === "space" ? (
+                        <div className="min-w-0">
+                          <dt className="text-muted-foreground">Connections</dt>
+                          <dd className="min-w-0 text-foreground">
+                            <DetailNameList names={item.connectedLinkNames} />
+                          </dd>
+                        </div>
                       ) : null}
                     </dl>
                     <button
@@ -799,13 +1174,7 @@ export function Inspector() {
                       onClick={() => toggleRouting(item)}
                       className="mt-2 text-[12px] font-medium text-destructive hover:underline"
                     >
-                      {removed
-                        ? item.kind === "space"
-                          ? "Restore space"
-                          : "Restore connection"
-                        : item.kind === "space"
-                          ? "Remove space"
-                          : "Remove connection"}
+                      {routingActionLabel(item, removed)}
                     </button>
                   </div>
                 ) : null}
@@ -816,18 +1185,29 @@ export function Inspector() {
       </ul>
 
       <div className="shrink-0 border-t border-border">
-        <button
-          type="button"
-          onClick={() => setRemovedOpen((v) => !v)}
-          className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-[12px] text-muted-foreground hover:bg-muted/40 hover:text-foreground"
-        >
-          {removedOpen ? (
-            <ChevronDown className="size-3.5" />
-          ) : (
-            <ChevronRight className="size-3.5" />
-          )}
-          Removed{removedRows.length ? ` (${removedRows.length})` : ""}
-        </button>
+        <div className="flex items-center">
+          <button
+            type="button"
+            onClick={() => setRemovedOpen((v) => !v)}
+            className="flex min-w-0 flex-1 items-center gap-1.5 px-3 py-2 text-left text-[12px] text-muted-foreground hover:bg-muted/40 hover:text-foreground"
+          >
+            {removedOpen ? (
+              <ChevronDown className="size-3.5" />
+            ) : (
+              <ChevronRight className="size-3.5" />
+            )}
+            Removed{removedRows.length ? ` (${removedRows.length})` : ""}
+          </button>
+          {removedRows.length ? (
+            <button
+              type="button"
+              onClick={restoreAll}
+              className="shrink-0 px-3 py-2 text-[11px] text-foreground transition-colors hover:underline"
+            >
+              Restore all
+            </button>
+          ) : null}
+        </div>
         {removedOpen ? (
           <ul className="max-h-40 overflow-y-auto px-2 pb-2">
             {removedRows.length === 0 ? (

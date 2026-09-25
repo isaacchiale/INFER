@@ -46,7 +46,7 @@ function FootprintModelViewportImpl({
   const { footprintsDocument } = useModelData();
   // Shared with FloorplanViewer (and InferModelViewport, for IFC models) —
   // picking a storey in one pane isolates the same floor everywhere.
-  const { activeStoreyId, setActiveStoreyId } = useViewport();
+  const { activeStoreyId, setActiveStoreyId, selectViewedStorey } = useViewport();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -178,7 +178,7 @@ function FootprintModelViewportImpl({
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="max-h-64 min-w-[10rem] overflow-y-auto">
-              <DropdownMenuItem className="text-[12px]" onSelect={() => setActiveStoreyId("all")}>
+              <DropdownMenuItem className="text-[12px]" onSelect={() => selectViewedStorey("all")}>
                 {activeStoreyId === "all" ? (
                   <Check className="size-3.5" />
                 ) : (
@@ -195,7 +195,7 @@ function FootprintModelViewportImpl({
                   <DropdownMenuItem
                     key={s.global_id}
                     className="text-[12px]"
-                    onSelect={() => setActiveStoreyId(s.global_id)}
+                    onSelect={() => selectViewedStorey(s.global_id)}
                   >
                     {active ? <Check className="size-3.5" /> : <span className="size-3.5" />}
                     {label}

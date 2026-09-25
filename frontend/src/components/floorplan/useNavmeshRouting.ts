@@ -11,6 +11,7 @@ import {
 import {
   findGridMultiStoreyPath,
   findGridNearestExitPath,
+  findGridNearestExitPathBuilding,
   findGridPath,
   type StoreyGrid,
 } from "@/lib/storey-grid";
@@ -182,9 +183,8 @@ export function useNavmeshRouting({
     const meshFor = (storeyId: string) => allStoreyNavmeshes.find((m) => m.storeyId === storeyId);
     const unavailable = navmeshBusy ? "Recalculating navmesh?" : "Storey mesh unavailable";
 
-    // Exit routes only ever pin a start point ? re-find the nearest exit from
-    // scratch each time (an exclusion change could make a different exit the
-    // closest one, not just invalidate the old path to the same exit).
+    // Exit routes only pin a start ? re-find the nearest exit (any storey)
+    // each time, because an exclusion can change which exit is closest.
     if (isExitRoute) {
       const grid = gridFor(navmeshRoute.storeyId);
       const mesh = meshFor(navmeshRoute.storeyId);
@@ -192,10 +192,35 @@ export function useNavmeshRouting({
         setNavmeshPathNote(unavailable);
         return;
       }
-      const result = findGridNearestExitPath(grid, mesh, navmeshRoute.start, { blockedPortalIds });
+      const result =
+        footprintsDocument && connectivityGraph && storeyGrids.length
+          ? findGridNearestExitPathBuilding(
+              storeyGrids,
+              allStoreyNavmeshes,
+              connectivityGraph,
+              footprintsDocument,
+              { storeyId: navmeshRoute.storeyId, point: navmeshRoute.start },
+              { blockedPortalIds },
+            )
+          : (() => {
+              const same = findGridNearestExitPath(grid, mesh, navmeshRoute.start, {
+                blockedPortalIds,
+              });
+              const end = same.found ? same.points[same.points.length - 1]! : null;
+              return {
+                found: same.found,
+                note: same.note,
+                segments: same.found ? [{ storeyId: navmeshRoute.storeyId, points: same.points }] : [],
+                graphNodeIds: same.graphNodeIds,
+                end,
+                endStoreyId: end ? navmeshRoute.storeyId : null,
+              };
+            })();
       setNavmeshPathNote(result.found ? null : result.note);
-      const nextEnd = result.found ? result.points[result.points.length - 1]! : null;
-      const nextPoints = result.found ? result.points : null;
+      const nextEnd = result.found ? result.end : null;
+      const multi = result.found && new Set(result.segments.map((s) => s.storeyId)).size > 1;
+      const nextPoints = result.found && !multi ? (result.segments[0]?.points ?? null) : null;
+      const nextSegments = result.found && multi ? result.segments : null;
       const nextGraph = result.found ? result.graphNodeIds : null;
       const sameEnd =
         (navmeshRoute.end == null && nextEnd == null) ||
@@ -203,18 +228,29 @@ export function useNavmeshRouting({
           nextEnd != null &&
           navmeshRoute.end.x === nextEnd.x &&
           navmeshRoute.end.y === nextEnd.y);
+      const sameSegments =
+        (navmeshRoute.segments == null && nextSegments == null) ||
+        (navmeshRoute.segments != null &&
+          nextSegments != null &&
+          navmeshRoute.segments.length === nextSegments.length &&
+          navmeshRoute.segments.every(
+            (seg, i) =>
+              seg.storeyId === nextSegments[i]!.storeyId &&
+              samePoints(seg.points, nextSegments[i]!.points),
+          ));
       if (
         !sameEnd ||
+        navmeshRoute.endStoreyId !== (result.found ? result.endStoreyId : null) ||
         !samePoints(navmeshRoute.points, nextPoints) ||
-        navmeshRoute.segments ||
+        !sameSegments ||
         !sameIds(navmeshRoute.graphNodeIds, nextGraph)
       ) {
         setNavmeshRoute({
           ...navmeshRoute,
           end: nextEnd,
-          endStoreyId: nextEnd ? navmeshRoute.storeyId : null,
+          endStoreyId: result.found ? result.endStoreyId : null,
           points: nextPoints,
-          segments: null,
+          segments: nextSegments,
           graphNodeIds: nextGraph,
         });
       }

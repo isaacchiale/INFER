@@ -100,7 +100,7 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       },
     },
     {
-      // Nested IfcSpace parents — red circle; before onPath so a hop's blue
+      // Nested IfcSpace parents — red circle; before onPath so a hop's
       // ring wins when the parent is also on the route.
       selector: "node[nestedParent = 1]",
       style: {
@@ -112,12 +112,15 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       },
     },
     {
-      // Hop on a calculated route — blue outline ring only (fill unchanged).
+      // Hop on a calculated route — outline ring only (fill unchanged).
+      // Dark paper: solid white (sky selection already owns blue).
+      // Light paper: route blue (black looked wrong; sky fill vs this ring
+      // is enough contrast on white).
       selector: "node[onPath = 1]",
       style: {
         "underlay-color": p.pathUnderlay,
         "underlay-padding": 8,
-        "underlay-opacity": 0.55,
+        "underlay-opacity": 1,
         "underlay-shape": "ellipse",
         "z-index": 50,
       },
@@ -341,7 +344,11 @@ export function layoutToCyElements(layout: GraphLayout): ElementDefinition[] {
         excluded: node.excluded ? 1 : 0,
       },
       position: { x: node.x + node.w / 2, y: node.y + node.h / 2 },
-      selectable: node.kind === "space" || Boolean(node.excluded),
+      selectable:
+        node.kind === "space" ||
+        node.kind === "stair" ||
+        node.kind === "lift" ||
+        Boolean(node.excluded),
       grabbable: false,
     });
   }
@@ -629,17 +636,6 @@ export async function createCytoscapeRuntime(
   let edgeCxtHandler: ((edgeId: string) => void) | null = null;
   let backgroundTapHandler: (() => void) | null = null;
 
-  const isGraphElement = (target: unknown): boolean => {
-    if (!target || typeof target !== "object") return false;
-    const t = target as { group?: () => string };
-    try {
-      const g = typeof t.group === "function" ? t.group() : "";
-      return g === "nodes" || g === "edges";
-    } catch {
-      return false;
-    }
-  };
-
   const distToSeg = (
     px: number,
     py: number,
@@ -656,64 +652,44 @@ export async function createCytoscapeRuntime(
     return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
   };
 
-  /** True when the pointer is on a space / stair / door — not blank canvas. */
-  const hitsGraphElement = (clientX: number, clientY: number): boolean => {
-    try {
-      const r = cy.renderer() as {
-        projectIntoViewport?: (x: number, y: number) => [number, number];
-        findNearestElements?: (
-          x: number,
-          y: number,
-          add?: boolean,
-          tooClose?: boolean,
-        ) => { length: number; forEach?: (fn: (el: { data: (k: string) => unknown; isNode: () => boolean; isEdge: () => boolean }) => void) => void };
-      };
-      if (r.projectIntoViewport && r.findNearestElements) {
-        const [x, y] = r.projectIntoViewport(clientX, clientY);
-        const found = r.findNearestElements(x, y, true, false);
-        if (found && found.length > 0) {
-          let hit = false;
-          found.forEach?.((el) => {
-            if (el.data("kind") === "label") return;
-            if (el.isNode() || el.isEdge()) hit = true;
-          });
-          if (hit || (found.length > 0 && !found.forEach)) return true;
-        }
-      }
-    } catch {
-      /* use geometry fallback */
-    }
+  /**
+   * Nodes first (rectangle bbox — stairs are wide/short, so an ellipse miss
+   * used to drop the click). Edges only if the pointer is not on a node.
+   * Vertical links into a stair have a fat overlay and otherwise steal the tap.
+   */
+  const pickGraphElement = (
+    clientX: number,
+    clientY: number,
+  ): { kind: "node" | "edge"; id: string } | null => {
     const rect = container.getBoundingClientRect();
     const x = clientX - rect.left;
     const y = clientY - rect.top;
+    let bestNode: { id: string; area: number } | null = null;
     for (const n of cy.nodes()) {
       if (n.data("kind") === "label") continue;
-      const bb = n.renderedBoundingBox({ includeOverlays: true, includeLabels: false });
-      const cx = (bb.x1 + bb.x2) / 2;
-      const cy0 = (bb.y1 + bb.y2) / 2;
-      const rx = Math.max((bb.x2 - bb.x1) / 2, 1);
-      const ry = Math.max((bb.y2 - bb.y1) / 2, 1);
-      const dx = (x - cx) / rx;
-      const dy = (y - cy0) / ry;
-      if (dx * dx + dy * dy <= 1) return true;
+      const bb = n.renderedBoundingBox({ includeOverlays: false, includeLabels: false });
+      if (x < bb.x1 || x > bb.x2 || y < bb.y1 || y > bb.y2) continue;
+      const area = Math.max(1, (bb.x2 - bb.x1) * (bb.y2 - bb.y1));
+      if (!bestNode || area < bestNode.area) bestNode = { id: n.id(), area };
     }
+    if (bestNode) return { kind: "node", id: bestNode.id };
+    let bestEdge: { id: string; dist: number } | null = null;
     for (const e of cy.edges()) {
       const src = e.renderedSourceEndpoint();
       const tgt = e.renderedTargetEndpoint();
       const mid = e.renderedMidpoint();
-      if (
-        distToSeg(x, y, src.x, src.y, tgt.x, tgt.y) <= 16 ||
-        Math.hypot(x - mid.x, y - mid.y) <= 16
-      ) {
-        return true;
-      }
+      const d = Math.min(
+        distToSeg(x, y, src.x, src.y, tgt.x, tgt.y),
+        Math.hypot(x - mid.x, y - mid.y),
+      );
+      if (d > 16) continue;
+      if (!bestEdge || d < bestEdge.dist) bestEdge = { id: e.id(), dist: d };
     }
-    return false;
+    return bestEdge ? { kind: "edge", id: bestEdge.id } : null;
   };
 
-  // Cytoscape `tap` often never fires on a real click — a 1–2px jitter is a
-  // pan. Mirror the 2D viewer: pointer-up without a drag, and no node/edge
-  // under the cursor, clears focus.
+  // Cytoscape `tap` often never fires (1–2px jitter = pan) and stair nodes
+  // lose to overlapping vertical-edge overlays. Own left-click here.
   let pointerDown: { x: number; y: number } | null = null;
   const onPointerDown = (e: PointerEvent) => {
     if (e.button !== 0) return;
@@ -725,26 +701,29 @@ export async function createCytoscapeRuntime(
     const dy = e.clientY - pointerDown.y;
     pointerDown = null;
     if (dx * dx + dy * dy > 16) return;
-    if (!hitsGraphElement(e.clientX, e.clientY)) backgroundTapHandler?.();
+    const hit = pickGraphElement(e.clientX, e.clientY);
+    if (hit?.kind === "node") {
+      const id = hit.id;
+      if (
+        id.startsWith("space:") ||
+        id.startsWith("stair:") ||
+        id.startsWith("lift:")
+      ) {
+        spaceHandler?.(id);
+      }
+      return;
+    }
+    if (hit?.kind === "edge") {
+      edgeTapHandler?.(hit.id);
+      return;
+    }
+    backgroundTapHandler?.();
   };
   container.addEventListener("pointerdown", onPointerDown);
   container.addEventListener("pointerup", onPointerUp);
 
-  cy.on("tap", (evt) => {
-    if (!isGraphElement(evt.target)) backgroundTapHandler?.();
-  });
-  cy.on("tap", "node", (evt) => {
-    const id = String(evt.target.id());
-    if (!id.startsWith("space:")) return;
-    // Live and soft-excluded spaces both toggle into the Inspector selection
-    // (excluded rooms stay on the canvas so they can be restored from there).
-    spaceHandler?.(id);
-  });
   cy.on("tap", "edge", (evt) => {
     evt.stopPropagation();
-    const id = String(evt.target.id());
-    if (!id) return;
-    edgeTapHandler?.(id);
   });
   cy.on("cxttap", "node", (evt) => {
     evt.preventDefault();

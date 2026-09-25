@@ -297,7 +297,9 @@ export function GraphViewer({ className }: { className?: string }) {
 
   useEffect(() => {
     if (!engineReady || !runtimeRef.current) return;
-    const selected = selectedElementIds.filter((id) => id.startsWith("space:"));
+    const selected = selectedElementIds.filter(
+      (id) => id.startsWith("space:") || id.startsWith("stair:") || id.startsWith("lift:"),
+    );
     const selectedEdges = selectedElementIds
       .filter((id) => id.startsWith("portal:"))
       .map((id) => id.slice("portal:".length));
@@ -451,7 +453,7 @@ export function GraphViewer({ className }: { className?: string }) {
                     </div>
                   )}
                   <div className="flex items-center gap-1.5">
-                    <span className="inline-block size-2.5 rounded-full border-2 border-[var(--route-normal)] bg-transparent" />
+                    <span className="inline-block size-2.5 rounded-full border-2 border-[var(--route-normal)] bg-transparent dark:border-white" />
                     Route hop
                   </div>
                   <div className="flex items-center gap-1.5">

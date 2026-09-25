@@ -930,7 +930,7 @@ export type GraphThemePalette = {
   vertical: string;
   verticalOpacity: number;
   path: string;
-  /** Blue hop ring (underlay) — not a fill. */
+  /** Route-hop outline ring (underlay) — not a fill. White on dark paper. */
   pathUnderlay: string;
   /** Selected node fill (sky). */
   selectedFill: string;
@@ -958,7 +958,7 @@ export function graphPalette(theme: "light" | "dark"): GraphThemePalette {
       vertical: LEGEND.stair,
       verticalOpacity: 0.55,
       path: LEGEND.routeSoft,
-      pathUnderlay: LEGEND.routeSoft,
+      pathUnderlay: "#FFFFFF",
       selectedFill: LEGEND.selected,
       selectedLabel: "#0C4A6E",
       ifcDoor: LEGEND.ifcDoor,
@@ -982,6 +982,8 @@ export function graphPalette(theme: "light" | "dark"): GraphThemePalette {
     vertical: LEGEND.stair,
     verticalOpacity: 0.55,
     path: LEGEND.route,
+    // Light paper: keep the route-blue hop they liked. Sky selection
+    // fill vs this ring is readable here; a black ring is not.
     pathUnderlay: LEGEND.route,
     selectedFill: LEGEND.selectedFill,
     selectedLabel: "#0C4A6E",

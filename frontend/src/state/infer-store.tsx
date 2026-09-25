@@ -72,6 +72,8 @@ export type EvacuationLoadMarker = {
 interface ViewportState {
   activeStoreyId: string | "all";
   setActiveStoreyId: (id: string | "all") => void;
+  /** User picked a level in a viewer — clears focus so an off-level glow does not linger. */
+  selectViewedStorey: (id: string | "all") => void;
 
   /** Evacuation-load heat map toggle — shared so the 3D pane's markers (see EvacuationLoadMarker) turn on with the same control as the floorplan's. */
   showEvacuationLoad: boolean;
@@ -79,7 +81,6 @@ interface ViewportState {
 
   selectedElementIds: string[];
   selectElement: (id: string | null) => void;
-  /** Raw setter — used by ModelDataState to drop a selection when its node is excluded. */
   setSelectedElementIds: (ids: string[] | ((prev: string[]) => string[])) => void;
 
   /**
@@ -142,6 +143,11 @@ interface ModelDataState {
   excludedEdgeIds: ReadonlySet<string>;
   toggleExcludedEdge: (edgeId: string) => void;
   clearExcludedEdges: () => void;
+  /** Replace both exclusion sets (Restore all + Undo). */
+  replaceExcluded: (
+    nodeIds: ReadonlySet<string>,
+    edgeIds: ReadonlySet<string>,
+  ) => void;
   graphSource: "model" | "none";
   setModelGraph: (payload: {
     modelId: string;
@@ -222,6 +228,12 @@ const ViewportCtx = createContext<ViewportState | null>(null);
 
 function ViewportProvider({ children }: { children: ReactNode }) {
   const [activeStoreyId, setActiveStoreyId] = useState<string | "all">("all");
+  const selectViewedStorey = useCallback((id: string | "all") => {
+    setActiveStoreyId((prev) => {
+      if (prev !== id) setFocusedElementId(null);
+      return id;
+    });
+  }, []);
   const [showEvacuationLoad, setShowEvacuationLoad] = useState(false);
   const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
   const [focusedElementId, setFocusedElementId] = useState<string | null>(null);
@@ -272,6 +284,7 @@ function ViewportProvider({ children }: { children: ReactNode }) {
     () => ({
       activeStoreyId,
       setActiveStoreyId,
+      selectViewedStorey,
       showEvacuationLoad,
       setShowEvacuationLoad,
       selectedElementIds,
@@ -292,6 +305,7 @@ function ViewportProvider({ children }: { children: ReactNode }) {
     }),
     [
       activeStoreyId,
+      selectViewedStorey,
       showEvacuationLoad,
       selectedElementIds,
       selectElement,
@@ -319,7 +333,7 @@ export function useViewport(): ViewportState {
 const ModelDataCtx = createContext<ModelDataState | null>(null);
 
 function ModelDataProvider({ children }: { children: ReactNode }) {
-  const { setActiveStoreyId, setSelectedElementIds, setFocusedElementId } = useViewport();
+  const { setActiveStoreyId } = useViewport();
   const { setViewerCameraPose, setViewerModelBounds, setViewerCoordInverse } = useViewerPose();
 
   const [backendModelId, setBackendModelId] = useState<string | null>(null);
@@ -352,12 +366,8 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
         else next.delete(nodeId);
         return next;
       });
-      if (willExclude) {
-        setSelectedElementIds((sel) => sel.filter((id) => id !== nodeId));
-        setFocusedElementId((f) => (f === nodeId ? null : f));
-      }
     },
-    [excludedNodeIds, setSelectedElementIds, setFocusedElementId],
+    [excludedNodeIds],
   );
 
   const clearExcludedNodes = useCallback(() => {
@@ -373,18 +383,21 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
         else next.delete(edgeId);
         return next;
       });
-      if (willExclude) {
-        const portalSel = `portal:${edgeId}`;
-        setSelectedElementIds((sel) => sel.filter((id) => id !== portalSel));
-        setFocusedElementId((f) => (f === portalSel ? null : f));
-      }
     },
-    [excludedEdgeIds, setSelectedElementIds, setFocusedElementId],
+    [excludedEdgeIds],
   );
 
   const clearExcludedEdges = useCallback(() => {
     setExcludedEdgeIds(new Set());
   }, []);
+
+  const replaceExcluded = useCallback(
+    (nodeIds: ReadonlySet<string>, edgeIds: ReadonlySet<string>) => {
+      setExcludedNodeIds(new Set(nodeIds));
+      setExcludedEdgeIds(new Set(edgeIds));
+    },
+    [],
+  );
 
   const setModelGraph = useCallback(
     (payload: {
@@ -456,6 +469,7 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
       excludedEdgeIds,
       toggleExcludedEdge,
       clearExcludedEdges,
+      replaceExcluded,
       graphSource: connectivityGraph ? "model" : "none",
       setModelGraph,
       clearModelGraph,
@@ -477,6 +491,7 @@ function ModelDataProvider({ children }: { children: ReactNode }) {
       excludedEdgeIds,
       toggleExcludedEdge,
       clearExcludedEdges,
+      replaceExcluded,
       setModelGraph,
       clearModelGraph,
     ],

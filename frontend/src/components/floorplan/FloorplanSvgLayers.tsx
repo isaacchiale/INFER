@@ -306,6 +306,8 @@ export type FloorplanSvgLayersProps = {
   doorsByGlobalId: Map<string, DoorPortal>;
   palette: FloorplanPalette;
   selectedSpaces: SpaceFootprint[];
+  /** Stair footprint global_ids currently selected. */
+  selectedStairIds: ReadonlySet<string>;
   /** Portal ids currently in graph/floorplan selection (blue outline). */
   selectedPortalIds: ReadonlySet<string>;
   /** Raw selection id (`space:…` / `portal:…`) the Control tray is focused on. */
@@ -351,6 +353,7 @@ function FloorplanSvgLayersImpl({
   doorsByGlobalId,
   palette,
   selectedSpaces,
+  selectedStairIds,
   selectedPortalIds,
   focusedElementId,
   roomStroke,
@@ -538,6 +541,12 @@ function FloorplanSvgLayersImpl({
           {layers.stairs
             ? stairs.map((s) => {
                 const clipId = `${stairClipPrefix}-${s.global_id}`;
+                const excluded = excludedNodeIds.has(`stair:${s.global_id}`);
+                const selected = selectedStairIds.has(s.global_id);
+                const focused = focusedElementId === `stair:${s.global_id}`;
+                const sw = selected
+                  ? selectedStroke * (focused ? 2.2 : 1)
+                  : roomStroke * 1.4;
                 return (
                   <g key={`stair:${s.global_id}`}>
                     <defs>
@@ -547,19 +556,36 @@ function FloorplanSvgLayersImpl({
                     </defs>
                     <path
                       d={polygonPathD(s.polygon)}
-                      fill="none"
-                      stroke="var(--stair-glyph)"
-                      strokeWidth={roomStroke * 1.4}
+                      fill={
+                        selected && !excluded
+                          ? `color-mix(in oklch, var(--selection) ${focused ? 70 : 22}%, transparent)`
+                          : "none"
+                      }
+                      stroke={selected ? "var(--selection)" : "var(--stair-glyph)"}
+                      strokeWidth={sw}
+                      strokeDasharray={excluded ? `${sw * 3} ${sw * 2}` : undefined}
+                      opacity={excluded ? 0.6 : 1}
+                      className={
+                        focused
+                          ? excluded
+                            ? "selection-glow-stroke"
+                            : "selection-glow"
+                          : undefined
+                      }
                     >
-                      <title>{s.name ? `Stair: ${s.name}` : "Stair"}</title>
+                      <title>
+                        {(s.name ? `Stair: ${s.name}` : "Stair") +
+                          (excluded ? " (removed — restore from Control)" : "")}
+                      </title>
                     </path>
                     <path
                       d={stairTreadLinesD(s.polygon, STAIR_TREAD_SPACING_M)}
                       fill="none"
-                      stroke="var(--stair-glyph)"
+                      stroke={selected ? "var(--selection)" : "var(--stair-glyph)"}
                       strokeWidth={roomStroke * 0.8}
                       clipPath={`url(#${clipId})`}
                       className="pointer-events-none"
+                      opacity={excluded ? 0.6 : 1}
                     />
                   </g>
                 );

@@ -25,12 +25,12 @@ import {
   useViewerPose,
   type EvacuationLoadMarker,
 } from "@/state/infer-store";
-import { continuousPolylineForStorey, pointInSpace } from "@/lib/geometric-path";
+import { continuousPolylineForStorey, pointInPolygon, pointInSpace } from "@/lib/geometric-path";
 import { toDisplayGraph } from "@/lib/graph-layout";
 import type { ConnectivityGraph } from "@/types/graph";
 import { buildStoreyNavmesh, regionAtPoint, type BuildingEvacuationLoadResult } from "@/lib/navmesh";
 import { computeBuildingEvacuationLoadAsync } from "@/lib/navmesh-worker-client";
-import type { FootprintsDocument, Point2D, SpaceFootprint } from "@/types/footprints";
+import type { FootprintsDocument, Point2D, SpaceFootprint, StairFootprint } from "@/types/footprints";
 import {
   elevationsForVerticalRemap,
   normalizeElevationsToMetres,
@@ -191,6 +191,34 @@ function spaceAtWorldPoint(
   return best;
 }
 
+function stairAtWorldPoint(
+  world: Point2D,
+  footprints: FootprintsDocument | null,
+  storeyId: string,
+): StairFootprint | null {
+  if (!footprints?.stairs?.length) return null;
+  let best: StairFootprint | null = null;
+  let bestArea = Infinity;
+  for (const s of footprints.stairs) {
+    if (s.incomplete || s.polygon.length < 3) continue;
+    if (s.storey_global_id != null && s.storey_global_id !== storeyId) continue;
+    if (!pointInPolygon(world.x, world.y, s.polygon)) continue;
+    let area = 0;
+    const ring = s.polygon;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const a = ring[i]!;
+      const b = ring[j]!;
+      area += a.x * b.y - b.x * a.y;
+    }
+    area = Math.abs(area) * 0.5;
+    if (area < bestArea) {
+      best = s;
+      bestArea = area;
+    }
+  }
+  return best;
+}
+
 function storeyIdForFocusedElement(
   rawId: string | null,
   footprints: FootprintsDocument | null,
@@ -200,6 +228,26 @@ function storeyIdForFocusedElement(
   if (rawId.startsWith("space:")) {
     const gid = rawId.slice("space:".length);
     return footprints.spaces.find((s) => s.global_id === gid)?.storey_global_id ?? null;
+  }
+  if (rawId.startsWith("stair:")) {
+    const gid = rawId.slice("stair:".length);
+    const stairStorey = footprints.stairs?.find((s) => s.global_id === gid)?.storey_global_id;
+    if (stairStorey) return stairStorey;
+    if (graph) {
+      const spaceId = graph.edges.find(
+        (e) =>
+          e.kind === "vertical" &&
+          ((e.source === rawId && e.target.startsWith("space:")) ||
+            (e.target === rawId && e.source.startsWith("space:"))),
+      );
+      const sid = spaceId
+        ? (spaceId.source.startsWith("space:") ? spaceId.source : spaceId.target).slice(
+            "space:".length,
+          )
+        : null;
+      if (sid) return footprints.spaces.find((s) => s.global_id === sid)?.storey_global_id ?? null;
+    }
+    return null;
   }
   if (!rawId.startsWith("portal:")) return null;
   const portalId = rawId.slice("portal:".length);
@@ -237,6 +285,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const {
     activeStoreyId,
     setActiveStoreyId,
+    selectViewedStorey,
     selectedElementIds,
     focusedElementId,
     setFocusedElementId,
@@ -648,11 +697,10 @@ export function FloorplanViewer({ className }: { className?: string }) {
     const list = footprintsDocument?.stairs ?? [];
     return list.filter((s) => {
       if (s.incomplete || s.polygon.length < 3) return false;
-      if (excludedNodeIds.has(`stair:${s.global_id}`)) return false;
       if (s.storey_global_id == null) return true;
       return s.storey_global_id === displayStoreyId;
     });
-  }, [footprintsDocument, displayStoreyId, excludedNodeIds]);
+  }, [footprintsDocument, displayStoreyId]);
 
   /** Walls: match storey when known; unassigned walls show on every storey. */
   const walls = useMemo(() => {
@@ -698,7 +746,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     if (!footprintsDocument || !selectedElementIds.length) return [];
     const out = [];
     for (const raw of selectedElementIds) {
-      if (raw.startsWith("portal:")) continue;
+      if (raw.startsWith("portal:") || raw.startsWith("stair:") || raw.startsWith("lift:")) continue;
       const gid = raw.startsWith("space:") ? raw.slice("space:".length) : raw;
       const space = footprintsDocument.spaces.find((s) => s.global_id === gid);
       if (!space || space.incomplete || space.polygon.length < 3) continue;
@@ -708,6 +756,14 @@ export function FloorplanViewer({ className }: { className?: string }) {
     }
     return out;
   }, [footprintsDocument, selectedElementIds, displayStoreyId]);
+
+  const selectedStairIds = useMemo(() => {
+    const set = new Set<string>();
+    for (const raw of selectedElementIds) {
+      if (raw.startsWith("stair:")) set.add(raw.slice("stair:".length));
+    }
+    return set;
+  }, [selectedElementIds]);
 
   /** Portal selection ids (`portal:<navmeshPortalId>`) → blue outline on markers. */
   const selectedPortalIds = useMemo(() => {
@@ -1412,6 +1468,11 @@ export function FloorplanViewer({ className }: { className?: string }) {
           return;
         }
         clearPendingPortalSelect();
+        const stair = stairAtWorldPoint(world, pick.footprints, pick.storeyId);
+        if (stair) {
+          selectElementRef.current(`stair:${stair.global_id}`);
+          return;
+        }
         const region = regionAtPoint(pick.mesh, world);
         if (!region) {
           setFocusedElementIdRef.current(null);
@@ -1429,6 +1490,11 @@ export function FloorplanViewer({ className }: { className?: string }) {
         const svg = svgRef.current;
         if (!bounds || !svg) return;
         const world = clientToView(e.clientX, e.clientY, svg, bounds, cameraRef.current);
+        const stair = stairAtWorldPoint(world, pick.footprints, pick.storeyId);
+        if (stair) {
+          selectElementRef.current(`stair:${stair.global_id}`);
+          return;
+        }
         const space = spaceAtWorldPoint(
           world,
           pick.footprints,
@@ -1481,149 +1547,157 @@ export function FloorplanViewer({ className }: { className?: string }) {
     <div className={cn("relative flex h-full min-h-0 flex-col", PLAN_CANVAS, className)}>
       <div className={cn("relative min-h-0 flex-1", PLAN_CANVAS)}>
         <div className="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-start justify-between gap-2 p-3">
-          <div className="pointer-events-auto flex flex-col items-start gap-1.5">
-            <div className={cn(GLASS, "flex overflow-hidden")} role="tablist" aria-label="Plan display mode">
-              <button
-                type="button"
-                role="tab"
-                aria-selected={planDisplayMode === "ifc"}
-                onClick={() => setPlanDisplayMode("ifc")}
-                className={cn(
-                  "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
-                  planDisplayMode === "ifc"
-                    ? "bg-muted text-foreground"
-                    : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-                )}
-                title="Show floorplan geometry"
+          <div className="pointer-events-auto min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <div
+                className={cn(GLASS, "flex shrink-0 overflow-hidden")}
+                role="tablist"
+                aria-label="Plan display mode"
               >
-                <Box className="size-3.5" aria-hidden />
-                Floorplan
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={planDisplayMode === "navmesh"}
-                onClick={() => setPlanDisplayMode("navmesh")}
-                className={cn(
-                  "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
-                  planDisplayMode === "navmesh"
-                    ? "bg-muted text-foreground"
-                    : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-                )}
-                title="Show portal navmesh for this level"
-              >
-                <Network className="size-3.5" aria-hidden />
-                Navmesh
-              </button>
-            </div>
-
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  disabled={!storeys.length}
-                  className={cn(
-                    GLASS,
-                    "flex h-8 max-w-[220px] items-center gap-1.5 px-2.5 text-[12px] text-foreground transition-colors hover:bg-muted disabled:opacity-40",
-                  )}
-                  title="Storey"
-                >
-                  <span className="min-w-0 truncate">{activeStoreyLabel}</span>
-                  <ChevronDown aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start" className="max-h-64 min-w-[10rem] overflow-y-auto">
-                {storeys.map((s) => {
-                  const label =
-                    s.name?.trim() ||
-                    (s.elevation != null ? `E${s.elevation}` : s.global_id.slice(0, 8));
-                  const active = displayStoreyId === s.global_id;
-                  return (
-                    <DropdownMenuItem
-                      key={s.global_id}
-                      className="text-[12px]"
-                      onSelect={() => setActiveStoreyId(s.global_id)}
-                    >
-                      {active ? <Check className="size-3.5" /> : <span className="size-3.5" />}
-                      {label}
-                    </DropdownMenuItem>
-                  );
-                })}
-              </DropdownMenuContent>
-            </DropdownMenu>
-
-            {planDisplayMode === "navmesh" ? (
-              <>
-              <div className={cn(GLASS, "flex overflow-hidden")} role="tablist" aria-label="Navmesh pick mode">
                 <button
                   type="button"
                   role="tab"
-                  aria-selected={navmeshPickMode === "route"}
-                  onClick={() => {
-                    setNavmeshPickMode("route");
-                    clearNavmeshRoute();
-                  }}
+                  aria-selected={planDisplayMode === "ifc"}
+                  onClick={() => setPlanDisplayMode("ifc")}
                   className={cn(
                     "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
-                    navmeshPickMode === "route"
+                    planDisplayMode === "ifc"
                       ? "bg-muted text-foreground"
                       : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
                   )}
-                  title="Right-click two points to route between them"
+                  title="Show IFC geometry"
                 >
-                  <RouteIcon className="size-3.5" aria-hidden />
-                  Route
+                  <Box className="size-3.5" aria-hidden />
+                  IFC
                 </button>
                 <button
                   type="button"
                   role="tab"
-                  aria-selected={navmeshPickMode === "exit"}
-                  onClick={() => {
-                    setNavmeshPickMode("exit");
-                    clearNavmeshRoute();
-                  }}
+                  aria-selected={planDisplayMode === "navmesh"}
+                  onClick={() => setPlanDisplayMode("navmesh")}
                   className={cn(
                     "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
-                    navmeshPickMode === "exit"
+                    planDisplayMode === "navmesh"
                       ? "bg-muted text-foreground"
                       : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
                   )}
-                  title="Right-click a point to route to the nearest exit on this level"
+                  title="Show portal navmesh for this level"
                 >
-                  <LogOut className="size-3.5" aria-hidden />
-                  Nearest exit
+                  <Network className="size-3.5" aria-hidden />
+                  Navmesh
                 </button>
               </div>
-              <button
-                type="button"
-                aria-pressed={showEvacuationLoad}
-                onClick={() => setShowEvacuationLoad(!showEvacuationLoad)}
-                className={cn(
-                  GLASS,
-                  "pointer-events-auto inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
-                  showEvacuationLoad
-                    ? "bg-muted text-foreground"
-                    : "text-muted-foreground hover:bg-muted hover:text-foreground",
-                )}
-                title="Simulate every room's route to its nearest exit and heat-map which doors carry the most traffic"
-              >
-                <Flame
-                  className={cn("size-3.5", isEvacuationLoadPending && "animate-pulse")}
-                  aria-hidden
-                />
-                Evacuation load
-                {isEvacuationLoadPending ? (
-                  <span className="text-[10px] font-normal text-muted-foreground">
-                    computing…
-                  </span>
-                ) : null}
-              </button>
-              </>
-            ) : null}
+
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    disabled={!storeys.length}
+                    className={cn(
+                      GLASS,
+                      "flex h-8 max-w-[220px] shrink-0 items-center gap-1.5 px-2.5 text-[12px] text-foreground transition-colors hover:bg-muted disabled:opacity-40",
+                    )}
+                    title="Storey"
+                  >
+                    <span className="min-w-0 truncate">{activeStoreyLabel}</span>
+                    <ChevronDown aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="max-h-64 min-w-[10rem] overflow-y-auto">
+                  {storeys.map((s) => {
+                    const label =
+                      s.name?.trim() ||
+                      (s.elevation != null ? `E${s.elevation}` : s.global_id.slice(0, 8));
+                    const active = displayStoreyId === s.global_id;
+                    return (
+                      <DropdownMenuItem
+                        key={s.global_id}
+                        className="text-[12px]"
+                        onSelect={() => selectViewedStorey(s.global_id)}
+                      >
+                        {active ? <Check className="size-3.5" /> : <span className="size-3.5" />}
+                        {label}
+                      </DropdownMenuItem>
+                    );
+                  })}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              {planDisplayMode === "navmesh" ? (
+                <>
+                  <div
+                    className={cn(GLASS, "flex shrink-0 overflow-hidden")}
+                    role="tablist"
+                    aria-label="Navmesh pick mode"
+                  >
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={navmeshPickMode === "route"}
+                      onClick={() => {
+                        setNavmeshPickMode("route");
+                        clearNavmeshRoute();
+                      }}
+                      className={cn(
+                        "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                        navmeshPickMode === "route"
+                          ? "bg-muted text-foreground"
+                          : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                      )}
+                      title="Right-click two points to route between them"
+                    >
+                      <RouteIcon className="size-3.5" aria-hidden />
+                      Route
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={navmeshPickMode === "exit"}
+                      onClick={() => {
+                        setNavmeshPickMode("exit");
+                        clearNavmeshRoute();
+                      }}
+                      className={cn(
+                        "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                        navmeshPickMode === "exit"
+                          ? "bg-muted text-foreground"
+                          : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                      )}
+                      title="Right-click a point to route to the nearest exit — including on another level via stairs or lifts"
+                    >
+                      <LogOut className="size-3.5" aria-hidden />
+                      Nearest exit
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    aria-pressed={showEvacuationLoad}
+                    onClick={() => setShowEvacuationLoad(!showEvacuationLoad)}
+                    className={cn(
+                      GLASS,
+                      "inline-flex h-8 shrink-0 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                      showEvacuationLoad
+                        ? "bg-muted text-foreground"
+                        : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                    )}
+                    title="Simulate every room's route to its nearest exit and heat-map which doors carry the most traffic"
+                  >
+                    <Flame
+                      className={cn("size-3.5", isEvacuationLoadPending && "animate-pulse")}
+                      aria-hidden
+                    />
+                    Evacuation load
+                    {isEvacuationLoadPending ? (
+                      <span className="text-[10px] font-normal text-muted-foreground">
+                        computing…
+                      </span>
+                    ) : null}
+                  </button>
+                </>
+              ) : null}
+            </div>
             {navmeshBusy ? (
-              <span className="text-[10px] text-muted-foreground">
-                Recalculating navmesh…
-              </span>
+              <p className="mt-1 text-[10px] text-muted-foreground">Recalculating navmesh…</p>
             ) : null}
           </div>
 
@@ -1633,7 +1707,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
             disabled={!buildingBounds}
             className={cn(
               GLASS,
-              "pointer-events-auto inline-flex h-8 items-center gap-1 px-2.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40",
+              "pointer-events-auto inline-flex h-8 shrink-0 items-center gap-1 px-2.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40",
             )}
             title="Fit all floors and reset rotation (shared frame)"
           >
@@ -1683,6 +1757,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     doorsByGlobalId={doorsByGlobalId}
                     palette={palette}
                     selectedSpaces={selectedSpaces}
+                    selectedStairIds={selectedStairIds}
                     selectedPortalIds={selectedPortalIds}
                     focusedElementId={focusedElementId}
                     roomStroke={roomStroke}
@@ -2035,7 +2110,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                       <button
                         type="button"
                         onClick={() => {
-                          setActiveStoreyId(entry.storeyId);
+                          selectViewedStorey(entry.storeyId);
                           // Fly the 3D camera there too — the whole point of
                           // a ranked list is to jump straight to the worst
                           // spot, not just switch which 2D plan is showing.

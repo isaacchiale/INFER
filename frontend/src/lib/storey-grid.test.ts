@@ -6,6 +6,7 @@ import {
   buildStoreyGrids,
   findGridMultiStoreyPath,
   findGridNearestExitPath,
+  findGridNearestExitPathBuilding,
   findGridPath,
 } from "./storey-grid.ts";
 import { pointInPolygon } from "./geometric-path.ts";
@@ -299,6 +300,40 @@ describe("storey grid routing", () => {
       const lastSeg = result.segments[1]!.points;
       assert.deepEqual(lastSeg[lastSeg.length - 1], { x: 3, y: 3 });
       assert.deepEqual(result.graphNodeIds, ["space:B", "space:A", "stair:ST", "space:C"]);
+    });
+
+    it("routes to an exit on another storey when this floor has none", () => {
+      const fpExit: FootprintsDocument = {
+        ...fp,
+        doors: [...fp.doors, door("E", { x: 0, y: 2 }, [{ x: 0, y: 1.5 }, { x: 0, y: 2.5 }])],
+      };
+      const gExit: ConnectivityGraph = {
+        ...g,
+        nodes: [
+          ...g.nodes,
+          { id: "door:E", kind: "door", global_id: "E", name: "E", storey_global_id: "S1" },
+        ],
+        edges: [...g.edges, ...doorEdges("E", ["A"])],
+      };
+      const meshes = buildAllStoreyNavmeshes(fpExit, gExit);
+      const grids = buildStoreyGrids(meshes, fpExit);
+      const upper = findGridNearestExitPath(
+        grids.find((x) => x.storeyId === "S2")!,
+        meshes.find((x) => x.storeyId === "S2")!,
+        { x: 2, y: 2 },
+      );
+      assert.equal(upper.found, false);
+      const result = findGridNearestExitPathBuilding(grids, meshes, gExit, fpExit, {
+        storeyId: "S2",
+        point: { x: 2, y: 2 },
+      });
+      assert.equal(result.found, true);
+      assert.equal(result.endStoreyId, "S1");
+      assert.deepEqual(result.end, { x: 0, y: 2 });
+      assert.deepEqual(
+        result.segments.map((seg) => seg.storeyId),
+        ["S2", "S1"],
+      );
     });
 
     it("fails when the stair landing is blocked", () => {

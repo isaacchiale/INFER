@@ -885,6 +885,61 @@ function cachedLandingReach(
   return hit;
 }
 
+type Landing = { key: string; linkId: string; storeyId: string; cell: number; point: Point2D };
+
+function collectLandings(
+  grids: readonly StoreyGrid[],
+  graph: ConnectivityGraph,
+  footprints: FootprintsDocument,
+  opts: { blockedConnectorIds?: ReadonlySet<string> } = {},
+): {
+  landings: Map<string, Landing>;
+  landingsByStorey: Map<string, Landing[]>;
+  verticalNext: Map<string, Landing[]>;
+  elevations: ReadonlyMap<string, number>;
+} {
+  const gridById = new Map(grids.map((g) => [g.storeyId, g]));
+  const landings = new Map<string, Landing>();
+  const landingsByStorey = new Map<string, Landing[]>();
+  const landingsByLink = new Map<string, Landing[]>();
+  for (const [linkId, connectors] of buildVerticalConnectors(graph, footprints)) {
+    for (const c of connectors) {
+      const key = `${linkId}@${c.storeyId}`;
+      if (opts.blockedConnectorIds?.has(key)) continue;
+      const grid = gridById.get(c.storeyId);
+      if (!grid) continue;
+      const regionIdx = grid.regionIds.indexOf(c.spaceId);
+      if (regionIdx < 0) continue;
+      const own = cellAt(grid, c.point.x, c.point.y);
+      const cell =
+        own >= 0 && grid.region[own] === regionIdx
+          ? own
+          : nearestRegionCell(grid, c.point, regionIdx, GATE_SEARCH_M * 5);
+      if (cell < 0) continue;
+      const landing: Landing = { key, linkId, storeyId: c.storeyId, cell, point: cellCentre(grid, cell) };
+      landings.set(key, landing);
+      (landingsByStorey.get(c.storeyId) ?? landingsByStorey.set(c.storeyId, []).get(c.storeyId)!).push(
+        landing,
+      );
+      (landingsByLink.get(linkId) ?? landingsByLink.set(linkId, []).get(linkId)!).push(landing);
+    }
+  }
+  const elevations = storeyElevationLookup(footprints);
+  const verticalNext = new Map<string, Landing[]>();
+  for (const list of landingsByLink.values()) {
+    const sorted = [...list].sort(
+      (a, b) => (elevations.get(a.storeyId) ?? 0) - (elevations.get(b.storeyId) ?? 0),
+    );
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const a = sorted[i]!;
+      const b = sorted[i + 1]!;
+      (verticalNext.get(a.key) ?? verticalNext.set(a.key, []).get(a.key)!).push(b);
+      (verticalNext.get(b.key) ?? verticalNext.set(b.key, []).get(b.key)!).push(a);
+    }
+  }
+  return { landings, landingsByStorey, verticalNext, elevations };
+}
+
 /**
  * Cross-storey route: per-storey grid Dijkstras between pins and stair/lift
  * landings, joined by vertical hops costed by storey elevation difference.
@@ -926,44 +981,12 @@ export function findGridMultiStoreyPath(
   const t = pinCell(endGrid, endMesh, end.point);
   if (!s || !t) return fail("Pick points inside walkable regions");
 
-  type Landing = { key: string; linkId: string; storeyId: string; cell: number; point: Point2D };
-  const landings = new Map<string, Landing>();
-  const landingsByStorey = new Map<string, Landing[]>();
-  const landingsByLink = new Map<string, Landing[]>();
-  for (const [linkId, connectors] of buildVerticalConnectors(graph, footprints)) {
-    for (const c of connectors) {
-      const key = `${linkId}@${c.storeyId}`;
-      if (opts.blockedConnectorIds?.has(key)) continue;
-      const grid = gridById.get(c.storeyId);
-      if (!grid) continue;
-      const regionIdx = grid.regionIds.indexOf(c.spaceId);
-      if (regionIdx < 0) continue;
-      const own = cellAt(grid, c.point.x, c.point.y);
-      const cell =
-        own >= 0 && grid.region[own] === regionIdx
-          ? own
-          : nearestRegionCell(grid, c.point, regionIdx, GATE_SEARCH_M * 5);
-      if (cell < 0) continue;
-      const landing: Landing = { key, linkId, storeyId: c.storeyId, cell, point: cellCentre(grid, cell) };
-      landings.set(key, landing);
-      (landingsByStorey.get(c.storeyId) ?? landingsByStorey.set(c.storeyId, []).get(c.storeyId)!).push(landing);
-      (landingsByLink.get(linkId) ?? landingsByLink.set(linkId, []).get(linkId)!).push(landing);
-    }
-  }
-
-  const elevations = storeyElevationLookup(footprints);
-  const verticalNext = new Map<string, Landing[]>();
-  for (const list of landingsByLink.values()) {
-    const sorted = [...list].sort(
-      (a, b) => (elevations.get(a.storeyId) ?? 0) - (elevations.get(b.storeyId) ?? 0),
-    );
-    for (let i = 0; i < sorted.length - 1; i++) {
-      const a = sorted[i]!;
-      const b = sorted[i + 1]!;
-      (verticalNext.get(a.key) ?? verticalNext.set(a.key, []).get(a.key)!).push(b);
-      (verticalNext.get(b.key) ?? verticalNext.set(b.key, []).get(b.key)!).push(a);
-    }
-  }
+  const { landings, landingsByStorey, verticalNext, elevations } = collectLandings(
+    grids,
+    graph,
+    footprints,
+    opts,
+  );
 
   const blockedByStorey = new Map<string, Uint8Array | null>();
   const blockedFor = (grid: StoreyGrid) => {
@@ -1085,5 +1108,222 @@ export function findGridMultiStoreyPath(
     note: `${chain.length} hops across ${new Set(segments.map((x) => x.storeyId)).size} storeys`,
     segments,
     graphNodeIds,
+  };
+}
+
+type GridExit = { key: string; storeyId: string; cell: number; point: Point2D; portalId: string };
+
+/**
+ * Nearest exterior exit from `start`, any storey. Same-floor exits still win
+ * when they're cheaper; otherwise the search walks stairs/lifts like
+ * {@link findGridMultiStoreyPath}.
+ */
+export function findGridNearestExitPathBuilding(
+  grids: readonly StoreyGrid[],
+  meshes: readonly StoreyNavmesh[],
+  graph: ConnectivityGraph,
+  footprints: FootprintsDocument,
+  start: { storeyId: string; point: Point2D },
+  opts: { blockedPortalIds?: ReadonlySet<string>; blockedConnectorIds?: ReadonlySet<string> } = {},
+): {
+  found: boolean;
+  note: string;
+  segments: { storeyId: string; points: Point2D[] }[];
+  graphNodeIds: string[];
+  exitPortalId?: string;
+  end: Point2D | null;
+  endStoreyId: string | null;
+} {
+  const fail = (note: string) => ({
+    found: false,
+    note,
+    segments: [],
+    graphNodeIds: [],
+    end: null,
+    endStoreyId: null,
+  });
+  const gridById = new Map(grids.map((g) => [g.storeyId, g]));
+  const meshById = new Map(meshes.map((m) => [m.storeyId, m]));
+  const startGrid = gridById.get(start.storeyId);
+  const startMesh = meshById.get(start.storeyId);
+  if (!startGrid || !startMesh) return fail("Unknown storey");
+
+  const s = pinCell(startGrid, startMesh, start.point);
+  if (!s) return fail("Pick a point inside a walkable region");
+
+  const blockedByStorey = new Map<string, Uint8Array | null>();
+  const blockedFor = (grid: StoreyGrid) => {
+    if (!blockedByStorey.has(grid.storeyId)) {
+      blockedByStorey.set(grid.storeyId, blockedMask(grid, opts.blockedPortalIds));
+    }
+    return blockedByStorey.get(grid.storeyId)!;
+  };
+  const blockedKey = opts.blockedPortalIds?.size ? [...opts.blockedPortalIds].sort().join("\0") : "";
+
+  const exitsByStorey = new Map<string, GridExit[]>();
+  for (const grid of grids) {
+    const blocked = blockedFor(grid);
+    const list: GridExit[] = [];
+    grid.portals.forEach((p, i) => {
+      if (p.kind !== "exit" || blocked?.[i]) return;
+      if (p.cell < 0 || grid.region[p.cell] === BLOCKED) return;
+      list.push({
+        key: `__exit:${p.id}`,
+        storeyId: grid.storeyId,
+        cell: p.cell,
+        point: p.point,
+        portalId: p.id,
+      });
+    });
+    if (list.length) exitsByStorey.set(grid.storeyId, list);
+  }
+  if (![...exitsByStorey.values()].some((list) => list.length)) {
+    return fail("No exit portal in the building");
+  }
+
+  const { landings, landingsByStorey, verticalNext, elevations } = collectLandings(
+    grids,
+    graph,
+    footprints,
+    opts,
+  );
+
+  type Step = { prev: string; storeyId: string | null; cells: number[] | null; reversed: boolean };
+  const best = new Map<string, number>([["__start", 0]]);
+  const came = new Map<string, Step>();
+  const done = new Set<string>();
+  const heap = new IndexHeap();
+  const keys: string[] = ["__start"];
+  const keyIndex = new Map<string, number>([["__start", 0]]);
+  const idxOf = (key: string) => {
+    let i = keyIndex.get(key);
+    if (i == null) {
+      i = keys.length;
+      keys.push(key);
+      keyIndex.set(key, i);
+    }
+    return i;
+  };
+  const relax = (from: string, to: string, cost: number, step: Omit<Step, "prev">) => {
+    const g = best.get(from)! + cost;
+    if (g >= (best.get(to) ?? Infinity)) return;
+    best.set(to, g);
+    came.set(to, { prev: from, ...step });
+    heap.push(g, idxOf(to));
+  };
+
+  const walkToExits = (fromKey: string, storeyId: string, sourceCell: number) => {
+    const grid = gridById.get(storeyId);
+    const exits = exitsByStorey.get(storeyId);
+    if (!grid || !exits?.length) return;
+    const reach = reachTargets(
+      grid,
+      sourceCell,
+      exits.map((e) => e.cell),
+      blockedFor(grid),
+    );
+    for (const exit of exits) {
+      const r = reach.get(exit.cell);
+      if (r) relax(fromKey, exit.key, r.cost, { storeyId, cells: r.cells, reversed: false });
+    }
+  };
+
+  heap.push(0, 0);
+  let hitExit: GridExit | null = null;
+  const exitByKey = new Map<string, GridExit>();
+  for (const list of exitsByStorey.values()) for (const e of list) exitByKey.set(e.key, e);
+
+  while (heap.size) {
+    const key = keys[heap.pop()]!;
+    if (done.has(key)) continue;
+    done.add(key);
+    const exit = exitByKey.get(key);
+    if (exit) {
+      hitExit = exit;
+      break;
+    }
+    if (key === "__start") {
+      walkToExits(key, start.storeyId, s.cell);
+      const fromStart = reachTargets(
+        startGrid,
+        s.cell,
+        (landingsByStorey.get(start.storeyId) ?? []).map((l) => l.cell),
+        blockedFor(startGrid),
+      );
+      for (const l of landingsByStorey.get(start.storeyId) ?? []) {
+        const r = fromStart.get(l.cell);
+        if (r) relax(key, l.key, r.cost, { storeyId: start.storeyId, cells: r.cells, reversed: false });
+      }
+      continue;
+    }
+    const landing = landings.get(key);
+    if (!landing) continue;
+    for (const next of verticalNext.get(key) ?? []) {
+      relax(key, next.key, verticalHopCost(elevations, landing.storeyId, next.storeyId), {
+        storeyId: null,
+        cells: null,
+        reversed: false,
+      });
+    }
+    walkToExits(key, landing.storeyId, landing.cell);
+    const peers = (landingsByStorey.get(landing.storeyId) ?? []).filter((l) => l.key !== key);
+    if (peers.length) {
+      const grid = gridById.get(landing.storeyId)!;
+      const reach = cachedLandingReach(
+        grid,
+        landing.cell,
+        peers.map((l) => l.cell),
+        blockedFor(grid),
+        blockedKey,
+      );
+      for (const peer of peers) {
+        const r = reach.get(peer.cell);
+        if (r) relax(key, peer.key, r.cost, { storeyId: landing.storeyId, cells: r.cells, reversed: false });
+      }
+    }
+  }
+  if (!hitExit) return fail("No reachable exit");
+
+  const chain: { key: string; step: Step }[] = [];
+  for (let cur = hitExit.key; cur !== "__start"; ) {
+    const step = came.get(cur)!;
+    chain.push({ key: cur, step });
+    cur = step.prev;
+  }
+  chain.reverse();
+
+  const segments: { storeyId: string; points: Point2D[] }[] = [];
+  const graphNodeIds: string[] = [];
+  const pushNode = (id: string) => {
+    if (graphNodeIds[graphNodeIds.length - 1] !== id) graphNodeIds.push(id);
+  };
+  for (const { key, step } of chain) {
+    if (step.storeyId == null) {
+      pushNode(landings.get(key)!.linkId);
+      continue;
+    }
+    const grid = gridById.get(step.storeyId)!;
+    const cells = step.cells!;
+    let pts = smoothCells(grid, cells, blockedFor(grid));
+    if (step.prev === "__start") pts = [start.point, ...pts.slice(1)];
+    if (exitByKey.has(key)) pts = [...pts.slice(0, -1), hitExit.point];
+    for (const id of regionSequence(grid, cells)) pushNode(id);
+    const last = segments[segments.length - 1];
+    if (last && last.storeyId === step.storeyId) last.points.push(...pts.slice(1));
+    else segments.push({ storeyId: step.storeyId, points: pts });
+  }
+
+  const storeyCount = new Set(segments.map((x) => x.storeyId)).size;
+  return {
+    found: segments.length > 0,
+    note:
+      storeyCount > 1
+        ? `${chain.length} hops to exit across ${storeyCount} storeys`
+        : `${Math.max(graphNodeIds.length - 1, 0)} hops to exit`,
+    segments,
+    graphNodeIds,
+    exitPortalId: hitExit.portalId,
+    end: hitExit.point,
+    endStoreyId: hitExit.storeyId,
   };
 }

@@ -799,43 +799,12 @@ function InferModelViewportImpl({
       />
 
       {engineReady && !engineError && (
-        <div className="pointer-events-auto absolute left-3 top-3 z-20 flex flex-col items-start gap-1.5">
-          <div className={cn(GLASS, "flex overflow-hidden")} role="tablist" aria-label="Camera navigation mode">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={navMode === "orbit"}
-              onClick={() => switchNavMode("orbit")}
-              className={cn(
-                "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
-                navMode === "orbit"
-                  ? "bg-muted text-foreground"
-                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-              )}
-              title="Orbit camera"
-            >
-              <Move3d className="size-3.5" aria-hidden />
-              Orbit
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={navMode === "fly"}
-              onClick={() => switchNavMode("fly")}
-              className={cn(
-                "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
-                navMode === "fly"
-                  ? "bg-muted text-foreground"
-                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-              )}
-              title="First-person fly (WASD move, Space up, Shift down, hold Ctrl to go faster)"
-            >
-              <PersonStanding className="size-3.5" aria-hidden />
-              Fly
-            </button>
-          </div>
-
-          <div className={cn(GLASS, "flex overflow-hidden")} role="tablist" aria-label="Geometry display mode">
+        <div className="pointer-events-auto absolute inset-x-3 top-3 z-20 flex flex-wrap items-center gap-1.5">
+          <div
+            className={cn(GLASS, "flex shrink-0 overflow-hidden")}
+            role="tablist"
+            aria-label="Geometry display mode"
+          >
             <button
               type="button"
               role="tab"
@@ -850,7 +819,7 @@ function InferModelViewportImpl({
               title="Show IFC geometry"
             >
               <Box className="size-3.5" aria-hidden />
-              IFC Geometry
+              IFC
             </button>
             <button
               type="button"
@@ -877,7 +846,7 @@ function InferModelViewportImpl({
                 disabled={!storeys.length}
                 className={cn(
                   GLASS,
-                  "flex h-8 max-w-[220px] items-center gap-1.5 px-2.5 text-[12px] text-foreground transition-colors hover:bg-muted disabled:opacity-40",
+                  "flex h-8 max-w-[220px] shrink-0 items-center gap-1.5 px-2.5 text-[12px] text-foreground transition-colors hover:bg-muted disabled:opacity-40",
                 )}
                 title="3D storey filter — independent of the floorplan level dropdown"
               >
@@ -915,6 +884,45 @@ function InferModelViewportImpl({
               })}
             </DropdownMenuContent>
           </DropdownMenu>
+
+          <div
+            className={cn(GLASS, "flex shrink-0 overflow-hidden")}
+            role="tablist"
+            aria-label="Camera navigation mode"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={navMode === "orbit"}
+              onClick={() => switchNavMode("orbit")}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                navMode === "orbit"
+                  ? "bg-muted text-foreground"
+                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+              )}
+              title="Orbit camera"
+            >
+              <Move3d className="size-3.5" aria-hidden />
+              Orbit
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={navMode === "fly"}
+              onClick={() => switchNavMode("fly")}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 px-2.5 text-[11px] transition-colors",
+                navMode === "fly"
+                  ? "bg-muted text-foreground"
+                  : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+              )}
+              title="First-person fly (WASD move, Space up, Shift down, hold Ctrl to go faster)"
+            >
+              <PersonStanding className="size-3.5" aria-hidden />
+              Fly
+            </button>
+          </div>
         </div>
       )}
 
