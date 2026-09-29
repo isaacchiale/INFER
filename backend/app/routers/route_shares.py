@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 import socket
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
 
 from app.config import get_settings
@@ -82,6 +82,22 @@ async def create_route_share(request: Request, share_id: str | None = None) -> d
     settings = get_settings()
     resolved_id = storage.save_route_share(settings, body, ext, share_id)
     return {"share_id": resolved_id, "ext": ext, "lan_ip": _lan_ip()}
+
+
+@router.delete("/{share_id}", status_code=204)
+def delete_route_share(share_id: str) -> Response:
+    """
+    Explicit revoke: the frontend calls this when a share is cancelled
+    mid-upload (only the GLB half went through) or when the sharer clicks
+    "Stop sharing" on a link they already handed out — either way, no need
+    to wait out the expiry sweep for a share nobody wants live anymore.
+    """
+    if not _SHARE_ID_RE.match(share_id):
+        raise HTTPException(status_code=404, detail="Share not found")
+    settings = get_settings()
+    if not storage.delete_route_share(settings, share_id):
+        raise HTTPException(status_code=404, detail="Share not found")
+    return Response(status_code=204)
 
 
 def _get_route_share_file(share_id: str, ext: str) -> FileResponse:

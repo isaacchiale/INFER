@@ -140,6 +140,34 @@ def test_landing_unknown_share_id_404s(client: TestClient):
     assert response.status_code == 404
 
 
+def test_delete_route_share_removes_both_formats(client: TestClient):
+    created = client.post(
+        "/route-shares", content=b"glb-bytes", headers={"content-type": "model/gltf-binary"}
+    )
+    share_id = created.json()["share_id"]
+    client.post(
+        f"/route-shares?share_id={share_id}",
+        content=b"usdz-bytes",
+        headers={"content-type": "model/vnd.usdz+zip"},
+    )
+
+    deleted = client.delete(f"/route-shares/{share_id}")
+    assert deleted.status_code == 204
+
+    assert client.get(f"/route-shares/{share_id}.glb").status_code == 404
+    assert client.get(f"/route-shares/{share_id}.usdz").status_code == 404
+
+
+def test_delete_unknown_share_id_404s(client: TestClient):
+    response = client.delete("/route-shares/" + "0" * 32)
+    assert response.status_code == 404
+
+
+def test_delete_invalid_share_id_404s(client: TestClient):
+    response = client.delete("/route-shares/not-a-real-id")
+    assert response.status_code == 404
+
+
 def test_expired_shares_swept_on_next_upload(client: TestClient):
     """The router docstring calls this "ephemeral hosting" — verify old
     shares actually get deleted rather than accumulating forever."""

@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { Share2 } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import { Check, Copy, Share2 } from "lucide-react";
 import { toast } from "sonner";
 import QRCode from "qrcode";
 import type { Object3D } from "three";
@@ -15,7 +15,12 @@ import { exportGLB } from "@/lib/export-glb";
 import { exportUSDZ } from "@/lib/export-usdz";
 import { buildRouteShareScene, buildDoorOverlay } from "@/lib/route-share-scene";
 import { buildExportGroup } from "@/lib/live-scene-export";
-import { uploadRouteShare, routeShareUrl } from "@/api/route-shares";
+import {
+  uploadRouteShare,
+  routeShareUrl,
+  deleteRouteShare,
+  checkRouteShareReachable,
+} from "@/api/route-shares";
 import { useViewerPose, type NavmeshRoute } from "@/state/infer-store";
 import type { FootprintsDocument } from "@/types/footprints";
 
@@ -24,6 +29,22 @@ import type { FootprintsDocument } from "@/types/footprints";
 function isIPhone(): boolean {
   return /iPhone|iPod/i.test(navigator.userAgent);
 }
+
+/** What building the export + creating a share link produced for one route,
+ * kept across a dialog close/reopen so re-checking a link you already
+ * generated doesn't re-export and re-upload the same route from scratch.
+ * Keyed by object identity: a genuinely new route (a fresh object from the
+ * router) invalidates it naturally without needing an explicit id/hash. */
+type ShareCache = {
+  route: NavmeshRoute;
+  glbBlob: Blob;
+  usdzBlob: Blob | null;
+  usedLiveGeometry: boolean;
+  shareId: string | null;
+  shareUrl: string | null;
+  qrDataUrl: string | null;
+  reachabilityWarning: boolean;
+};
 
 /**
  * Exports the current click-to-click navmesh route (plus the rooms it
@@ -43,14 +64,21 @@ export function ShareRouteButton({
   const [glbBlob, setGlbBlob] = useState<Blob | null>(null);
   const [usdzBlob, setUsdzBlob] = useState<Blob | null>(null);
   const [usdzUrl, setUsdzUrl] = useState<string | null>(null);
+  const [shareId, setShareId] = useState<string | null>(null);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [sharing, setSharing] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [usedLiveGeometry, setUsedLiveGeometry] = useState(false);
+  const [reachabilityWarning, setReachabilityWarning] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   const { viewerExportRef } = useViewerPose();
   const iPhone = useMemo(() => isIPhone(), []);
+  const cacheRef = useRef<ShareCache | null>(null);
+  const abortUploadRef = useRef<(() => void) | null>(null);
+  const copiedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const hasRoute = Boolean(
     navmeshRoute && (navmeshRoute.points?.length || navmeshRoute.segments?.length),
@@ -59,14 +87,34 @@ export function ShareRouteButton({
   const openDialog = async () => {
     if (!navmeshRoute || !footprintsDocument) return;
     setOpen(true);
-    setBuilding(true);
     setError(null);
+
+    // Reopening for the exact same route object (e.g. just to re-check or
+    // re-copy a link already generated) reuses the prior export/share
+    // instead of rebuilding and re-uploading from scratch.
+    const cached = cacheRef.current;
+    if (cached && cached.route === navmeshRoute) {
+      setBuilding(false);
+      setGlbBlob(cached.glbBlob);
+      setUsdzBlob(cached.usdzBlob);
+      setUsedLiveGeometry(cached.usedLiveGeometry);
+      setShareId(cached.shareId);
+      setShareUrl(cached.shareUrl);
+      setQrDataUrl(cached.qrDataUrl);
+      setReachabilityWarning(cached.reachabilityWarning);
+      setUsdzUrl(iPhone && cached.usdzBlob ? URL.createObjectURL(cached.usdzBlob) : null);
+      return;
+    }
+
+    setBuilding(true);
     setGlbBlob(null);
     setUsdzBlob(null);
     setUsdzUrl(null);
+    setShareId(null);
     setShareUrl(null);
     setQrDataUrl(null);
     setUsedLiveGeometry(false);
+    setReachabilityWarning(false);
     try {
       // Prefer the actual loaded IFC geometry (real wall thickness, real
       // openings, real materials) over the flat-extrusion footprint proxy —
@@ -118,6 +166,16 @@ export function ShareRouteButton({
       setGlbBlob(glb);
       setUsdzBlob(usdz);
       if (iPhone) setUsdzUrl(URL.createObjectURL(usdz));
+      cacheRef.current = {
+        route: navmeshRoute,
+        glbBlob: glb,
+        usdzBlob: usdz,
+        usedLiveGeometry: liveGeometryUsed,
+        shareId: null,
+        shareUrl: null,
+        qrDataUrl: null,
+        reachabilityWarning: false,
+      };
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to build the 3D export.");
     } finally {
@@ -147,8 +205,25 @@ export function ShareRouteButton({
     if (!glbBlob) return;
     setSharing(true);
     setError(null);
+    setUploadProgress(0);
+    // Weighted by bytes across both uploads so the bar reflects total
+    // transfer progress, not "upload 1 of 2 done" jumping straight to 50%
+    // when the GLB and USDZ are very different sizes.
+    const totalBytes = glbBlob.size + (usdzBlob?.size ?? 0);
+    let glbBytesSent = 0;
+    let usdzBytesSent = 0;
+    let uploadedShareId: string | null = null;
+    const reportProgress = () => {
+      setUploadProgress(totalBytes ? (glbBytesSent + usdzBytesSent) / totalBytes : 1);
+    };
     try {
-      const glbUpload = await uploadRouteShare(glbBlob, "glb");
+      const glbUpload = uploadRouteShare(glbBlob, "glb", undefined, (fraction) => {
+        glbBytesSent = fraction * glbBlob.size;
+        reportProgress();
+      });
+      abortUploadRef.current = glbUpload.abort;
+      const glbResult = await glbUpload.done;
+      uploadedShareId = glbResult.shareId;
       if (usdzBlob) {
         // A large export (or a slow/flaky connection) can fail or exceed
         // the backend's upload size limit for the USDZ specifically — that
@@ -156,18 +231,72 @@ export function ShareRouteButton({
         // the landing route (route-shares.py) just falls back to the GLB
         // for everyone, iPhone included.
         try {
-          await uploadRouteShare(usdzBlob, "usdz", glbUpload.shareId);
+          const usdzUpload = uploadRouteShare(usdzBlob, "usdz", glbResult.shareId, (fraction) => {
+            usdzBytesSent = fraction * usdzBlob.size;
+            reportProgress();
+          });
+          abortUploadRef.current = usdzUpload.abort;
+          await usdzUpload.done;
         } catch (err) {
+          // A user-initiated cancel here must still cancel the whole share —
+          // only a genuine USDZ failure (network error, size limit) should
+          // fall back to a GLB-only share while swallowing the error.
+          if (err instanceof DOMException && err.name === "AbortError") throw err;
           console.warn("Share: USDZ upload failed, continuing with GLB only", err);
         }
       }
-      const url = routeShareUrl(glbUpload.origin, glbUpload.shareId);
+      const url = routeShareUrl(glbResult.origin, glbResult.shareId);
+      const qr = await QRCode.toDataURL(url, { margin: 1, width: 220 });
+      setShareId(glbResult.shareId);
       setShareUrl(url);
-      setQrDataUrl(await QRCode.toDataURL(url, { margin: 1, width: 220 }));
+      setQrDataUrl(qr);
+      if (cacheRef.current?.route === navmeshRoute) {
+        cacheRef.current.shareId = glbResult.shareId;
+        cacheRef.current.shareUrl = url;
+        cacheRef.current.qrDataUrl = qr;
+      }
+      // Best-effort: confirms this machine can reach the address it just
+      // built for the phone to scan, not that the phone itself can — see
+      // checkRouteShareReachable's own doc comment for why that's still
+      // worth surfacing as a hint rather than staying silent.
+      const reachable = await checkRouteShareReachable(url);
+      setReachabilityWarning(!reachable);
+      if (cacheRef.current?.route === navmeshRoute) {
+        cacheRef.current.reachabilityWarning = !reachable;
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create a shareable link.");
+      if (err instanceof DOMException && err.name === "AbortError") {
+        toast("Share cancelled");
+        if (uploadedShareId) void deleteRouteShare(uploadedShareId);
+      } else {
+        setError(err instanceof Error ? err.message : "Failed to create a shareable link.");
+      }
     } finally {
+      abortUploadRef.current = null;
       setSharing(false);
+      setUploadProgress(null);
+    }
+  };
+
+  const cancelShare = () => {
+    abortUploadRef.current?.();
+  };
+
+  const stopSharing = async () => {
+    const id = shareId;
+    setShareId(null);
+    setShareUrl(null);
+    setQrDataUrl(null);
+    setReachabilityWarning(false);
+    if (cacheRef.current?.route === navmeshRoute) {
+      cacheRef.current.shareId = null;
+      cacheRef.current.shareUrl = null;
+      cacheRef.current.qrDataUrl = null;
+      cacheRef.current.reachabilityWarning = false;
+    }
+    if (id) {
+      const revoked = await deleteRouteShare(id);
+      toast(revoked ? "Link revoked" : "Couldn't reach the server to revoke — it'll still expire on its own");
     }
   };
 
@@ -175,7 +304,9 @@ export function ShareRouteButton({
     if (!shareUrl) return;
     try {
       await navigator.clipboard.writeText(shareUrl);
-      toast("Link copied");
+      setCopied(true);
+      if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current);
+      copiedTimeoutRef.current = setTimeout(() => setCopied(false), 1500);
     } catch {
       toast("Couldn't copy — copy it manually");
     }
@@ -229,17 +360,38 @@ export function ShareRouteButton({
               </Button>
 
               {!shareUrl ? (
-                <Button className="w-full" disabled={!glbBlob || sharing} onClick={share}>
-                  {sharing ? "Creating link…" : "Get shareable link + QR"}
-                </Button>
+                <div className="space-y-1.5">
+                  <div className="flex gap-2">
+                    <Button className="flex-1" disabled={!glbBlob || sharing} onClick={share}>
+                      {sharing
+                        ? `Creating link… ${Math.round((uploadProgress ?? 0) * 100)}%`
+                        : "Get shareable link + QR"}
+                    </Button>
+                    {sharing && (
+                      <Button variant="outline" onClick={cancelShare}>
+                        Cancel
+                      </Button>
+                    )}
+                  </div>
+                  {sharing && (
+                    <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
+                      <div
+                        className="h-full bg-[#DC143C] transition-[width]"
+                        style={{ width: `${Math.round((uploadProgress ?? 0) * 100)}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
               ) : (
                 <div className="space-y-2 rounded-[6px] border border-border p-3">
                   {qrDataUrl ? (
-                    <img
-                      src={qrDataUrl}
-                      alt="QR code linking to the 3D route"
-                      className="mx-auto size-[220px]"
-                    />
+                    <div className="mx-auto w-fit rounded-xl border-2 border-[#DC143C]/15 bg-white p-3 shadow-sm">
+                      <img
+                        src={qrDataUrl}
+                        alt="QR code linking to the 3D route"
+                        className="size-[220px] rounded-md"
+                      />
+                    </div>
                   ) : null}
                   <div className="flex items-center gap-2">
                     <input
@@ -249,14 +401,31 @@ export function ShareRouteButton({
                       className="min-w-0 flex-1 rounded-[4px] border border-border bg-muted/40 px-2 py-1 text-[11px] text-foreground"
                     />
                     <Button variant="outline" size="sm" onClick={copyLink}>
-                      Copy
+                      {copied ? (
+                        <Check className="size-3.5 text-green-600" aria-hidden />
+                      ) : (
+                        <Copy className="size-3.5" aria-hidden />
+                      )}
+                      {copied ? "Copied" : "Copy"}
                     </Button>
                   </div>
+                  {reachabilityWarning && (
+                    <p className="text-[11px] text-amber-600">
+                      Couldn't confirm this link responds on your network — if scanning it does
+                      nothing, check that the other device is on the same Wi-Fi.
+                    </p>
+                  )}
                   <p className="text-[11px] text-muted-foreground">
-                    Works on a device on the same network as this computer — not a public link. Most
-                    Android 3D viewers open .glb directly; on iPhone it opens straight into native AR
-                    Quick Look.
+                    {usdzBlob
+                      ? "Scanning this on iPhone opens straight into native AR Quick Look; every other device opens or downloads the .glb."
+                      : "Opens or downloads the .glb 3D file — the AR (USDZ) export wasn't available for this route, so iPhone falls back to the same file."}
                   </p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Works on a device on the same network as this computer — not a public link.
+                  </p>
+                  <Button variant="outline" size="sm" className="w-full" onClick={stopSharing}>
+                    Stop sharing
+                  </Button>
                 </div>
               )}
             </div>

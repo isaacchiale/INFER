@@ -249,14 +249,13 @@ def route_share_path(settings: Settings, share_id: str, ext: str = "glb") -> Pat
     return _route_shares_root(settings) / f"{share_id}.{ext}"
 
 
-# Router docstring calls this "ephemeral hosting" — without an actual sweep
-# it was permanent hosting with an expiry date nobody enforced. No task
-# queue or cron in this app, so the cheapest correct trigger is "whenever a
-# new one is created" rather than a background job.
+# Router docstring calls this "ephemeral hosting" — an upload-triggered sweep
+# alone means a share outlives its window indefinitely if nobody uploads
+# again, so app/main.py also runs this on a timer via lifespan.
 ROUTE_SHARE_MAX_AGE_DAYS = 7
 
 
-def _sweep_expired_route_shares(settings: Settings) -> None:
+def sweep_expired_route_shares(settings: Settings) -> None:
     root = _route_shares_root(settings)
     if not root.is_dir():
         return
@@ -282,8 +281,23 @@ def save_route_share(
     """
     root = _route_shares_root(settings)
     root.mkdir(parents=True, exist_ok=True)
-    _sweep_expired_route_shares(settings)
+    sweep_expired_route_shares(settings)
     if share_id is None:
         share_id = uuid.uuid4().hex
     route_share_path(settings, share_id, ext).write_bytes(data)
     return share_id
+
+
+def delete_route_share(settings: Settings, share_id: str) -> bool:
+    """
+    Remove every format stored under `share_id` (a cancelled share can have
+    only the GLB uploaded, a completed one both). Returns whether anything
+    was actually removed, so the router can 404 a share that never existed.
+    """
+    removed = False
+    for ext in ROUTE_SHARE_EXTENSIONS:
+        path = route_share_path(settings, share_id, ext)
+        if path.is_file():
+            path.unlink()
+            removed = True
+    return removed

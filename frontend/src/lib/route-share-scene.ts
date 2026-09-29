@@ -35,6 +35,26 @@ const DOOR_HEIGHT_M = 2.1;
 /** Marker sphere radius for a door with no measured width (DoorPortal.polygon absent). */
 const DOOR_MARKER_RADIUS_M = 0.15;
 
+/**
+ * Tune a mesh's own material in place. Only ever called on a mesh this file
+ * just built itself (prism()'s own return, or a locally-constructed sphere)
+ * — prism() is shared with footprint-scene.ts (the 3D Viewer's footprint
+ * rendering, a different feature), and it already constructs a fresh
+ * MeshStandardMaterial per call, so mutating what it returns here can never
+ * bleed into that other consumer's meshes.
+ */
+function tuneMaterial(
+  mesh: THREE.Mesh,
+  opts: { metalness?: number; roughness?: number; emissive?: number; emissiveIntensity?: number },
+): THREE.Mesh {
+  const material = mesh.material as THREE.MeshStandardMaterial;
+  if (opts.metalness != null) material.metalness = opts.metalness;
+  if (opts.roughness != null) material.roughness = opts.roughness;
+  if (opts.emissive != null) material.emissive.setHex(opts.emissive);
+  if (opts.emissiveIntensity != null) material.emissiveIntensity = opts.emissiveIntensity;
+  return mesh;
+}
+
 type StoreySegment = { storeyId: string; points: Point2D[] };
 
 function routeSegments(route: NavmeshRoute): StoreySegment[] {
@@ -101,7 +121,16 @@ function routeTube(points: Point2D[], elevationM: number): THREE.Mesh | null {
   const curve = new THREE.CatmullRomCurve3(points.map((p) => planPoint(p.x, p.y, y)));
   const segments = Math.max(points.length * 4, 8);
   const geometry = new THREE.TubeGeometry(curve, segments, TUBE_RADIUS_M, 8, false);
-  const material = new THREE.MeshStandardMaterial({ color: TUBE_COLOR, roughness: 0.4 });
+  // A subtle emissive glow — matches the "glowing 3D markers" look the
+  // evacuation-load view already established elsewhere in the app, and
+  // keeps the route reading clearly even in AR Quick Look's ambient lighting.
+  const material = new THREE.MeshStandardMaterial({
+    color: TUBE_COLOR,
+    roughness: 0.35,
+    metalness: 0.15,
+    emissive: TUBE_COLOR,
+    emissiveIntensity: 0.5,
+  });
   return new THREE.Mesh(geometry, material);
 }
 
@@ -115,11 +144,22 @@ function routeTube(points: Point2D[], elevationM: number): THREE.Mesh | null {
  */
 function doorMesh(door: DoorPortal, elevationM: number): THREE.Object3D | null {
   if (door.polygon && door.polygon.length >= 3) {
-    return prism(door.polygon, elevationM, DOOR_HEIGHT_M, DOOR_COLOR);
+    return tuneMaterial(prism(door.polygon, elevationM, DOOR_HEIGHT_M, DOOR_COLOR), {
+      metalness: 0.2,
+      roughness: 0.5,
+      emissive: DOOR_COLOR,
+      emissiveIntensity: 0.12,
+    });
   }
   if (door.point) {
     const geometry = new THREE.SphereGeometry(DOOR_MARKER_RADIUS_M, 12, 12);
-    const material = new THREE.MeshStandardMaterial({ color: DOOR_COLOR });
+    const material = new THREE.MeshStandardMaterial({
+      color: DOOR_COLOR,
+      metalness: 0.2,
+      roughness: 0.5,
+      emissive: DOOR_COLOR,
+      emissiveIntensity: 0.12,
+    });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.position.copy(planPoint(door.point.x, door.point.y, elevationM + DOOR_HEIGHT_M / 2));
     return mesh;
@@ -157,7 +197,13 @@ export function buildDoorOverlay(
 
 function marker(point: Point2D, elevationM: number, color: number): THREE.Mesh {
   const geometry = new THREE.SphereGeometry(MARKER_RADIUS_M, 16, 16);
-  const material = new THREE.MeshStandardMaterial({ color });
+  const material = new THREE.MeshStandardMaterial({
+    color,
+    roughness: 0.3,
+    metalness: 0.1,
+    emissive: color,
+    emissiveIntensity: 0.7,
+  });
   const mesh = new THREE.Mesh(geometry, material);
   mesh.position.copy(planPoint(point.x, point.y, elevationM + TUBE_HEIGHT_OFFSET_M));
   return mesh;
@@ -176,10 +222,16 @@ export function buildRouteShareScene(
 
   const elevations = storeyElevationsM(footprints);
   const scene = new THREE.Scene();
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.5));
-  const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+  scene.add(new THREE.HemisphereLight(0xfff4e6, 0x444444, 1.4));
+  // Warm key light plus a cooler fill from the opposite side — a plain
+  // single directional light left every prism looking flat-shaded on one
+  // face; the second light gives walls/rooms a soft gradient instead.
+  const sun = new THREE.DirectionalLight(0xfff1e0, 1.15);
   sun.position.set(3, 8, 4);
   scene.add(sun);
+  const fill = new THREE.DirectionalLight(0xcfe0ff, 0.45);
+  fill.position.set(-4, 5, -3);
+  scene.add(fill);
 
   // A wall with no storey_global_id is shown "on every storey" elsewhere in
   // the app (FloorplanViewer); here every segment renders simultaneously in
@@ -195,7 +247,12 @@ export function buildRouteShareScene(
     for (const space of footprints.spaces) {
       if (space.incomplete || space.polygon.length < 3) continue;
       if (space.storey_global_id !== segment.storeyId) continue;
-      scene.add(prism(space.polygon, elevationM, ROOM_SLAB_HEIGHT_M, ROOM_COLOR));
+      scene.add(
+        tuneMaterial(prism(space.polygon, elevationM, ROOM_SLAB_HEIGHT_M, ROOM_COLOR), {
+          metalness: 0.03,
+          roughness: 0.85,
+        }),
+      );
     }
 
     for (const wall of footprints.walls ?? []) {
@@ -203,7 +260,12 @@ export function buildRouteShareScene(
       if (wall.storey_global_id != null && wall.storey_global_id !== segment.storeyId) continue;
       if (wallsAdded.has(wall.global_id)) continue;
       wallsAdded.add(wall.global_id);
-      scene.add(prism(wall.polygon, elevationM, WALL_HEIGHT_M, WALL_COLOR));
+      scene.add(
+        tuneMaterial(prism(wall.polygon, elevationM, WALL_HEIGHT_M, WALL_COLOR), {
+          metalness: 0.06,
+          roughness: 0.75,
+        }),
+      );
     }
 
     for (const door of footprints.doors ?? []) {
@@ -220,10 +282,20 @@ export function buildRouteShareScene(
       if (item.storey_global_id != null && item.storey_global_id !== segment.storeyId) continue;
       if (furnitureAdded.has(item.global_id)) continue;
       furnitureAdded.add(item.global_id);
-      scene.add(prism(item.polygon, elevationM, FURNITURE_HEIGHT_M, FURNITURE_COLOR));
+      scene.add(
+        tuneMaterial(prism(item.polygon, elevationM, FURNITURE_HEIGHT_M, FURNITURE_COLOR), {
+          metalness: 0.15,
+          roughness: 0.55,
+        }),
+      );
       for (const part of item.parts ?? []) {
         if (part.length >= 3) {
-          scene.add(prism(part, elevationM, FURNITURE_HEIGHT_M, FURNITURE_COLOR));
+          scene.add(
+            tuneMaterial(prism(part, elevationM, FURNITURE_HEIGHT_M, FURNITURE_COLOR), {
+              metalness: 0.15,
+              roughness: 0.55,
+            }),
+          );
         }
       }
     }
