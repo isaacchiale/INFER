@@ -91,6 +91,8 @@ npm run dev
 
 Open the app, click **Open model…**, and drop an `.ifc` or IndoorGML file. Vite proxies `/api` to the backend on `:8000`.
 
+**Using the workspace:** [docs/INFER-user-guide.md](docs/INFER-user-guide.md) · [Word](docs/INFER-user-guide.docx) · [slides](docs/INFER-user-guide.pptx).
+
 ## Project structure
 
 ```

@@ -304,6 +304,39 @@ describe("geometric-path", () => {
     assert.equal(obs[0]![0]!.x, 15);
   });
 
+  it("furnitureOverlappingSpace includes sibling occupancy rings (screens beside a desk)", () => {
+    const space = footprints.spaces[1]!;
+    const fp: FootprintsDocument = {
+      ...footprints,
+      furniture: [
+        {
+          global_id: "F-cubicle",
+          name: "Cubicle",
+          storey_global_id: "S1",
+          polygon: [
+            { x: 15, y: 2 },
+            { x: 16, y: 2 },
+            { x: 16, y: 4 },
+            { x: 15, y: 4 },
+          ],
+          parts: [
+            [
+              { x: 16, y: 4 },
+              { x: 16.1, y: 4 },
+              { x: 16.1, y: 8 },
+              { x: 16, y: 8 },
+            ],
+          ],
+          incomplete: false,
+          method: "ifc_mesh_xy_outline",
+        },
+      ],
+    };
+    const obs = furnitureOverlappingSpace(fp, space);
+    assert.equal(obs.length, 2);
+    assert.equal(obs[1]![0]!.x, 16);
+  });
+
   it("biases corridor path away from the near wall (1/clearance cost)", () => {
     const corridor = [
       { x: 0, y: 0 },

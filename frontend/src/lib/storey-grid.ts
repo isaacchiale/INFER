@@ -8,6 +8,8 @@
  * door between them stay separate, because a step between different regions
  * is only allowed inside a portal's gate cells (or across a space↔space
  * opening). Blocking a portal closes its gate for that search only.
+ * Blocking a space (same what-if overlay) forbids occupying that region's
+ * cells without removing the room from the mesh.
  */
 
 import {
@@ -18,9 +20,18 @@ import {
   type NavmeshPortal,
   type StoreyNavmesh,
 } from "@/lib/navmesh";
-import { pointInPolygon, pointInSpace } from "@/lib/geometric-path";
+import { occupancyRings, pointInPolygon, pointInSpace } from "@/lib/geometric-path";
 import type { FootprintsDocument, Point2D } from "@/types/footprints";
 import type { ConnectivityGraph } from "@/types/graph";
+
+export type GridRouteOpts = {
+  blockedPortalIds?: ReadonlySet<string>;
+  blockedSpaceIds?: ReadonlySet<string>;
+  blockedConnectorIds?: ReadonlySet<string>;
+};
+
+/** Portal-closed bits plus region indices that must not be occupied this search. */
+type StepBlock = { portals: Uint8Array | null; regions: Set<number> | null };
 
 export type GridPortal = {
   id: string;
@@ -70,9 +81,12 @@ const MAX_GATE_WIDTH_M = 2.4;
 const GATE_SEARCH_M = 2;
 /** Pins further than this from any cell of their own region can't be placed on the grid. */
 const PIN_SNAP_M = 1;
-/** Steps closer than this to a wall cost extra, so routes keep off walls when there's room. */
-const WALL_CLEAR_M = 0.5;
-const WALL_PENALTY = 1.5;
+/** Steps closer than 1 m to a wall cost extra: 1 m → ×1, 0.5 m → ×2, 0 m → ×3. */
+const WALL_CLEAR_M = 1;
+const WALL_PENALTY = 2;
+/** String-pull and fillets must stay this far from walls — A* already prefers
+ * 1 m, but a taut shortcut was allowed to scrape the inner corner (0 m). */
+const PULL_CLEAR_M = 0.4;
 const DOORWAY_VOID_MAX_THICKNESS_M = 1;
 
 const DC = [1, -1, 0, 0, 1, 1, -1, -1];
@@ -267,10 +281,13 @@ function gatesShareOpenPortal(grid: StoreyGrid, gu: number, gv: number, blocked:
 }
 
 /** Whether a walker may step from cell `u` to the adjacent cell `v`. */
-function canStep(grid: StoreyGrid, u: number, v: number, blocked: Uint8Array | null): boolean {
+function canStep(grid: StoreyGrid, u: number, v: number, block: StepBlock | null): boolean {
   const ru = grid.region[u]!;
   const rv = grid.region[v]!;
   if (ru === BLOCKED || rv === BLOCKED) return false;
+  const closed = block?.regions;
+  if (closed && ((ru >= 0 && closed.has(ru)) || (rv >= 0 && closed.has(rv)))) return false;
+  const blocked = block?.portals ?? null;
   if (ru === rv && ru >= 0) return true;
   const gu = grid.gate[u]!;
   const gv = grid.gate[v]!;
@@ -449,9 +466,11 @@ export function buildStoreyGrid(mesh: StoreyNavmesh, footprints: FootprintsDocum
   // Painted after gates so a desk parked in a doorway really does block it.
   for (const item of footprints.furniture ?? []) {
     if (item.incomplete || item.storey_global_id !== mesh.storeyId) continue;
-    forObstacleCells(grid, item.polygon, (idx) => {
-      grid.region[idx] = BLOCKED;
-    });
+    for (const ring of occupancyRings(item)) {
+      forObstacleCells(grid, ring, (idx) => {
+        grid.region[idx] = BLOCKED;
+      });
+    }
   }
 
   computeClearance(grid);
@@ -575,7 +594,7 @@ function stepPenalty(grid: StoreyGrid, idx: number): number {
 function search(
   grid: StoreyGrid,
   source: number,
-  blocked: Uint8Array | null,
+  block: StepBlock | null,
   h: (idx: number) => number,
   onSettle: (idx: number) => boolean,
 ): Scratch {
@@ -600,13 +619,13 @@ function search(
       if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
       const v = nr * cols + nc;
       if (done[v] === gen) continue;
-      if (!canStep(grid, u, v, blocked)) continue;
+      if (!canStep(grid, u, v, block)) continue;
       if (k >= 4) {
         // No corner-cutting past a wall or a closed boundary.
         const o1 = r * cols + nc;
         const o2 = nr * cols + c;
-        if (!canStep(grid, u, o1, blocked) || !canStep(grid, o1, v, blocked)) continue;
-        if (!canStep(grid, u, o2, blocked) || !canStep(grid, o2, v, blocked)) continue;
+        if (!canStep(grid, u, o1, block) || !canStep(grid, o1, v, block)) continue;
+        if (!canStep(grid, u, o2, block) || !canStep(grid, o2, v, block)) continue;
       }
       const cost = STEP_LEN[k]! * grid.cell * 0.5 * (penU + stepPenalty(grid, v));
       const tentative = g[u]! + cost;
@@ -639,13 +658,35 @@ function blockedMask(grid: StoreyGrid, blockedPortalIds?: ReadonlySet<string>): 
   return any ? mask : null;
 }
 
+function blockedRegionSet(grid: StoreyGrid, blockedSpaceIds?: ReadonlySet<string>): Set<number> | null {
+  if (!blockedSpaceIds?.size) return null;
+  const closed = new Set<number>();
+  grid.regionIds.forEach((id, i) => {
+    if (blockedSpaceIds.has(id)) closed.add(i);
+  });
+  return closed.size ? closed : null;
+}
+
+function stepBlock(grid: StoreyGrid, opts: GridRouteOpts = {}): StepBlock | null {
+  const portals = blockedMask(grid, opts.blockedPortalIds);
+  const regions = blockedRegionSet(grid, opts.blockedSpaceIds);
+  if (!portals && !regions) return null;
+  return { portals, regions };
+}
+
+function hazardCacheKey(opts: GridRouteOpts = {}): string {
+  const p = opts.blockedPortalIds?.size ? [...opts.blockedPortalIds].sort().join("\0") : "";
+  const s = opts.blockedSpaceIds?.size ? [...opts.blockedSpaceIds].sort().join("\0") : "";
+  return s ? `${p}#s:${s}` : p;
+}
+
 /** Straight segment stays on steppable cells no closer to walls than `minClear`. */
 function segmentClear(
   grid: StoreyGrid,
   a: Point2D,
   b: Point2D,
   minClear: number,
-  blocked: Uint8Array | null,
+  block: StepBlock | null,
 ): boolean {
   const len = Math.hypot(b.x - a.x, b.y - a.y);
   const samples = Math.max(1, Math.ceil(len / (grid.cell * 0.5)));
@@ -661,40 +702,243 @@ function segmentClear(
     const ic = idx % grid.cols;
     const ir = (idx - ic) / grid.cols;
     if (Math.abs(pc - ic) > 1 || Math.abs(pr - ir) > 1) return false;
-    if (!canStep(grid, prev, idx, blocked)) return false;
+    if (!canStep(grid, prev, idx, block)) return false;
     if (pc !== ic && pr !== ir) {
       const o1 = pr * grid.cols + ic;
       const o2 = ir * grid.cols + pc;
-      if (!canStep(grid, prev, o1, blocked) || !canStep(grid, o1, idx, blocked)) return false;
-      if (!canStep(grid, prev, o2, blocked) || !canStep(grid, o2, idx, blocked)) return false;
+      if (!canStep(grid, prev, o1, block) || !canStep(grid, o1, idx, block)) return false;
+      if (!canStep(grid, prev, o2, block) || !canStep(grid, o2, idx, block)) return false;
     }
     prev = idx;
   }
   return true;
 }
 
+/** Straight chord may cost a bit more than the cell walk before we keep the wiggles. */
+const SIMPLIFY_COST_TOLERANCE = 1.15;
+
+/** Scrape-weighted length of the straight segment `a`→`b` (same weights as A*). */
+function segmentScrapeCost(grid: StoreyGrid, a: Point2D, b: Point2D): number {
+  const len = Math.hypot(b.x - a.x, b.y - a.y);
+  const samples = Math.max(1, Math.ceil(len / (grid.cell * 0.5)));
+  let cost = 0;
+  for (let i = 0; i < samples; i++) {
+    const t = (i + 0.5) / samples;
+    const idx = cellAt(grid, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+    const pen = idx >= 0 ? stepPenalty(grid, idx) : 1 + WALL_PENALTY;
+    cost += (len / samples) * pen;
+  }
+  return cost;
+}
+
+/** Scrape-weighted length of the cell walk from `lo` to `hi` inclusive. */
+function cellsScrapeCost(grid: StoreyGrid, cells: number[], lo: number, hi: number): number {
+  let cost = 0;
+  for (let i = lo; i < hi; i++) {
+    const a = cellCentre(grid, cells[i]!);
+    const b = cellCentre(grid, cells[i + 1]!);
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    cost +=
+      len * 0.5 * (stepPenalty(grid, cells[i]!) + stepPenalty(grid, cells[i + 1]!));
+  }
+  return cost;
+}
+
+/** Biggest circular fillet on a string-pull corner (metres). */
+const MAX_BEND_RADIUS_M = 2.2;
+/** Ignore heading changes smaller than this — they are already "straight". */
+const MIN_TURN_RAD = (18 * Math.PI) / 180;
+/** Keep this much clearance after the fillet cuts toward the inner wall. */
+const FILLET_CLEAR_KEEP_M = PULL_CLEAR_M;
+/** Each corner may eat at most this fraction of the outgoing edge. */
+const FILLET_EDGE_FRACTION = 0.42;
+
+/** Fill `from`→`to` so the Catmull-Rom display tube cannot bow off the chord. */
+function appendResampled(out: Point2D[], from: Point2D, to: Point2D, spacing: number): void {
+  const len = Math.hypot(to.x - from.x, to.y - from.y);
+  const steps = Math.max(1, Math.ceil(len / Math.max(spacing, 1e-6)));
+  for (let s = 1; s <= steps; s++) {
+    const t = s / steps;
+    out.push({ x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t });
+  }
+}
+
+/** Walk a pin toward higher clearance so taut corners sit ~PULL_CLEAR_M off the wall. */
+function nudgeClear(grid: StoreyGrid, p: Point2D, block: StepBlock | null): Point2D {
+  let idx = cellAt(grid, p.x, p.y);
+  if (idx < 0) return p;
+  for (let step = 0; step < 12; step++) {
+    if (grid.clear[idx]! >= PULL_CLEAR_M) return cellCentre(grid, idx);
+    let best = -1;
+    let bestC = grid.clear[idx]!;
+    const c = idx % grid.cols;
+    const r = (idx - c) / grid.cols;
+    for (let k = 0; k < 8; k++) {
+      const nc = c + DC[k]!;
+      const nr = r + DR[k]!;
+      if (nc < 0 || nc >= grid.cols || nr < 0 || nr >= grid.rows) continue;
+      const v = nr * grid.cols + nc;
+      if (!canStep(grid, idx, v, block)) continue;
+      if (grid.clear[v]! > bestC) {
+        bestC = grid.clear[v]!;
+        best = v;
+      }
+    }
+    if (best < 0) break;
+    idx = best;
+  }
+  return cellCentre(grid, idx);
+}
+
+function samplesWalkable(grid: StoreyGrid, samples: Point2D[], block: StepBlock | null): boolean {
+  for (let i = 1; i < samples.length; i++) {
+    if (!segmentClear(grid, samples[i - 1]!, samples[i]!, PULL_CLEAR_M, block)) return false;
+  }
+  return true;
+}
+
 /**
- * Greedy string-pull of a cell path into straight runs. A shortcut must not
- * pass closer to walls than the cell path it replaces did, so the wall-offset
- * the search paid for survives smoothing.
+ * Circular fillet at `b` for the turn `a`→`b`→`c`, or null if the corner is
+ * already shallow / too tight against a wall / not walkable.
  */
-function smoothCells(grid: StoreyGrid, cells: number[], blocked: Uint8Array | null): Point2D[] {
+function cornerFillet(
+  grid: StoreyGrid,
+  block: StepBlock | null,
+  a: Point2D,
+  b: Point2D,
+  c: Point2D,
+  incomingLeft: number,
+  outgoingLeft: number,
+): { t1: Point2D; t2: Point2D; samples: Point2D[] } | null {
+  const inx = b.x - a.x;
+  const iny = b.y - a.y;
+  const outx = c.x - b.x;
+  const outy = c.y - b.y;
+  const inLen = Math.hypot(inx, iny);
+  const outLen = Math.hypot(outx, outy);
+  if (inLen < 1e-6 || outLen < 1e-6) return null;
+  const uix = inx / inLen;
+  const uiy = iny / inLen;
+  const uox = outx / outLen;
+  const uoy = outy / outLen;
+  const dot = Math.max(-1, Math.min(1, uix * uox + uiy * uoy));
+  const delta = Math.acos(dot);
+  if (delta < MIN_TURN_RAD || delta > Math.PI - 0.08) return null;
+  const half = delta / 2;
+  const tanHalf = Math.tan(half);
+  const cosHalf = Math.cos(half);
+  if (tanHalf < 1e-6 || cosHalf < 1e-6) return null;
+
+  const idx = cellAt(grid, b.x, b.y);
+  const clear = idx >= 0 ? grid.clear[idx]! : 0;
+  const inset = 1 / cosHalf - 1;
+  const rWall = inset > 1e-6 ? Math.max(0, clear - FILLET_CLEAR_KEEP_M) / inset : MAX_BEND_RADIUS_M;
+  const maxL = Math.min(incomingLeft, outgoingLeft, inLen * FILLET_EDGE_FRACTION, outLen * FILLET_EDGE_FRACTION);
+  let R = Math.min(MAX_BEND_RADIUS_M, rWall, maxL / tanHalf);
+  if (R < grid.cell) return null;
+
+  const build = (radius: number) => {
+    const L = radius * tanHalf;
+    const cross = uix * uoy - uiy * uox;
+    const nx = cross >= 0 ? -uiy : uiy;
+    const ny = cross >= 0 ? uix : -uix;
+    const t1 = { x: b.x - uix * L, y: b.y - uiy * L };
+    const t2 = { x: b.x + uox * L, y: b.y + uoy * L };
+    const cx = t1.x + nx * radius;
+    const cy = t1.y + ny * radius;
+    let a1 = Math.atan2(t1.y - cy, t1.x - cx);
+    const a2 = Math.atan2(t2.y - cy, t2.x - cx);
+    let sweep = a2 - a1;
+    if (cross >= 0) {
+      while (sweep <= 0) sweep += Math.PI * 2;
+      if (sweep > Math.PI + 1e-3) return null;
+    } else {
+      while (sweep >= 0) sweep -= Math.PI * 2;
+      if (sweep < -Math.PI - 1e-3) return null;
+    }
+    const steps = Math.max(2, Math.ceil((Math.abs(sweep) * radius) / grid.cell));
+    const samples: Point2D[] = [t1];
+    for (let s = 1; s < steps; s++) {
+      const ang = a1 + (sweep * s) / steps;
+      samples.push({ x: cx + Math.cos(ang) * radius, y: cy + Math.sin(ang) * radius });
+    }
+    samples.push(t2);
+    return { t1, t2, samples };
+  };
+
+  for (const radius of [R, R * 0.55]) {
+    if (radius < grid.cell) break;
+    const fillet = build(radius);
+    if (fillet && samplesWalkable(grid, fillet.samples, block)) return fillet;
+  }
+  return null;
+}
+
+/**
+ * Greedy string-pull: fewest straight runs that stay walkable and do not
+ * raise scrape-weighted cost (same 1 m / 0.5 m / 0 m multipliers as A*).
+ */
+function stringPullCells(grid: StoreyGrid, cells: number[], block: StepBlock | null): Point2D[] {
   const pts = cells.map((c) => cellCentre(grid, c));
   if (pts.length <= 2) return pts;
   const out: Point2D[] = [pts[0]!];
-  let anchor = 0;
-  let runMin = grid.clear[cells[0]!]!;
-  for (let k = 1; k < pts.length; k++) {
-    runMin = Math.min(runMin, grid.clear[cells[k]!]!);
-    if (k - anchor < 2) continue;
-    if (!segmentClear(grid, pts[anchor]!, pts[k]!, runMin - 1e-6, blocked)) {
-      anchor = k - 1;
-      out.push(pts[anchor]!);
-      runMin = Math.min(grid.clear[cells[anchor]!]!, grid.clear[cells[k]!]!);
+  let i = 0;
+  while (i < pts.length - 1) {
+    let j = pts.length - 1;
+    while (j > i + 1) {
+      if (!segmentClear(grid, pts[i]!, pts[j]!, PULL_CLEAR_M, block)) {
+        j--;
+        continue;
+      }
+      const straight = segmentScrapeCost(grid, pts[i]!, pts[j]!);
+      const raw = cellsScrapeCost(grid, cells, i, j);
+      if (straight <= raw * SIMPLIFY_COST_TOLERANCE) break;
+      j--;
+    }
+    out.push(pts[j]!);
+    i = j;
+  }
+  if (out.length <= 2) return out;
+  return [
+    out[0]!,
+    ...out.slice(1, -1).map((p) => nudgeClear(grid, p, block)),
+    out[out.length - 1]!,
+  ];
+}
+
+/**
+ * Round string-pull corners with clearance-limited circular fillets, then
+ * resample so Catmull-Rom cannot bow off the walkable line.
+ */
+function filletAndResample(grid: StoreyGrid, pts: Point2D[], block: StepBlock | null): Point2D[] {
+  if (pts.length === 0) return pts;
+  if (pts.length <= 2) {
+    const out = [pts[0]!];
+    if (pts[1]) appendResampled(out, pts[0]!, pts[1]!, grid.cell);
+    return out;
+  }
+  const out: Point2D[] = [pts[0]!];
+  let cursor = pts[0]!;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const b = pts[i]!;
+    const incomingLeft = Math.hypot(b.x - cursor.x, b.y - cursor.y);
+    const outgoingLeft = Math.hypot(pts[i + 1]!.x - b.x, pts[i + 1]!.y - b.y);
+    const fillet = cornerFillet(grid, block, pts[i - 1]!, b, pts[i + 1]!, incomingLeft, outgoingLeft);
+    if (fillet && incomingLeft + 1e-6 >= Math.hypot(b.x - fillet.t1.x, b.y - fillet.t1.y)) {
+      appendResampled(out, cursor, fillet.t1, grid.cell);
+      for (let s = 1; s < fillet.samples.length; s++) out.push(fillet.samples[s]!);
+      cursor = fillet.t2;
+    } else {
+      appendResampled(out, cursor, b, grid.cell);
+      cursor = b;
     }
   }
-  out.push(pts[pts.length - 1]!);
+  appendResampled(out, cursor, pts[pts.length - 1]!, grid.cell);
   return out;
+}
+
+function smoothCells(grid: StoreyGrid, cells: number[], block: StepBlock | null): Point2D[] {
+  return filletAndResample(grid, stringPullCells(grid, cells, block), block);
 }
 
 function regionSequence(grid: StoreyGrid, cells: number[]): string[] {
@@ -709,10 +953,13 @@ function regionSequence(grid: StoreyGrid, cells: number[]): string[] {
 }
 
 /** Region indices reachable from `from` through open (unblocked) portals. */
-function reachableRegions(grid: StoreyGrid, from: number, blocked: Uint8Array | null): Set<number> {
+function reachableRegions(grid: StoreyGrid, from: number, block: StepBlock | null): Set<number> {
+  const closed = block?.regions;
+  if (closed?.has(from)) return new Set([from]);
   const adj = new Map<number, number[]>();
   grid.portals.forEach((p, i) => {
-    if (blocked?.[i] || p.b < 0) return;
+    if (block?.portals?.[i] || p.b < 0) return;
+    if (closed?.has(p.a) || closed?.has(p.b)) return;
     (adj.get(p.a) ?? adj.set(p.a, []).get(p.a)!).push(p.b);
     (adj.get(p.b) ?? adj.set(p.b, []).get(p.b)!).push(p.a);
   });
@@ -755,15 +1002,18 @@ export function findGridPath(
   mesh: StoreyNavmesh,
   start: Point2D,
   end: Point2D,
-  opts: { blockedPortalIds?: ReadonlySet<string> } = {},
+  opts: GridRouteOpts = {},
 ): { found: boolean; points: Point2D[]; note: string; graphNodeIds: string[] } {
   const s = pinCell(grid, mesh, start);
   const t = pinCell(grid, mesh, end);
   if (!s || !t) {
     return { found: false, points: [], note: "Pick points inside walkable regions", graphNodeIds: [] };
   }
-  const blocked = blockedMask(grid, opts.blockedPortalIds);
-  if (s.region !== t.region && !reachableRegions(grid, s.region, blocked).has(t.region)) {
+  const block = stepBlock(grid, opts);
+  if (block?.regions?.has(s.region) || block?.regions?.has(t.region)) {
+    return { found: false, points: [], note: "Region is blocked", graphNodeIds: [] };
+  }
+  if (s.region !== t.region && !reachableRegions(grid, s.region, block).has(t.region)) {
     return { found: false, points: [], note: "No portal path between regions", graphNodeIds: [] };
   }
   const goal = cellCentre(grid, t.cell);
@@ -771,7 +1021,7 @@ export function findGridPath(
   const sc = search(
     grid,
     s.cell,
-    blocked,
+    block,
     (idx) => {
       const p = cellCentre(grid, idx);
       return Math.hypot(p.x - goal.x, p.y - goal.y);
@@ -785,7 +1035,7 @@ export function findGridPath(
   const graphNodeIds = regionSequence(grid, cells);
   return {
     found: true,
-    points: withPins(smoothCells(grid, cells, blocked), start, end),
+    points: withPins(smoothCells(grid, cells, block), start, end),
     note: graphNodeIds.length > 1 ? `${graphNodeIds.length - 1} hops` : "Same-region path",
     graphNodeIds,
   };
@@ -796,24 +1046,27 @@ export function findGridNearestExitPath(
   grid: StoreyGrid,
   mesh: StoreyNavmesh,
   start: Point2D,
-  opts: { blockedPortalIds?: ReadonlySet<string> } = {},
+  opts: GridRouteOpts = {},
 ): { found: boolean; points: Point2D[]; note: string; exitPortalId?: string; graphNodeIds: string[] } {
   const s = pinCell(grid, mesh, start);
   if (!s) {
     return { found: false, points: [], note: "Pick a point inside a walkable region", graphNodeIds: [] };
   }
-  const blocked = blockedMask(grid, opts.blockedPortalIds);
+  const block = stepBlock(grid, opts);
+  if (block?.regions?.has(s.region)) {
+    return { found: false, points: [], note: "Region is blocked", graphNodeIds: [] };
+  }
   const exitByCell = new Map<number, number>();
   grid.portals.forEach((p, i) => {
-    if (p.kind === "exit" && !blocked?.[i] && p.cell >= 0 && grid.region[p.cell] !== BLOCKED) {
-      exitByCell.set(p.cell, i);
-    }
+    if (p.kind !== "exit" || block?.portals?.[i] || p.cell < 0 || grid.region[p.cell] === BLOCKED) return;
+    if (block?.regions?.has(p.a)) return;
+    exitByCell.set(p.cell, i);
   });
   if (!exitByCell.size) {
     return { found: false, points: [], note: "No exit portal on this storey", graphNodeIds: [] };
   }
   let hit = -1;
-  const sc = search(grid, s.cell, blocked, () => 0, (idx) => {
+  const sc = search(grid, s.cell, block, () => 0, (idx) => {
     if (!exitByCell.has(idx)) return false;
     hit = idx;
     return true;
@@ -826,7 +1079,7 @@ export function findGridNearestExitPath(
   const graphNodeIds = regionSequence(grid, cells);
   return {
     found: true,
-    points: withPins(smoothCells(grid, cells, blocked), start, exit.point),
+    points: withPins(smoothCells(grid, cells, block), start, exit.point),
     note: `${Math.max(graphNodeIds.length - 1, 0)} hops to exit`,
     exitPortalId: exit.id,
     graphNodeIds,
@@ -844,14 +1097,14 @@ function reachTargets(
   grid: StoreyGrid,
   source: number,
   targets: readonly number[],
-  blocked: Uint8Array | null,
+  block: StepBlock | null,
 ): Map<number, Reach> {
   const pending = new Set(targets.filter((t) => t >= 0 && t !== source));
   const out = new Map<number, Reach>();
   if (targets.includes(source)) out.set(source, { cost: 0, cells: [source] });
   if (!pending.size) return out;
   const settled: number[] = [];
-  const sc = search(grid, source, blocked, () => 0, (idx) => {
+  const sc = search(grid, source, block, () => 0, (idx) => {
     if (!pending.has(idx)) return false;
     pending.delete(idx);
     settled.push(idx);
@@ -868,7 +1121,7 @@ function cachedLandingReach(
   grid: StoreyGrid,
   source: number,
   targets: readonly number[],
-  blocked: Uint8Array | null,
+  block: StepBlock | null,
   blockedKey: string,
 ): Map<number, Reach> {
   let byKey = landingReachCache.get(grid);
@@ -879,7 +1132,7 @@ function cachedLandingReach(
   const key = `${blockedKey}#${source}`;
   let hit = byKey.get(key);
   if (!hit) {
-    hit = reachTargets(grid, source, targets, blocked);
+    hit = reachTargets(grid, source, targets, block);
     byKey.set(key, hit);
   }
   return hit;
@@ -891,7 +1144,7 @@ function collectLandings(
   grids: readonly StoreyGrid[],
   graph: ConnectivityGraph,
   footprints: FootprintsDocument,
-  opts: { blockedConnectorIds?: ReadonlySet<string> } = {},
+  opts: GridRouteOpts = {},
 ): {
   landings: Map<string, Landing>;
   landingsByStorey: Map<string, Landing[]>;
@@ -906,6 +1159,7 @@ function collectLandings(
     for (const c of connectors) {
       const key = `${linkId}@${c.storeyId}`;
       if (opts.blockedConnectorIds?.has(key)) continue;
+      if (opts.blockedSpaceIds?.has(c.spaceId)) continue;
       const grid = gridById.get(c.storeyId);
       if (!grid) continue;
       const regionIdx = grid.regionIds.indexOf(c.spaceId);
@@ -951,7 +1205,7 @@ export function findGridMultiStoreyPath(
   footprints: FootprintsDocument,
   start: { storeyId: string; point: Point2D },
   end: { storeyId: string; point: Point2D },
-  opts: { blockedPortalIds?: ReadonlySet<string>; blockedConnectorIds?: ReadonlySet<string> } = {},
+  opts: GridRouteOpts = {},
 ): {
   found: boolean;
   note: string;
@@ -980,6 +1234,9 @@ export function findGridMultiStoreyPath(
   const s = pinCell(startGrid, startMesh, start.point);
   const t = pinCell(endGrid, endMesh, end.point);
   if (!s || !t) return fail("Pick points inside walkable regions");
+  if (stepBlock(startGrid, opts)?.regions?.has(s.region) || stepBlock(endGrid, opts)?.regions?.has(t.region)) {
+    return fail("Region is blocked");
+  }
 
   const { landings, landingsByStorey, verticalNext, elevations } = collectLandings(
     grids,
@@ -988,14 +1245,14 @@ export function findGridMultiStoreyPath(
     opts,
   );
 
-  const blockedByStorey = new Map<string, Uint8Array | null>();
+  const blockedByStorey = new Map<string, StepBlock | null>();
   const blockedFor = (grid: StoreyGrid) => {
     if (!blockedByStorey.has(grid.storeyId)) {
-      blockedByStorey.set(grid.storeyId, blockedMask(grid, opts.blockedPortalIds));
+      blockedByStorey.set(grid.storeyId, stepBlock(grid, opts));
     }
     return blockedByStorey.get(grid.storeyId)!;
   };
-  const blockedKey = opts.blockedPortalIds?.size ? [...opts.blockedPortalIds].sort().join("\0") : "";
+  const blockedKey = hazardCacheKey(opts);
 
   const startLandingCells = (landingsByStorey.get(start.storeyId) ?? []).map((l) => l.cell);
   const endLandingCells = (landingsByStorey.get(end.storeyId) ?? []).map((l) => l.cell);
@@ -1124,7 +1381,7 @@ export function findGridNearestExitPathBuilding(
   graph: ConnectivityGraph,
   footprints: FootprintsDocument,
   start: { storeyId: string; point: Point2D },
-  opts: { blockedPortalIds?: ReadonlySet<string>; blockedConnectorIds?: ReadonlySet<string> } = {},
+  opts: GridRouteOpts = {},
 ): {
   found: boolean;
   note: string;
@@ -1150,23 +1407,25 @@ export function findGridNearestExitPathBuilding(
 
   const s = pinCell(startGrid, startMesh, start.point);
   if (!s) return fail("Pick a point inside a walkable region");
+  if (stepBlock(startGrid, opts)?.regions?.has(s.region)) return fail("Region is blocked");
 
-  const blockedByStorey = new Map<string, Uint8Array | null>();
+  const blockedByStorey = new Map<string, StepBlock | null>();
   const blockedFor = (grid: StoreyGrid) => {
     if (!blockedByStorey.has(grid.storeyId)) {
-      blockedByStorey.set(grid.storeyId, blockedMask(grid, opts.blockedPortalIds));
+      blockedByStorey.set(grid.storeyId, stepBlock(grid, opts));
     }
     return blockedByStorey.get(grid.storeyId)!;
   };
-  const blockedKey = opts.blockedPortalIds?.size ? [...opts.blockedPortalIds].sort().join("\0") : "";
+  const blockedKey = hazardCacheKey(opts);
 
   const exitsByStorey = new Map<string, GridExit[]>();
   for (const grid of grids) {
-    const blocked = blockedFor(grid);
+    const block = blockedFor(grid);
     const list: GridExit[] = [];
     grid.portals.forEach((p, i) => {
-      if (p.kind !== "exit" || blocked?.[i]) return;
+      if (p.kind !== "exit" || block?.portals?.[i]) return;
       if (p.cell < 0 || grid.region[p.cell] === BLOCKED) return;
+      if (block?.regions?.has(p.a)) return;
       list.push({
         key: `__exit:${p.id}`,
         storeyId: grid.storeyId,

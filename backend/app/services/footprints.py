@@ -4,10 +4,14 @@ Build 2D footprints for every space (and door portal) that enters the navigation
 Method (spaces / furniture):
 1. Prefer ifcopenshell.geom mesh → keep nearly-horizontal faces (floor/ceiling) →
    project to XY → boundary-edge stitch → exterior + holes (ifc_mesh_xy_outline).
-   Full 3D meshes are not used for boundary edges: floor+ceiling would double-count
-   every plan edge and force a convex-hull fallback. Furniture uses the exterior
-   ring only (obstacle polygon); tiny measured outlines are dropped.
-2. Fallback: convex hull of mesh XY (ifc_mesh_xy_hull).
+   Full 3D meshes are not used for a single boundary stitch: floor+ceiling would
+   double-count every plan edge. Spaces keep the largest ring (room slab) and
+   treat inner rings as holes. Furniture stitches each horizontal Z-slab on its
+   own and keeps *every* occupancy ring (desk + privacy-screen caps + chair
+   seats) so a cubicle stays a concave true shape instead of one convex hull
+   that fills the chair well.
+2. Spaces / walls / stairs fallback: convex hull of mesh XY (ifc_mesh_xy_hull).
+   Furniture does *not* take that fallback — hull is not the true occupancy.
 3. Fallback: local placement origin ± OverallWidth/Depth (ifc_placement_bbox).
    Furniture requires both dimensions (no invented 1×1 m box).
 4. If neither works → incomplete=True, empty polygon (spaces/walls); furniture
@@ -56,7 +60,7 @@ logger = logging.getLogger(__name__)
 _XY_NDIGITS = 4
 # Douglas–Peucker simplify epsilon (metres) for noisy outlines.
 _SIMPLIFY_EPS_M = 0.05
-# Drop furniture hulls smaller than this (m^2) — wall-mounted clocks, picture
+# Drop furniture occupancy smaller than this (m^2) — wall-mounted clocks, picture
 # frames, and other near-zero-footprint items that would clutter the local
 # pathfinding obstacle set without ever actually blocking a walkable route.
 _MIN_FURNITURE_AREA_M2 = 0.05
@@ -401,6 +405,39 @@ def _tri_normal(
     return nx, ny, nz
 
 
+def _horizontal_face_bands(
+    verts: list[tuple[float, float, float]],
+    faces: list[tuple[int, int, int]],
+    *,
+    min_nz_ratio: float = 0.85,
+) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]], float, float]:
+    """Nearly-horizontal faces split by normal sign (floor vs ceiling).
+
+    Stitching both bands in one edge-count pass cancels every plan edge of a
+    closed extrusion. Callers that want a *single* outline pick the larger
+    band; furniture occupancy stitches each band on its own and keeps every
+    ring so sibling caps (desk + screens) are not discarded.
+    """
+    bands: dict[str, list[tuple[int, int, int]]] = {"up": [], "down": []}
+    areas: dict[str, float] = {"up": 0.0, "down": 0.0}
+    for face in faces:
+        nx, ny, nz = _tri_normal(verts, face)
+        mag = (nx * nx + ny * ny + nz * nz) ** 0.5
+        if mag < 1e-12:
+            continue
+        if abs(nz) / mag < min_nz_ratio:
+            continue
+        i, j, k = face
+        ax, ay = verts[i][0], verts[i][1]
+        bx, by = verts[j][0], verts[j][1]
+        cx, cy = verts[k][0], verts[k][1]
+        area = abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay)) * 0.5
+        key = "up" if nz > 0 else "down"
+        bands[key].append(face)
+        areas[key] += area
+    return bands["up"], bands["down"], areas["up"], areas["down"]
+
+
 def _horizontal_faces(
     verts: list[tuple[float, float, float]],
     faces: list[tuple[int, int, int]],
@@ -414,8 +451,30 @@ def _horizontal_faces(
     to horizontal faces yields the true plan outline (including concavities).
     Prefers the Z-band with larger total |projected area| (usually floor or ceiling).
     """
-    bands: dict[str, list[tuple[int, int, int]]] = {"up": [], "down": []}
-    areas: dict[str, float] = {"up": 0.0, "down": 0.0}
+    up, down, area_up, area_down = _horizontal_face_bands(
+        verts, faces, min_nz_ratio=min_nz_ratio
+    )
+    if area_up <= 0 and area_down <= 0:
+        return []
+    return up if area_up >= area_down else down
+
+
+def _horizontal_z_slabs(
+    verts: list[tuple[float, float, float]],
+    faces: list[tuple[int, int, int]],
+    *,
+    min_nz_ratio: float = 0.85,
+    z_ndigits: int = 1,
+) -> list[list[tuple[int, int, int]]]:
+    """Horizontal faces grouped by mean Z (decimetre buckets).
+
+    Up vs down is the wrong split for occupancy: exporters often wind both
+    the top and bottom of a box with the same normal sign, so putting them
+    in one edge-count pass cancels every plan edge. Separate Z slabs keep
+    the desk top, the desk underside, and a privacy-screen cap as their own
+    rings; duplicates are dropped later.
+    """
+    slabs: dict[float, list[tuple[int, int, int]]] = defaultdict(list)
     for face in faces:
         nx, ny, nz = _tri_normal(verts, face)
         mag = (nx * nx + ny * ny + nz * nz) ** 0.5
@@ -423,18 +482,10 @@ def _horizontal_faces(
             continue
         if abs(nz) / mag < min_nz_ratio:
             continue
-        # XY projected area ~ 0.5 * |nz| component of cross product magnitude
         i, j, k = face
-        ax, ay = verts[i][0], verts[i][1]
-        bx, by = verts[j][0], verts[j][1]
-        cx, cy = verts[k][0], verts[k][1]
-        area = abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay)) * 0.5
-        key = "up" if nz > 0 else "down"
-        bands[key].append(face)
-        areas[key] += area
-    if areas["up"] <= 0 and areas["down"] <= 0:
-        return []
-    return bands["up"] if areas["up"] >= areas["down"] else bands["down"]
+        z = (verts[i][2] + verts[j][2] + verts[k][2]) / 3.0
+        slabs[round(z, z_ndigits)].append(face)
+    return [band for band in slabs.values() if band]
 
 
 def _boundary_edges_xy(
@@ -559,6 +610,75 @@ def outline_from_mesh_xy(
     if len(exterior) < 3:
         return None
     return exterior, holes
+
+
+def _classify_occupancy_rings(
+    rings: list[list[tuple[float, float]]],
+    min_area: float,
+    simplify_eps: float = _SIMPLIFY_EPS_M,
+) -> list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]]:
+    """Turn stitched XY rings into solid exteriors + holes, keeping siblings.
+
+    `_classify_exterior_and_holes` keeps only the largest ring (correct for a
+    room slab). A cubicle mesh is many sibling caps — desk, screens, seat —
+    and discarding those is what made the convex hull look like the "true"
+    obstacle. A ring whose centroid sits in a much larger solid is a hole;
+    a near-duplicate (floor and ceiling of the same slab) is dropped.
+    """
+    scored: list[tuple[float, list[tuple[float, float]]]] = []
+    for ring in rings:
+        simplified = _simplify_ring(ring, eps=simplify_eps)
+        area = abs(_signed_area(simplified))
+        if area < min_area or len(simplified) < 3:
+            continue
+        scored.append((area, simplified))
+    scored.sort(key=lambda t: t[0], reverse=True)
+
+    solids: list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]] = []
+    for area, ring in scored:
+        cx = sum(p[0] for p in ring) / len(ring)
+        cy = sum(p[1] for p in ring) / len(ring)
+        placed = False
+        for ext, holes in solids:
+            if not _point_in_ring(cx, cy, ext):
+                continue
+            ext_a = abs(_signed_area(ext))
+            if area >= ext_a * 0.9:
+                placed = True
+                break
+            holes.append(ring)
+            placed = True
+            break
+        if not placed:
+            solids.append((ring, []))
+    return solids
+
+
+def _dedupe_occupancy_solids(
+    solids: list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]],
+) -> list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]]:
+    """Drop floor+ceiling duplicates of the same slab. Do not punch a desk
+    out of a privacy-screen loop just because their XY overlaps — those
+    rings come from different Z and are both solids.
+    """
+    scored = sorted(solids, key=lambda s: abs(_signed_area(s[0])), reverse=True)
+    kept: list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]] = []
+    for ext, holes in scored:
+        if len(ext) < 3:
+            continue
+        cx = sum(p[0] for p in ext) / len(ext)
+        cy = sum(p[1] for p in ext) / len(ext)
+        area = abs(_signed_area(ext))
+        duplicate = False
+        for kext, _kholes in kept:
+            if not _point_in_ring(cx, cy, kext):
+                continue
+            if area >= abs(_signed_area(kext)) * 0.9:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append((ext, holes))
+    return kept
 
 
 def _placement_xy(element) -> tuple[float, float] | None:
@@ -1047,6 +1167,7 @@ def _hull_or_bbox_footprint(
     model_cls: Callable[..., _FootprintT],
     min_area: float | None = None,
     require_dimensions: bool = False,
+    allow_hull: bool = True,
 ) -> _FootprintT | None:
     """Shared hull -> placement-bbox -> incomplete waterfall behind
     walls/stairs/furniture footprints (they differ only in how `xy` and
@@ -1057,6 +1178,10 @@ def _hull_or_bbox_footprint(
     it's a *measured*, small footprint, not a missing one — and skips the
     final `incomplete=True` placeholder too: nothing here is worth flagging
     as broken data, just not worth keeping as an obstacle.
+
+    `allow_hull` is False for furniture: a convex hull of the whole mesh is
+    not the true occupancy (it fills cubicle chair wells). Skip straight to
+    a dimensioned placement bbox, or drop.
 
     `require_dimensions` (furniture): the shared bbox helper invents a 1×1 m
     square when OverallWidth/OverallDepth are missing. Furniture without both
@@ -1075,7 +1200,7 @@ def _hull_or_bbox_footprint(
     exporters and not others. The two are told apart below and only the
     genuine failure is logged.
     """
-    if len(xy) >= 3:
+    if allow_hull and len(xy) >= 3:
         hull = _convex_hull(xy)
         if len(hull) >= 3:
             if min_area is not None and abs(_signed_area(hull)) < min_area:
@@ -1088,6 +1213,13 @@ def _hull_or_bbox_footprint(
                 incomplete=False,
                 method="ifc_mesh_xy_hull",
             )
+
+    # Furniture skips the hull *drawing*, but a measured mesh that is simply
+    # tiny (clock, picture) must still be dropped rather than inflated via bbox.
+    if not allow_hull and min_area is not None and len(xy) >= 3:
+        measured = _convex_hull(xy)
+        if len(measured) >= 3 and abs(_signed_area(measured)) < min_area:
+            return None
 
     if require_dimensions:
         size = _furniture_plan_size_m(bbox_element)
@@ -1277,16 +1409,53 @@ def _furniture_storey(
     return _nearest_storey_gid(storeys, z)
 
 
+def _furniture_mesh_plan(
+    verts: list[tuple[float, float, float]],
+    faces: list[tuple[int, int, int]],
+) -> list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]] | None:
+    """True plan occupancy: every horizontal-face ring, never a convex hull.
+
+    Trapelo Abak cubicles are one mesh (desk + privacy screens). Each Z-slab
+    is stitched and classified on its own so a desk is not punched out as a
+    "hole" in a privacy-screen loop that merely overlaps it in XY. Sibling
+    caps stay as separate solids; the chair well is empty space.
+    """
+    solids: list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]] = []
+    for band in _horizontal_z_slabs(verts, faces):
+        edges = _boundary_edges_xy(verts, band)
+        if len(edges) < 3:
+            continue
+        solids.extend(
+            _classify_occupancy_rings(
+                _stitch_rings(edges), _MIN_FURNITURE_AREA_M2, simplify_eps=0.01
+            )
+        )
+    solids = _dedupe_occupancy_solids(solids)
+    if solids:
+        return solids
+    # Chair/table meshes often tessellate into many sub-0.05 m² caps that
+    # occupancy drops; the single-band outline is still a concave true shape,
+    # not a convex hull of every vertex.
+    outlined = outline_from_mesh_xy(verts, faces)
+    if outlined is None:
+        return None
+    exterior, holes = outlined
+    if abs(_signed_area(exterior)) < _MIN_FURNITURE_AREA_M2 or len(exterior) < 3:
+        return None
+    return [(exterior, holes)]
+
+
 def _furniture_footprint(
     index: dict[str, _MeshData],
     ifc,
     item,
     storeys: list[StoreyFootprintMeta],
 ) -> FurnitureFootprint | None:
-    """Furniture plan obstacle: prefer mesh XY outline (keeps concavities —
-    L-desks, U-sofas), then convex hull, then a *dimensioned* placement bbox.
+    """Furniture plan obstacle: true occupancy rings from the mesh (L-desks
+    keep their indent; cubicle screens stay as sibling solids), then a
+    *dimensioned* placement bbox. Never a convex hull of the whole mesh.
 
-    A *measured* outline/hull under `_MIN_FURNITURE_AREA_M2` is dropped rather
+    A *measured* outline under `_MIN_FURNITURE_AREA_M2` is dropped rather
     than kept or re-approximated — wall art and small fixtures clutter the
     local pathfinding obstacle set without blocking a walkable route.
     Undimensioned furniture must not invent a 1×1 m square (the shared bbox
@@ -1304,20 +1473,19 @@ def _furniture_footprint(
 
     verts, faces = _mesh_verts_faces(index, item)
     if verts and faces:
-        outlined = outline_from_mesh_xy(verts, faces)
-        if outlined is not None:
-            exterior, _holes = outlined
-            if abs(_signed_area(exterior)) >= _MIN_FURNITURE_AREA_M2 and len(exterior) >= 3:
-                return FurnitureFootprint(
-                    global_id=gid,
-                    name=name,
-                    storey_global_id=storey,
-                    polygon=_to_points(exterior),
-                    incomplete=False,
-                    method="ifc_mesh_xy_outline",
-                )
-            # Measured but tiny — drop rather than falling through to hull/bbox.
-            return None
+        solids = _furniture_mesh_plan(verts, faces)
+        if solids:
+            (exterior, holes), *rest = solids
+            return FurnitureFootprint(
+                global_id=gid,
+                name=name,
+                storey_global_id=storey,
+                polygon=_to_points(exterior),
+                holes=[_to_points(h) for h in holes],
+                parts=[_to_points(ext) for ext, _ignored in rest],
+                incomplete=False,
+                method="ifc_mesh_xy_outline",
+            )
 
     return _hull_or_bbox_footprint(
         gid,
@@ -1328,6 +1496,7 @@ def _furniture_footprint(
         FurnitureFootprint,
         min_area=_MIN_FURNITURE_AREA_M2,
         require_dimensions=True,
+        allow_hull=False,
     )
 
 

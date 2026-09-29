@@ -221,6 +221,11 @@ export function buildRouteShareScene(
       if (furnitureAdded.has(item.global_id)) continue;
       furnitureAdded.add(item.global_id);
       scene.add(prism(item.polygon, elevationM, FURNITURE_HEIGHT_M, FURNITURE_COLOR));
+      for (const part of item.parts ?? []) {
+        if (part.length >= 3) {
+          scene.add(prism(part, elevationM, FURNITURE_HEIGHT_M, FURNITURE_COLOR));
+        }
+      }
     }
 
     const tube = routeTube(segment.points, elevationM);

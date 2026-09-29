@@ -84,6 +84,10 @@ export type FurnitureFootprint = {
   name: string;
   storey_global_id: string | null;
   polygon: Point2D[];
+  /** Voids in `polygon`. Optional for older footprints.json. */
+  holes?: Point2D[][];
+  /** Extra solid rings (privacy screens beside a desk). Optional for older footprints.json. */
+  parts?: Point2D[][];
   incomplete: boolean;
   method: "ifc_mesh_xy_outline" | "ifc_mesh_xy_hull" | "ifc_placement_bbox" | "unavailable";
 };

@@ -187,10 +187,10 @@ def test_footprints_placement_bbox_happy_path(tmp_path):
 
 
 def test_footprints_furniture_placement_bbox_and_tiny_items_dropped(tmp_path, monkeypatch):
-    """IfcFurnishingElement/IfcFurniture keep the mesh-hull path, but the
+    """IfcFurnishingElement/IfcFurniture keep a mesh occupancy path, but the
     placement-bbox fallback requires real OverallWidth+OverallDepth (no
     invented 1×1 m square). Undimensioned IFC4 furnishings and sub-threshold
-    hulls are dropped."""
+    measured meshes are dropped."""
     ifc_path = tmp_path / "furniture.ifc"
     f = ifcopenshell.file(schema="IFC4")
     project = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="T")
@@ -316,6 +316,73 @@ def test_furniture_outline_preserves_l_shape_concavity(tmp_path, monkeypatch):
     assert footprints_service._point_in_ring(1.0, 4.0, exterior)
     assert footprints_service._point_in_ring(4.0, 1.0, exterior)
     assert not footprints_service._point_in_ring(4.0, 4.0, exterior)
+
+
+def test_furniture_cubicle_screens_keep_true_occupancy(tmp_path, monkeypatch):
+    """Desk top + a separate privacy-screen cap must both draw. Convex hull
+    of all mesh XY would fill the chair well at (1, 1.4); true occupancy
+    must not."""
+    ifc_path = tmp_path / "cubicle.ifc"
+    f = ifcopenshell.file(schema="IFC4")
+    project = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcProject", name="T")
+    ifcopenshell.api.run("unit.assign_unit", f, length={"is_metric": True, "raw": "METERS"})
+    site = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcSite", name="S")
+    building = ifcopenshell.api.run("root.create_entity", f, ifc_class="IfcBuilding", name="B")
+    storey = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcBuildingStorey", name="L1"
+    )
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=project, products=[site])
+    ifcopenshell.api.run("aggregate.assign_object", f, relating_object=site, products=[building])
+    ifcopenshell.api.run(
+        "aggregate.assign_object", f, relating_object=building, products=[storey]
+    )
+    desk = ifcopenshell.api.run(
+        "root.create_entity", f, ifc_class="IfcFurnishingElement", name="Cubicle"
+    )
+    ifcopenshell.api.run(
+        "spatial.assign_container", f, relating_structure=storey, products=[desk]
+    )
+    f.write(str(ifc_path))
+
+    # Horizontal desk 0..2 x 0..1, plus a disjoint screen cap at x=2..2.1, y=0..1.5.
+    verts = [
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (2.0, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (2.0, 0.0, 1.2),
+        (2.1, 0.0, 1.2),
+        (2.1, 1.5, 1.2),
+        (2.0, 1.5, 1.2),
+    ]
+    faces = [
+        (0, 1, 2),
+        (0, 2, 3),
+        (4, 5, 6),
+        (4, 6, 7),
+    ]
+    monkeypatch.setattr(
+        footprints_service, "_mesh_verts_faces", lambda index, element: (verts, faces)
+    )
+
+    fp = footprints_service._furniture_footprint({}, f, desk, [])
+    assert fp is not None
+    assert fp.method == "ifc_mesh_xy_outline"
+
+    def in_furniture(x: float, y: float) -> bool:
+        if footprints_service._point_in_ring(x, y, [(p.x, p.y) for p in fp.polygon]):
+            for hole in fp.holes:
+                if footprints_service._point_in_ring(x, y, [(p.x, p.y) for p in hole]):
+                    return False
+            return True
+        for part in fp.parts:
+            if footprints_service._point_in_ring(x, y, [(p.x, p.y) for p in part]):
+                return True
+        return False
+
+    assert in_furniture(1.0, 0.5)
+    assert in_furniture(2.05, 1.4)
+    assert not in_furniture(1.0, 1.4)
 
 
 def test_furniture_with_no_geometry_at_all_warns_and_is_dropped(tmp_path, caplog):

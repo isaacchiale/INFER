@@ -331,16 +331,36 @@ export function furnitureOverlappingSpace(
   const out: Point2D[][] = [];
   for (const item of furniture) {
     if (!footprintOverlapsSpace(item, space)) continue;
-    out.push(item.polygon);
+    out.push(...occupancyRings(item));
+  }
+  return out;
+}
+
+/** Largest solid plus sibling caps (screens beside a desk). */
+export function occupancyRings(footprint: {
+  polygon: Point2D[];
+  parts?: Point2D[][];
+}): Point2D[][] {
+  const out: Point2D[][] = [];
+  if (footprint.polygon.length >= 3) out.push(footprint.polygon);
+  for (const part of footprint.parts ?? []) {
+    if (part.length >= 3) out.push(part);
   }
   return out;
 }
 
 function footprintOverlapsSpace(
-  footprint: { incomplete: boolean; polygon: Point2D[]; storey_global_id: string | null },
+  footprint: {
+    incomplete: boolean;
+    polygon: Point2D[];
+    parts?: Point2D[][];
+    storey_global_id: string | null;
+  },
   space: SpaceFootprint,
 ): boolean {
-  if (footprint.incomplete || footprint.polygon.length < 3) return false;
+  if (footprint.incomplete) return false;
+  const rings = occupancyRings(footprint);
+  if (!rings.length) return false;
   if (
     space.storey_global_id &&
     footprint.storey_global_id !== space.storey_global_id
@@ -348,27 +368,32 @@ function footprintOverlapsSpace(
     return false;
   }
 
-  for (const p of footprint.polygon) {
+  for (const ring of rings) {
+    if (ringOverlapsSpace(ring, space)) return true;
+  }
+  return false;
+}
+
+function ringOverlapsSpace(ring: Point2D[], space: SpaceFootprint): boolean {
+  for (const p of ring) {
     if (pointInSpace(p.x, p.y, space.polygon, space.holes)) return true;
   }
-  const fc = polygonCentroid(footprint.polygon);
+  const fc = polygonCentroid(ring);
   if (fc && pointInSpace(fc.x, fc.y, space.polygon, space.holes)) return true;
 
   for (const p of space.polygon) {
-    if (pointInPolygon(p.x, p.y, footprint.polygon)) return true;
+    if (pointInPolygon(p.x, p.y, ring)) return true;
   }
   for (const hole of space.holes ?? []) {
     for (const p of hole) {
-      if (pointInPolygon(p.x, p.y, footprint.polygon)) return true;
+      if (pointInPolygon(p.x, p.y, ring)) return true;
     }
   }
 
-  // Thin obstacles (e.g. a wall) can cross the room without vertices inside
-  // either ring — sample edge midpoints.
-  const n = footprint.polygon.length;
+  const n = ring.length;
   for (let i = 0; i < n; i++) {
-    const a = footprint.polygon[i]!;
-    const b = footprint.polygon[(i + 1) % n]!;
+    const a = ring[i]!;
+    const b = ring[(i + 1) % n]!;
     const mx = 0.5 * (a.x + b.x);
     const my = 0.5 * (a.y + b.y);
     if (pointInSpace(mx, my, space.polygon, space.holes)) return true;
@@ -452,6 +477,8 @@ function localPathInSpace(
 
 /** Default (finest) cell size for in-polygon A* (metres). */
 export const LOCAL_PATH_CELL_M = 0.1;
+/** String-pull / line-of-sight may not scrape closer than this (person width). */
+const PULL_CLEAR_M = 0.4;
 
 /**
  * Upper bound on the local-search grid's cell count. At the default 0.1 m
@@ -800,7 +827,7 @@ export function hasLineOfSight(
     const t = i / samples;
     const x = a.x + dx * t;
     const y = a.y + dy * t;
-    if (cellClearance(x, y, polygon, holes, obstacles, doorwayVoids) < 0) return false;
+    if (cellClearance(x, y, polygon, holes, obstacles, doorwayVoids) < PULL_CLEAR_M) return false;
   }
   return true;
 }

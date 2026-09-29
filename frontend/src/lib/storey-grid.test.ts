@@ -9,6 +9,7 @@ import {
   findGridNearestExitPathBuilding,
   findGridPath,
 } from "./storey-grid.ts";
+import { smoothPolylinePathD } from "./floorplan-camera.ts";
 import { pointInPolygon } from "./geometric-path.ts";
 import type { ConnectivityGraph } from "../types/graph.ts";
 import type { FootprintsDocument, Point2D } from "../types/footprints.ts";
@@ -76,7 +77,103 @@ function setup(fp: FootprintsDocument, g: ConnectivityGraph, opts: Parameters<ty
   return { mesh, grid: buildStoreyGrid(mesh, fp) };
 }
 
+/** Dense samples of the same Catmull-Rom the 2D/3D viewers draw. */
+function sampleDisplayCurve(points: Point2D[], samplesPerSegment = 24): Point2D[] {
+  const d = smoothPolylinePathD(points);
+  if (!d.includes("C")) return points;
+  const tokens = (d.match(/-?\d+(?:\.\d+)?(?:e[-+]?\d+)?/gi) ?? []).map(Number);
+  let i = 0;
+  let start = { x: tokens[i++]!, y: tokens[i++]! };
+  const out: Point2D[] = [];
+  while (i < tokens.length) {
+    const c1 = { x: tokens[i++]!, y: tokens[i++]! };
+    const c2 = { x: tokens[i++]!, y: tokens[i++]! };
+    const end = { x: tokens[i++]!, y: tokens[i++]! };
+    for (let s = 0; s <= samplesPerSegment; s++) {
+      const t = s / samplesPerSegment;
+      const mt = 1 - t;
+      out.push({
+        x: mt * mt * mt * start.x + 3 * mt * mt * t * c1.x + 3 * mt * t * t * c2.x + t * t * t * end.x,
+        y: mt * mt * mt * start.y + 3 * mt * t * t * c1.y + 3 * mt * t * t * c2.y + t * t * t * end.y,
+      });
+    }
+    start = end;
+  }
+  return out;
+}
+
+function maxTurnDeg(points: Point2D[]): number {
+  let max = 0;
+  for (let i = 1; i < points.length - 1; i++) {
+    const ax = points[i]!.x - points[i - 1]!.x;
+    const ay = points[i]!.y - points[i - 1]!.y;
+    const bx = points[i + 1]!.x - points[i]!.x;
+    const by = points[i + 1]!.y - points[i]!.y;
+    const da = Math.hypot(ax, ay);
+    const db = Math.hypot(bx, by);
+    if (da < 1e-4 || db < 1e-4) continue;
+    const dot = Math.max(-1, Math.min(1, (ax * bx + ay * by) / (da * db)));
+    max = Math.max(max, Math.acos(dot) * (180 / Math.PI));
+  }
+  return max;
+}
+
 describe("storey grid routing", () => {
+  it("display curve of an L-corridor stays inside the L", () => {
+    const hall = [
+      { x: 0, y: 0 },
+      { x: 12, y: 0 },
+      { x: 12, y: 12 },
+      { x: 9, y: 12 },
+      { x: 9, y: 3 },
+      { x: 0, y: 3 },
+    ];
+    const fp: FootprintsDocument = {
+      ...footprints,
+      spaces: [space("L", hall)],
+      doors: [],
+    };
+    const g: ConnectivityGraph = {
+      ...graph,
+      nodes: [{ id: "space:L", kind: "space", global_id: "L", name: "L", storey_global_id: "S1" }],
+      edges: [],
+    };
+    const { mesh, grid } = setup(fp, g);
+    const path = findGridPath(grid, mesh, { x: 1, y: 1.5 }, { x: 10.5, y: 10.5 });
+    assert.equal(path.found, true);
+    // Sparse start→corner→end Catmull-Rom bows into the missing rectangle
+    // (x<9, y>3). Outer-wall millimetre overshoot is not this bug.
+    const cut = sampleDisplayCurve(path.points).filter((p) => p.x < 8.7 && p.y > 3.3);
+    assert.equal(cut.length, 0, `display curve cut the L corner at ${JSON.stringify(cut.slice(0, 3))}`);
+    const maxTurn = maxTurnDeg(path.points);
+    assert.ok(maxTurn < 50, `L corner should be filleted, max turn ${maxTurn.toFixed(1)}°`);
+    const inner = { x: 9, y: 3 };
+    for (const p of path.points) {
+      if (p.x < 7.5 || p.x > 10.5 || p.y < 1.5 || p.y > 4.5) continue;
+      const d = Math.hypot(p.x - inner.x, p.y - inner.y);
+      assert.ok(d > 0.35, `string-pull scraped the inner corner at ${p.x.toFixed(2)},${p.y.toFixed(2)} (${d.toFixed(2)} m)`);
+    }
+  });
+
+  it("keeps a corridor path off the wall after smoothing", () => {
+    const fp: FootprintsDocument = {
+      ...footprints,
+      spaces: [space("Hall", rect(0, 0, 20, 4))],
+      doors: [],
+    };
+    const g: ConnectivityGraph = {
+      ...graph,
+      nodes: [{ id: "space:Hall", kind: "space", global_id: "Hall", name: "Hall", storey_global_id: "S1" }],
+      edges: [],
+    };
+    const { mesh, grid } = setup(fp, g);
+    const path = findGridPath(grid, mesh, { x: 1, y: 0.3 }, { x: 19, y: 0.3 });
+    assert.equal(path.found, true);
+    const mid = path.points.find((p, i) => i > 0 && i < path.points.length - 1 && p.x > 8 && p.x < 12);
+    const y = mid?.y ?? path.points[Math.floor(path.points.length / 2)]!.y;
+    assert.ok(y > 0.7, `smoothing must not hug the wall, mid.y=${y}`);
+  });
+
   it("routes inside one room", () => {
     const { mesh, grid } = setup(footprints, graph);
     const path = findGridPath(grid, mesh, { x: 1, y: 1 }, { x: 3, y: 3 });
@@ -115,6 +212,22 @@ describe("storey grid routing", () => {
     });
     assert.equal(blocked.found, false);
     assert.equal(findGridPath(grid, mesh, { x: 1, y: 2 }, { x: 7, y: 2 }).found, true);
+  });
+
+  it("closes a blocked space for that search only without removing it", () => {
+    const { mesh, grid } = setup(footprints, graph);
+    const through = findGridPath(grid, mesh, { x: 1, y: 2 }, { x: 7, y: 2 }, {
+      blockedSpaceIds: new Set(["space:A"]),
+    });
+    assert.equal(through.found, false);
+    assert.equal(
+      findGridPath(grid, mesh, { x: 7, y: 1.5 }, { x: 7, y: 2.5 }, {
+        blockedSpaceIds: new Set(["space:A"]),
+      }).found,
+      true,
+    );
+    assert.equal(findGridPath(grid, mesh, { x: 1, y: 2 }, { x: 7, y: 2 }).found, true);
+    assert.ok(mesh.regions.some((r) => r.spaceId === "space:A"));
   });
 
   it("walks through a door carved in a real wall gap", () => {

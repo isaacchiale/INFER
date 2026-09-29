@@ -57,6 +57,8 @@ export function useNavmeshRouting({
   const [isExitRoute, setIsExitRoute] = useState(false);
   /** Hazard/what-if: portals excluded from routing without removing them from the graph. */
   const [blockedPortalIds, setBlockedPortalIds] = useState<Set<string>>(() => new Set());
+  /** What-if: spaces treated as closed without removing them from the mesh. */
+  const [blockedSpaceIds, setBlockedSpaceIds] = useState<Set<string>>(() => new Set());
   /** Mesh or grid build in flight ? drives the floorplan "Recalculating navmesh?" label. */
   const [navmeshBusy, setNavmeshBusy] = useState(false);
 
@@ -200,11 +202,12 @@ export function useNavmeshRouting({
               connectivityGraph,
               footprintsDocument,
               { storeyId: navmeshRoute.storeyId, point: navmeshRoute.start },
-              { blockedPortalIds },
+              { blockedPortalIds, blockedSpaceIds },
             )
           : (() => {
               const same = findGridNearestExitPath(grid, mesh, navmeshRoute.start, {
                 blockedPortalIds,
+                blockedSpaceIds,
               });
               const end = same.found ? same.points[same.points.length - 1]! : null;
               return {
@@ -277,6 +280,7 @@ export function useNavmeshRouting({
     if (navmeshRoute.storeyId === navmeshRoute.endStoreyId) {
       const result = findGridPath(startGrid, startMesh, navmeshRoute.start, navmeshRoute.end, {
         blockedPortalIds,
+        blockedSpaceIds,
       });
       setNavmeshPathNote(result.found ? null : result.note);
       const nextPoints = result.found ? result.points : null;
@@ -298,7 +302,7 @@ export function useNavmeshRouting({
       footprintsDocument,
       { storeyId: navmeshRoute.storeyId, point: navmeshRoute.start },
       { storeyId: navmeshRoute.endStoreyId, point: navmeshRoute.end },
-      { blockedPortalIds },
+      { blockedPortalIds, blockedSpaceIds },
     );
     setNavmeshPathNote(result.found ? null : result.note);
     const nextSegments = result.found ? result.segments : null;
@@ -318,6 +322,7 @@ export function useNavmeshRouting({
     allStoreyNavmeshes,
     storeyGrids,
     blockedPortalIds,
+    blockedSpaceIds,
     connectivityGraph,
     footprintsDocument,
     isExitRoute,
@@ -341,6 +346,7 @@ export function useNavmeshRouting({
     setNavmeshPathNote(null);
     setIsExitRoute(false);
     setBlockedPortalIds(new Set());
+    setBlockedSpaceIds(new Set());
   }, [footprintsId, setNavmeshRoute]);
 
   const clearNavmeshRoute = useCallback(() => {
@@ -355,6 +361,8 @@ export function useNavmeshRouting({
     setIsExitRoute,
     blockedPortalIds,
     setBlockedPortalIds,
+    blockedSpaceIds,
+    setBlockedSpaceIds,
     allStoreyNavmeshes,
     clearNavmeshRoute,
     navmeshBusy,

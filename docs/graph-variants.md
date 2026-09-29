@@ -1,11 +1,15 @@
-"""Graph variant layers: IFC / geometry / TopologicPy (on-prem).
+"""Graph variant layers: IFC / geometry (operator UI) / TopologicPy (API stub).
+
+The Graph Viewer dropdown only lists **IFC relations** and **Geometry rules**.
+The ``topologic`` variant is not an operator feature: the extractor is not
+wired, and the UI does not offer it.
 
 Variants
 --------
 - ``ifc`` — strict IfcRelSpaceBoundary graph → ``graph.json``
 - ``geometry`` — IFC ∪ door/opening/stair/wall-strip healing → ``graph.geometry.json``
-- ``topologic`` — IFC ∪ TopologicPy adjacency → ``graph.topologic.json``
-  (optional stub; not required for space↔space heal)
+- ``topologic`` — API-only stub (TopologicPy adjacency if ever wired) → ``graph.topologic.json``
+  Not required for routing; geometry healing is the live overlay.
 
 TopologicPy
 -----------

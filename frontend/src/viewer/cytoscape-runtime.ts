@@ -247,11 +247,12 @@ function stylesheet(p: GraphThemePalette): StylesheetJson {
       },
     },
     {
-      // Route hop: solid heal-colour underlay + white marching dashes on top.
+      // Route hop: heal-colour underlay + marching dashes in the hop-ring
+      // colour (white on dark paper, route blue on light).
       selector: "edge[onPath = 1]",
       style: {
         width: 2.75,
-        "line-color": "#ffffff",
+        "line-color": p.pathUnderlay,
         "line-style": "dashed",
         "line-dash-pattern": [7, 9],
         "line-dash-offset": 0,

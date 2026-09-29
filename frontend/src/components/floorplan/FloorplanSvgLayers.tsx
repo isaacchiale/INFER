@@ -98,6 +98,29 @@ function spacePathD(exterior: Point2[], holes?: Point2[][]): string {
   return d;
 }
 
+/** Desk + sibling solids (screens) + holes, evenodd so the chair well stays empty. */
+function furniturePathD(item: FurnitureFootprint): string {
+  let d = spacePathD(item.polygon, item.holes);
+  for (const part of item.parts ?? []) {
+    if (part.length >= 3) d += " " + polygonPathD(part);
+  }
+  return d;
+}
+
+function polygonBounds(polygon: Point2[]): { minX: number; minY: number; maxX: number; maxY: number } {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const p of polygon) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  return { minX, minY, maxX, maxY };
+}
+
 function polygonCentroid(polygon: Point2[]): Point2 {
   let x = 0;
   let y = 0;
@@ -301,6 +324,7 @@ export type FloorplanSvgLayersProps = {
   navmeshEnd: Point2 | null;
   isExitRoute: boolean;
   blockedPortalIds: Set<string>;
+  blockedSpaceIds: Set<string>;
   /** Evacuation-bottleneck overlay. When set, room fills and stairNodes (stairs aren't part of storeyNavmesh.portals at all) render via the continuous heatmap texture — see evacuationHeatTexture. Portal/stair markers themselves always keep their plain kind color/size. Null/omitted leaves the normal navmesh look with no heatmap. */
   evacuationLoad?: EvacuationLoadResult | null;
   doorsByGlobalId: Map<string, DoorPortal>;
@@ -349,6 +373,7 @@ function FloorplanSvgLayersImpl({
   navmeshEnd,
   isExitRoute,
   blockedPortalIds,
+  blockedSpaceIds,
   evacuationLoad,
   doorsByGlobalId,
   palette,
@@ -595,9 +620,10 @@ function FloorplanSvgLayersImpl({
             ? furniture.map((item) => (
                 <path
                   key={`furniture:${item.global_id}`}
-                  d={polygonPathD(item.polygon)}
+                  d={furniturePathD(item)}
                   fill={FURNITURE_FILL}
                   fillOpacity={0.55}
+                  fillRule="evenodd"
                   stroke={FURNITURE_STROKE}
                   strokeWidth={roomStroke}
                 >
@@ -699,6 +725,7 @@ function FloorplanSvgLayersImpl({
           ) : null}
           {storeyNavmesh?.regions.map((r: NavmeshRegion) => {
             const c = polygonCentroid(r.polygon);
+            const blocked = blockedSpaceIds.has(r.spaceId);
             // The heatmap itself is the <image> texture above (a real
             // continuous field — see evacuation-heat-texture.ts); a flat
             // per-polygon fill here reads as coloring shapes in, not a
@@ -711,23 +738,52 @@ function FloorplanSvgLayersImpl({
             // them apart, same convention this file uses for excluded spaces.
             const isUnreachable = unreachableSet?.has(r.spaceId) ?? false;
             const distance = regionDistanceToExit?.get(r.spaceId);
-            const title = isUnreachable
-              ? `${r.name || r.spaceId} — no path to an exit`
-              : distance != null
-                ? `${r.name || r.spaceId} — ${distance.toFixed(1)} m to nearest exit`
-                : r.name;
+            const title = blocked
+              ? `${r.name || r.spaceId} — blocked · double-click to unblock`
+              : isUnreachable
+                ? `${r.name || r.spaceId} — no path to an exit`
+                : distance != null
+                  ? `${r.name || r.spaceId} — ${distance.toFixed(1)} m to nearest exit`
+                  : `${r.name || r.spaceId} — click to select · double-click to block`;
+            const b = polygonBounds(r.polygon);
+            const slashId = `${heatClipId}-slash-${r.spaceId.replace(/[^A-Za-z0-9_-]/g, "_")}`;
             return (
               <g key={r.spaceId}>
                 <path
                   d={spacePathD(r.polygon, r.holes)}
-                  fill={evacuationHeatTexture ? "transparent" : "rgba(148,163,184,0.35)"}
+                  fill={
+                    blocked
+                      ? PORTAL_COLORS.blocked
+                      : evacuationHeatTexture
+                        ? "transparent"
+                        : "rgba(148,163,184,0.35)"
+                  }
+                  fillOpacity={blocked ? 0.1 : undefined}
                   fillRule="evenodd"
-                  stroke={isUnreachable ? "var(--hazard)" : "#64748b"}
+                  stroke={blocked ? "#0f172a" : isUnreachable ? "var(--hazard)" : "#64748b"}
                   strokeWidth={roomStroke}
-                  strokeDasharray={isUnreachable ? `${roomStroke * 3} ${roomStroke * 2}` : undefined}
+                  strokeDasharray={isUnreachable && !blocked ? `${roomStroke * 3} ${roomStroke * 2}` : undefined}
                 >
                   <title>{title}</title>
                 </path>
+                {blocked ? (
+                  <>
+                    <clipPath id={slashId}>
+                      <path d={spacePathD(r.polygon, r.holes)} fillRule="evenodd" />
+                    </clipPath>
+                    <line
+                      x1={b.minX}
+                      y1={b.minY}
+                      x2={b.maxX}
+                      y2={b.maxY}
+                      stroke="#0f172a"
+                      strokeWidth={roomStroke * 1.8}
+                      strokeLinecap="round"
+                      clipPath={`url(#${slashId})`}
+                      className="pointer-events-none"
+                    />
+                  </>
+                ) : null}
                 {r.name ? (
                   <g transform={`translate(${c.x} ${c.y})`}>
                     <text
@@ -752,9 +808,10 @@ function FloorplanSvgLayersImpl({
             ? furniture.map((item) => (
                 <path
                   key={`furniture:${item.global_id}`}
-                  d={polygonPathD(item.polygon)}
+                  d={furniturePathD(item)}
                   fill={FURNITURE_FILL}
                   fillOpacity={0.55}
+                  fillRule="evenodd"
                   stroke={FURNITURE_STROKE}
                   strokeWidth={roomStroke}
                   className="pointer-events-none"

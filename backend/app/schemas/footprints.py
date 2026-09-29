@@ -124,14 +124,18 @@ class WallFootprint(BaseModel):
 
 
 class FurnitureFootprint(BaseModel):
-    """2D plan outline for an IfcFurnishingElement/IfcFurniture, used as a
-    local-pathfinding obstacle alongside walls. Prefer mesh XY outline
-    (concave-capable) over convex hull / placement bbox."""
+    """2D plan occupancy for an IfcFurnishingElement/IfcFurniture, used as a
+    local-pathfinding obstacle alongside walls. Mesh XY rings (concave, one
+    solid per desk/screen/seat cap) — never a convex hull of the whole mesh.
+    `polygon` is the largest solid; `parts` are sibling solids; `holes` are
+    voids in `polygon`."""
 
     global_id: str
     name: str = ""
     storey_global_id: str | None = None
     polygon: list[Point2D] = Field(default_factory=list)
+    holes: list[list[Point2D]] = Field(default_factory=list)
+    parts: list[list[Point2D]] = Field(default_factory=list)
     incomplete: bool = False
     method: Literal[
         "ifc_mesh_xy_outline",

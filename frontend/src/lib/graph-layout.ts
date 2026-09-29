@@ -973,7 +973,8 @@ export function graphPalette(theme: "light" | "dark"): GraphThemePalette {
     label: "#64748B",
     spaceFill: "#E2E8F0",
     spaceLabel: "#1E293B",
-    spaceBorder: "#CBD5E1",
+    // Same slate as IFC space strokes on the floorplan (`#64748b`).
+    spaceBorder: "#64748B",
     portalFill: "#EDE9FE",
     portalLabel: "#5B21B6",
     portalBorder: LEGEND.stair,

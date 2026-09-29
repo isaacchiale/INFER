@@ -1548,6 +1548,18 @@ describe("computeBuildingEvacuationLoad — realistic multi-exit/topology scenar
     assert.ok(!result.unreachableSpaceIds.includes("space:L"));
   });
 
+  it("omits a blocked space from evacuation load without removing it from the mesh", () => {
+    const mesh = buildThreeRoomMesh();
+    const result = computeBuildingEvacuationLoad([mesh], threeRoomFootprints, threeRoomGraph, {
+      blockedSpaceIds: new Set(["space:M"]),
+    });
+    assert.ok(!result.regionDistanceToExit.has("space:M"));
+    assert.ok(!result.unreachableSpaceIds.includes("space:M"));
+    assert.ok(result.regionDistanceToExit.has("space:L"));
+    assert.ok(result.regionDistanceToExit.has("space:R"));
+    assert.ok(mesh.regions.some((r) => r.spaceId === "space:M"));
+  });
+
   it("treats blocking every exit the same as having none — every room unreachable, no distances", () => {
     const mesh = buildThreeRoomMesh();
     const elPortalId = mesh.portals.find((p) => p.doorGlobalId === "EL")!.id;

@@ -369,6 +369,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
     setIsExitRoute,
     blockedPortalIds,
     setBlockedPortalIds,
+    blockedSpaceIds,
+    setBlockedSpaceIds,
     allStoreyNavmeshes,
     clearNavmeshRoute,
     navmeshBusy,
@@ -814,6 +816,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     setIsEvacuationLoadPending(true);
     void computeBuildingEvacuationLoadAsync(allStoreyNavmeshes, footprintsDocument, connectivityGraph, {
       blockedPortalIds,
+      blockedSpaceIds,
     })
       .then((result) => {
         if (cancelled) return;
@@ -829,7 +832,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     return () => {
       cancelled = true;
     };
-  }, [showEvacuationLoad, allStoreyNavmeshes, footprintsDocument, connectivityGraph, blockedPortalIds]);
+  }, [showEvacuationLoad, allStoreyNavmeshes, footprintsDocument, connectivityGraph, blockedPortalIds, blockedSpaceIds]);
 
   // The floorplan pane only ever shows one storey's plan at a time, so
   // stair markers (which carry a storeyId, unlike real portals which are
@@ -1100,7 +1103,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
   const setFocusedElementIdRef = useRef(setFocusedElementId);
   setFocusedElementIdRef.current = setFocusedElementId;
   /** Single-click selects after a short delay; double-click cancels and blocks. */
-  const pendingPortalSelectRef = useRef<{
+  const pendingHazardSelectRef = useRef<{
+    kind: "portal" | "region";
     id: string;
     timer: ReturnType<typeof setTimeout>;
   } | null>(null);
@@ -1275,11 +1279,11 @@ export function FloorplanViewer({ className }: { className?: string }) {
      * Inspector "Remove" button (or Graph Viewer right-click) instead.
      * Navmesh tab still places route pins on short right-click.
      */
-    const clearPendingPortalSelect = () => {
-      const pending = pendingPortalSelectRef.current;
+    const clearPendingHazardSelect = () => {
+      const pending = pendingHazardSelectRef.current;
       if (!pending) return;
       clearTimeout(pending.timer);
-      pendingPortalSelectRef.current = null;
+      pendingHazardSelectRef.current = null;
     };
 
     const onPointerDown = (e: PointerEvent) => {
@@ -1447,10 +1451,10 @@ export function FloorplanViewer({ className }: { className?: string }) {
         const world = clientToView(e.clientX, e.clientY, svg, bounds, cameraRef.current);
         const portal = nearestPortalWithin(pick.mesh.portals, world, pick.portalHitR);
         if (portal) {
-          const pending = pendingPortalSelectRef.current;
-          if (pending && pending.id === portal.id) {
+          const pending = pendingHazardSelectRef.current;
+          if (pending && pending.kind === "portal" && pending.id === portal.id) {
             // Second click of a double-click — block only, never select.
-            clearPendingPortalSelect();
+            clearPendingHazardSelect();
             setBlockedPortalIds((prev) => {
               const next = new Set(prev);
               if (next.has(portal.id)) next.delete(portal.id);
@@ -1459,29 +1463,46 @@ export function FloorplanViewer({ className }: { className?: string }) {
             });
             return;
           }
-          clearPendingPortalSelect();
+          clearPendingHazardSelect();
           const timer = setTimeout(() => {
-            pendingPortalSelectRef.current = null;
+            pendingHazardSelectRef.current = null;
             selectElementRef.current(`portal:${portal.id}`);
           }, 280);
-          pendingPortalSelectRef.current = { id: portal.id, timer };
+          pendingHazardSelectRef.current = { kind: "portal", id: portal.id, timer };
           return;
         }
-        clearPendingPortalSelect();
         const stair = stairAtWorldPoint(world, pick.footprints, pick.storeyId);
         if (stair) {
+          clearPendingHazardSelect();
           selectElementRef.current(`stair:${stair.global_id}`);
           return;
         }
         const region = regionAtPoint(pick.mesh, world);
         if (!region) {
+          clearPendingHazardSelect();
           setFocusedElementIdRef.current(null);
           return;
         }
-        selectElementRef.current(region.spaceId);
+        const pendingRegion = pendingHazardSelectRef.current;
+        if (pendingRegion && pendingRegion.kind === "region" && pendingRegion.id === region.spaceId) {
+          clearPendingHazardSelect();
+          setBlockedSpaceIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(region.spaceId)) next.delete(region.spaceId);
+            else next.add(region.spaceId);
+            return next;
+          });
+          return;
+        }
+        clearPendingHazardSelect();
+        const timer = setTimeout(() => {
+          pendingHazardSelectRef.current = null;
+          selectElementRef.current(region.spaceId);
+        }, 280);
+        pendingHazardSelectRef.current = { kind: "region", id: region.spaceId, timer };
         return;
       }
-      clearPendingPortalSelect();
+      clearPendingHazardSelect();
       // Plain Floorplan tab: click a room to select it. Skips excluded
       // parents so nested children become hittable after Remove — same
       // idea as navmesh (excluded parent leaves the region set).
@@ -1522,7 +1543,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     surface.addEventListener("contextmenu", onContextMenu);
     return () => {
       clearRightPress();
-      clearPendingPortalSelect();
+      clearPendingHazardSelect();
       surface.removeEventListener("wheel", onWheel);
       surface.removeEventListener("pointerdown", onPointerDown);
       surface.removeEventListener("pointermove", onPointerMove);
@@ -1541,6 +1562,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
     flashMissPick,
     setIsExitRoute,
     setBlockedPortalIds,
+    setBlockedSpaceIds,
   ]);
 
   return (
@@ -1753,6 +1775,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
                     navmeshEnd={navmeshEnd}
                     isExitRoute={isExitRoute}
                     blockedPortalIds={blockedPortalIds}
+                    blockedSpaceIds={blockedSpaceIds}
                     evacuationLoad={evacuationLoad ?? null}
                     doorsByGlobalId={doorsByGlobalId}
                     palette={palette}
@@ -1850,7 +1873,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
               aria-label="Floorplan pan, zoom, and rotate surface"
               title={
                 planDisplayMode === "navmesh"
-                  ? "Left-drag: pan. Shift+scroll: rotate. Scroll: zoom. Left-click region: select. Left-click portal: select · double-click: block. Right-click: set start then end. Long right-click: clear."
+                  ? "Left-drag: pan. Shift+scroll: rotate. Scroll: zoom. Left-click region: select · double-click: block. Left-click portal: select · double-click: block. Right-click: set start then end. Long right-click: clear."
                   : "Left-drag: pan. Shift+scroll: rotate. Scroll: zoom. Left-click room: select. Remove spaces from the selection popup."
               }
             />
@@ -2062,15 +2085,19 @@ export function FloorplanViewer({ className }: { className?: string }) {
                 ) : null}
               </span>
 
-              {planDisplayMode === "navmesh" && blockedPortalIds.size > 0 ? (
+              {planDisplayMode === "navmesh" &&
+              (blockedPortalIds.size > 0 || blockedSpaceIds.size > 0) ? (
                 <button
                   type="button"
                   className="pointer-events-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-foreground transition-colors hover:bg-muted"
-                  title="Clear all blocked portals"
-                  onClick={() => setBlockedPortalIds(new Set())}
+                  title="Clear all blocked doors and spaces"
+                  onClick={() => {
+                    setBlockedPortalIds(new Set());
+                    setBlockedSpaceIds(new Set());
+                  }}
                 >
                   <span className="inline-block size-2 rounded-full bg-portal-blocked" />
-                  {blockedPortalIds.size} blocked · clear
+                  {blockedPortalIds.size + blockedSpaceIds.size} blocked · clear
                 </button>
               ) : null}
               {planDisplayMode === "navmesh" &&

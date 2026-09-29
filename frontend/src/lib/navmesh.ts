@@ -651,9 +651,11 @@ type PortalGraph = {
   adjacency: Map<string, PortalAdj[]>;
 };
 
-function blockedPortalKey(blocked?: ReadonlySet<string>): string {
-  if (!blocked?.size) return "";
-  return [...blocked].sort().join("\0");
+function blockedPortalKey(portals?: ReadonlySet<string>, spaces?: ReadonlySet<string>): string {
+  const p = portals?.size ? [...portals].sort().join("\0") : "";
+  const s = spaces?.size ? [...spaces].sort().join("\0") : "";
+  if (!p && !s) return "";
+  return s ? `${p}\nspaces:${s}` : p;
 }
 
 type PortalCoreCache = {
@@ -824,6 +826,7 @@ export function warmStoreyNavmeshWalkCosts(
 function buildPortalCoreAdjacency(
   mesh: StoreyNavmesh,
   blockedPortalIds?: ReadonlySet<string>,
+  blockedSpaceIds?: ReadonlySet<string>,
 ): {
   regionById: Map<string, NavmeshRegion>;
   graph: PortalGraph;
@@ -832,10 +835,12 @@ function buildPortalCoreAdjacency(
   const nodes = new Map<string, PortalGraphNode>();
   for (const p of mesh.portals) {
     if (blockedPortalIds?.has(p.id)) continue;
+    const regions = p.spaceB ? [p.spaceA, p.spaceB] : [p.spaceA];
+    if (regions.every((id) => blockedSpaceIds?.has(id))) continue;
     nodes.set(p.id, {
       id: p.id,
       point: p.point,
-      regions: p.spaceB ? [p.spaceA, p.spaceB] : [p.spaceA],
+      regions,
       isExit: p.kind === "exit",
     });
   }
@@ -843,6 +848,7 @@ function buildPortalCoreAdjacency(
   const nodesByRegion = new Map<string, PortalGraphNode[]>();
   for (const node of nodes.values()) {
     for (const regionId of node.regions) {
+      if (blockedSpaceIds?.has(regionId)) continue;
       const list = nodesByRegion.get(regionId) ?? [];
       list.push(node);
       nodesByRegion.set(regionId, list);
@@ -854,7 +860,7 @@ function buildPortalCoreAdjacency(
     const out: PortalAdj[] = [];
     const linked = new Set<string>();
     for (const regionId of node.regions) {
-      if (!regionById.has(regionId)) continue;
+      if (!regionById.has(regionId) || blockedSpaceIds?.has(regionId)) continue;
       for (const other of nodesByRegion.get(regionId) ?? []) {
         if (other.id === node.id || linked.has(other.id)) continue;
         linked.add(other.id);
@@ -876,17 +882,18 @@ function buildPortalCoreAdjacency(
 function adoptPortalCoreForBlockedChange(
   prev: PortalCoreCache,
   blockedPortalIds: ReadonlySet<string> | undefined,
+  blockedSpaceIds: ReadonlySet<string> | undefined,
   blockedKey: string,
 ): PortalCoreCache {
   const prevBlocked = new Set(
-    prev.blockedKey ? prev.blockedKey.split("\0").filter(Boolean) : [],
+    prev.blockedKey ? prev.blockedKey.split("\n")[0]!.split("\0").filter(Boolean) : [],
   );
   const nextBlocked = blockedPortalIds ?? new Set<string>();
   const affected = new Set<string>();
   for (const id of prevBlocked) if (!nextBlocked.has(id)) affected.add(id);
   for (const id of nextBlocked) if (!prevBlocked.has(id)) affected.add(id);
 
-  const { regionById, graph } = buildPortalCoreAdjacency(prev.mesh, blockedPortalIds);
+  const { regionById, graph } = buildPortalCoreAdjacency(prev.mesh, blockedPortalIds, blockedSpaceIds);
 
   const prevCost = new Map<string, { cost: number; path: Point2D[] | null }>();
   for (const [fromId, edges] of prev.graph.adjacency) {
@@ -944,18 +951,20 @@ function getPortalCoreGraph(
   mesh: StoreyNavmesh,
   footprints: FootprintsDocument | null | undefined,
   blockedPortalIds?: ReadonlySet<string>,
+  blockedSpaceIds?: ReadonlySet<string>,
 ): PortalCoreCache {
-  const blockedKey = blockedPortalKey(blockedPortalIds);
+  const blockedKey = blockedPortalKey(blockedPortalIds, blockedSpaceIds);
   const hit = portalCoreCacheByMesh.get(mesh);
   if (hit) {
     hit.footprints = footprints;
     if (hit.blockedKey === blockedKey) return hit;
-    return adoptPortalCoreForBlockedChange(hit, blockedPortalIds, blockedKey);
+    return adoptPortalCoreForBlockedChange(hit, blockedPortalIds, blockedSpaceIds, blockedKey);
   }
 
-  const { regionById, graph } = buildPortalCoreAdjacency(mesh, blockedPortalIds);
+  const { regionById, graph } = buildPortalCoreAdjacency(mesh, blockedPortalIds, blockedSpaceIds);
   const warmed =
     !blockedPortalIds?.size &&
+    !blockedSpaceIds?.size &&
     seedPortalEdgesFromMemos(graph, mesh.portalEdgeMemos);
   const entry: PortalCoreCache = {
     mesh,
@@ -1115,7 +1124,7 @@ export function findNavmeshPath(
   start: Point2D,
   end: Point2D,
   footprints?: FootprintsDocument | null,
-  opts: { blockedPortalIds?: ReadonlySet<string> } = {},
+  opts: { blockedPortalIds?: ReadonlySet<string>; blockedSpaceIds?: ReadonlySet<string> } = {},
 ): { found: boolean; points: Point2D[]; note: string; graphNodeIds: string[] } {
   const startRegion = regionAtPoint(mesh, start);
   const endRegion = regionAtPoint(mesh, end);
@@ -1128,6 +1137,10 @@ export function findNavmeshPath(
     };
   }
 
+  if (opts.blockedSpaceIds?.has(startRegion.spaceId) || opts.blockedSpaceIds?.has(endRegion.spaceId)) {
+    return { found: false, points: [], note: "Region is blocked", graphNodeIds: [] };
+  }
+
   if (startRegion.spaceId === endRegion.spaceId) {
     const points = localWalk(start, end, startRegion, footprints);
     return {
@@ -1138,7 +1151,7 @@ export function findNavmeshPath(
     };
   }
 
-  const core = getPortalCoreGraph(mesh, footprints, opts.blockedPortalIds);
+  const core = getPortalCoreGraph(mesh, footprints, opts.blockedPortalIds, opts.blockedSpaceIds);
   const graph = withPortalTerminals(core, [
     { id: "__start", point: start, regions: [startRegion.spaceId] },
     { id: "__end", point: end, regions: [endRegion.spaceId] },
@@ -1213,7 +1226,7 @@ export function findNearestExitPath(
   mesh: StoreyNavmesh,
   start: Point2D,
   footprints?: FootprintsDocument | null,
-  opts: { blockedPortalIds?: ReadonlySet<string> } = {},
+  opts: { blockedPortalIds?: ReadonlySet<string>; blockedSpaceIds?: ReadonlySet<string> } = {},
 ): {
   found: boolean;
   points: Point2D[];
@@ -1235,7 +1248,22 @@ export function findNearestExitPath(
     };
   }
 
-  const hasExit = mesh.portals.some((p) => p.kind === "exit" && !opts.blockedPortalIds?.has(p.id));
+  if (opts.blockedSpaceIds?.has(startRegion.spaceId)) {
+    return {
+      found: false,
+      points: [],
+      note: "Region is blocked",
+      portalIds: [],
+      graphNodeIds: [],
+    };
+  }
+
+  const hasExit = mesh.portals.some(
+    (p) =>
+      p.kind === "exit" &&
+      !opts.blockedPortalIds?.has(p.id) &&
+      !opts.blockedSpaceIds?.has(p.spaceA),
+  );
   if (!hasExit) {
     return {
       found: false,
@@ -1246,7 +1274,7 @@ export function findNearestExitPath(
     };
   }
 
-  const core = getPortalCoreGraph(mesh, footprints, opts.blockedPortalIds);
+  const core = getPortalCoreGraph(mesh, footprints, opts.blockedPortalIds, opts.blockedSpaceIds);
   const graph = withPortalTerminals(core, [
     { id: "__start", point: start, regions: [startRegion.spaceId] },
   ]);
@@ -1440,7 +1468,7 @@ function interiorPointForRegion(region: NavmeshRegion): Point2D | null {
 export function computeEvacuationLoad(
   mesh: StoreyNavmesh,
   footprints?: FootprintsDocument | null,
-  opts: { blockedPortalIds?: ReadonlySet<string> } = {},
+  opts: { blockedPortalIds?: ReadonlySet<string>; blockedSpaceIds?: ReadonlySet<string> } = {},
   connectivityGraph?: ConnectivityGraph | null,
 ): EvacuationLoadResult {
   const portalLoad = new Map<string, number>();
@@ -1453,6 +1481,7 @@ export function computeEvacuationLoad(
     for (const [linkId, connectors] of connectorsByLink) {
       const onThis = connectors.find((c) => c.storeyId === mesh.storeyId);
       if (!onThis) continue;
+      if (opts.blockedSpaceIds?.has(onThis.spaceId)) continue;
       const nodeId = `vertical-evac:${linkId}:${onThis.spaceId}`;
       if (opts.blockedPortalIds?.has(nodeId)) continue;
       stairNodes.push({ id: nodeId, point: onThis.point, regions: [onThis.spaceId], isExit: true });
@@ -1460,10 +1489,16 @@ export function computeEvacuationLoad(
   }
 
   const hasExit =
-    mesh.portals.some((p) => p.kind === "exit" && !opts.blockedPortalIds?.has(p.id)) ||
-    stairNodes.length > 0;
+    mesh.portals.some(
+      (p) =>
+        p.kind === "exit" &&
+        !opts.blockedPortalIds?.has(p.id) &&
+        !opts.blockedSpaceIds?.has(p.spaceA),
+    ) || stairNodes.length > 0;
   if (!hasExit) {
-    for (const region of mesh.regions) unreachableSpaceIds.push(region.spaceId);
+    for (const region of mesh.regions) {
+      if (!opts.blockedSpaceIds?.has(region.spaceId)) unreachableSpaceIds.push(region.spaceId);
+    }
     return { portalLoad, unreachableSpaceIds, skippedSpaceIds, stairNodes: [] };
   }
 
@@ -1482,7 +1517,7 @@ export function computeEvacuationLoad(
       }
     : footprints;
 
-  const core = getPortalCoreGraph(mesh, scopedFootprints, opts.blockedPortalIds);
+  const core = getPortalCoreGraph(mesh, scopedFootprints, opts.blockedPortalIds, opts.blockedSpaceIds);
   const graph = withPortalTerminals(core, stairNodes);
 
   const nodesByRegion = new Map<string, PortalGraphNode[]>();
@@ -1495,6 +1530,7 @@ export function computeEvacuationLoad(
   }
 
   for (const region of mesh.regions) {
+    if (opts.blockedSpaceIds?.has(region.spaceId)) continue;
     const start = interiorPointForRegion(region);
     if (!start) {
       skippedSpaceIds.push(region.spaceId);
@@ -1668,7 +1704,11 @@ export function findMultiStoreyNavmeshPath(
   footprints: FootprintsDocument,
   start: { storeyId: string; point: Point2D },
   end: { storeyId: string; point: Point2D },
-  opts: { blockedPortalIds?: ReadonlySet<string>; blockedConnectorIds?: ReadonlySet<string> } = {},
+  opts: {
+    blockedPortalIds?: ReadonlySet<string>;
+    blockedSpaceIds?: ReadonlySet<string>;
+    blockedConnectorIds?: ReadonlySet<string>;
+  } = {},
 ): {
   found: boolean;
   note: string;
@@ -1692,9 +1732,12 @@ export function findMultiStoreyNavmeshPath(
     };
   }
 
+  if (opts.blockedSpaceIds?.has(startRegion.spaceId) || opts.blockedSpaceIds?.has(endRegion.spaceId)) {
+    return { found: false, note: "Region is blocked", segments: [], graphNodeIds: [] };
+  }
+
   if (start.storeyId === end.storeyId) {
-    const sameStoreyOpts = opts.blockedPortalIds ? { blockedPortalIds: opts.blockedPortalIds } : {};
-    const result = findNavmeshPath(startMesh, start.point, end.point, footprints, sameStoreyOpts);
+    const result = findNavmeshPath(startMesh, start.point, end.point, footprints, opts);
     return {
       found: result.found,
       note: result.note,
@@ -1725,11 +1768,13 @@ export function findMultiStoreyNavmeshPath(
   for (const mesh of meshes) {
     for (const p of mesh.portals) {
       if (opts.blockedPortalIds?.has(p.id)) continue;
+      const regions = p.spaceB ? [p.spaceA, p.spaceB] : [p.spaceA];
+      if (regions.every((id) => opts.blockedSpaceIds?.has(id))) continue;
       nodes.set(p.id, {
         id: p.id,
         storeyId: mesh.storeyId,
         point: p.point,
-        regions: p.spaceB ? [p.spaceA, p.spaceB] : [p.spaceA],
+        regions,
       });
     }
   }
@@ -1745,6 +1790,7 @@ export function findMultiStoreyNavmeshPath(
       if (!regionByIdPerStorey.get(c.storeyId)?.has(c.spaceId)) continue;
       const connectorKey = `${linkId}@${c.storeyId}`;
       if (opts.blockedConnectorIds?.has(connectorKey)) continue;
+      if (opts.blockedSpaceIds?.has(c.spaceId)) continue;
 
       const id = `vlink:${connectorKey}`;
       nodes.set(id, { id, storeyId: c.storeyId, point: c.point, regions: [c.spaceId] });
@@ -1757,7 +1803,7 @@ export function findMultiStoreyNavmeshPath(
   // Same-storey adjacency: portal↔portal edges stay lazy on each storey's
   // core; only pin/stair terminals pay distance at build time.
   const coreByStorey = new Map(
-    meshes.map((m) => [m.storeyId, getPortalCoreGraph(m, footprints, opts.blockedPortalIds)] as const),
+    meshes.map((m) => [m.storeyId, getPortalCoreGraph(m, footprints, opts.blockedPortalIds, opts.blockedSpaceIds)] as const),
   );
   const nodesByRegion = new Map<string, MultiNode[]>();
   for (const node of nodes.values()) {
@@ -1776,6 +1822,7 @@ export function findMultiStoreyNavmeshPath(
     const core = coreByStorey.get(node.storeyId);
     const nodeInCore = !!core?.graph.nodes.has(node.id);
     for (const regionId of node.regions) {
+      if (opts.blockedSpaceIds?.has(regionId)) continue;
       for (const other of nodesByRegion.get(regionId) ?? []) {
         if (other.id === node.id || linked.has(other.id)) continue;
         linked.add(other.id);
@@ -2002,7 +2049,11 @@ export function computeBuildingEvacuationLoad(
   meshes: StoreyNavmesh[],
   footprints: FootprintsDocument | null | undefined,
   connectivityGraph: ConnectivityGraph | null | undefined,
-  opts: { blockedPortalIds?: ReadonlySet<string>; blockedConnectorIds?: ReadonlySet<string> } = {},
+  opts: {
+    blockedPortalIds?: ReadonlySet<string>;
+    blockedSpaceIds?: ReadonlySet<string>;
+    blockedConnectorIds?: ReadonlySet<string>;
+  } = {},
 ): BuildingEvacuationLoadResult {
   const portalLoad = new Map<string, number>();
   const unreachableSpaceIds: string[] = [];
@@ -2025,12 +2076,14 @@ export function computeBuildingEvacuationLoad(
   for (const mesh of meshes) {
     for (const p of mesh.portals) {
       if (opts.blockedPortalIds?.has(p.id)) continue;
+      const regions = p.spaceB ? [p.spaceA, p.spaceB] : [p.spaceA];
+      if (regions.every((id) => opts.blockedSpaceIds?.has(id))) continue;
       nodes.set(p.id, {
         id: p.id,
         storeyId: mesh.storeyId,
         point: p.point,
-        regions: p.spaceB ? [p.spaceA, p.spaceB] : [p.spaceA],
-        isExit: p.kind === "exit",
+        regions,
+        isExit: p.kind === "exit" && !opts.blockedSpaceIds?.has(p.spaceA),
       });
     }
   }
@@ -2044,6 +2097,7 @@ export function computeBuildingEvacuationLoad(
         if (!regionByIdPerStorey.get(c.storeyId)?.has(c.spaceId)) continue;
         const connectorKey = `${linkId}@${c.storeyId}`;
         if (opts.blockedConnectorIds?.has(connectorKey)) continue;
+        if (opts.blockedSpaceIds?.has(c.spaceId)) continue;
         const id = `vlink-evac:${connectorKey}`;
         nodes.set(id, { id, storeyId: c.storeyId, point: c.point, regions: [c.spaceId] });
         stairNodesOut.push({ id, storeyId: c.storeyId, point: c.point });
@@ -2061,6 +2115,7 @@ export function computeBuildingEvacuationLoad(
   const nodesByRegion = new Map<string, MultiNode[]>();
   for (const node of nodes.values()) {
     for (const regionId of node.regions) {
+      if (opts.blockedSpaceIds?.has(regionId)) continue;
       const list = nodesByRegion.get(regionId) ?? [];
       list.push(node);
       nodesByRegion.set(regionId, list);
@@ -2072,6 +2127,7 @@ export function computeBuildingEvacuationLoad(
     const out: { id: string; viaRegion: string | null; cost: number }[] = [];
     const linked = new Set<string>();
     for (const regionId of node.regions) {
+      if (opts.blockedSpaceIds?.has(regionId)) continue;
       // node.storeyId === other.storeyId is guaranteed: space ids are
       // globally unique, so two nodes sharing a regionId share a storey.
       for (const other of nodesByRegion.get(regionId) ?? []) {
@@ -2128,7 +2184,9 @@ export function computeBuildingEvacuationLoad(
   }
   if (open.size === 0) {
     for (const mesh of meshes) {
-      for (const region of mesh.regions) unreachableSpaceIds.push(region.spaceId);
+      for (const region of mesh.regions) {
+        if (!opts.blockedSpaceIds?.has(region.spaceId)) unreachableSpaceIds.push(region.spaceId);
+      }
     }
     return { portalLoad, unreachableSpaceIds, skippedSpaceIds, regionDistanceToExit, stairNodes: [] };
   }
@@ -2152,6 +2210,7 @@ export function computeBuildingEvacuationLoad(
   // already-known distance to the nearest exit.
   for (const mesh of meshes) {
     for (const region of mesh.regions) {
+      if (opts.blockedSpaceIds?.has(region.spaceId)) continue;
       const start = interiorPointForRegion(region);
       if (!start) {
         skippedSpaceIds.push(region.spaceId);
