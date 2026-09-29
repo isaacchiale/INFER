@@ -11,7 +11,6 @@ import type { FootprintsDocument, SpaceFootprint } from "@/types/footprints";
 import type { ConnectivityGraph } from "@/types/graph";
 
 const TRAY_W = 300;
-const SEARCH_CAP = 24;
 
 type BrowseSection =
   | "all"
@@ -687,15 +686,7 @@ export function Inspector() {
     }
 
     rows.sort((a, b) => a.title.localeCompare(b.title));
-    // Exits / stairs / lifts are few and sort late (or get crowded out by
-    // rooms). Reserve them in the cap so All-types still surfaces them.
-    const reservedLabels = new Set(["Exit", "Stair", "Lift"]);
-    const reserved = rows.filter((r) => reservedLabels.has(r.kindLabel));
-    const rest = rows.filter((r) => !reservedLabels.has(r.kindLabel));
-    const keepReserved = reserved.slice(0, SEARCH_CAP);
-    return [...rest.slice(0, Math.max(0, SEARCH_CAP - keepReserved.length)), ...keepReserved].sort(
-      (a, b) => a.title.localeCompare(b.title),
-    );
+    return rows;
   }, [
     browseSection,
     query,
