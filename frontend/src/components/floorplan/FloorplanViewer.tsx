@@ -1081,6 +1081,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
     portalHitR: 1,
     storeyId: "" as string,
     excludedNodeIds: new Set<string>() as ReadonlySet<string>,
+    showStairs: true as boolean,
+    showSpaces: true as boolean,
   });
   navmeshPickRef.current = {
     enabled: planDisplayMode === "navmesh" && storeyNavmesh != null,
@@ -1096,6 +1098,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
     portalHitR,
     storeyId: displayStoreyId ?? "",
     excludedNodeIds,
+    showStairs: layers.stairs,
+    showSpaces: layers.spaces,
   };
 
   const selectElementRef = useRef(selectElement);
@@ -1471,12 +1475,7 @@ export function FloorplanViewer({ className }: { className?: string }) {
           pendingHazardSelectRef.current = { kind: "portal", id: portal.id, timer };
           return;
         }
-        const stair = stairAtWorldPoint(world, pick.footprints, pick.storeyId);
-        if (stair) {
-          clearPendingHazardSelect();
-          selectElementRef.current(`stair:${stair.global_id}`);
-          return;
-        }
+        // Stair hulls are IFC-tab only (Legend → Stair). Navmesh never draws them.
         const region = regionAtPoint(pick.mesh, world);
         if (!region) {
           clearPendingHazardSelect();
@@ -1511,9 +1510,15 @@ export function FloorplanViewer({ className }: { className?: string }) {
         const svg = svgRef.current;
         if (!bounds || !svg) return;
         const world = clientToView(e.clientX, e.clientY, svg, bounds, cameraRef.current);
-        const stair = stairAtWorldPoint(world, pick.footprints, pick.storeyId);
+        const stair = pick.showStairs
+          ? stairAtWorldPoint(world, pick.footprints, pick.storeyId)
+          : null;
         if (stair) {
           selectElementRef.current(`stair:${stair.global_id}`);
+          return;
+        }
+        if (!pick.showSpaces) {
+          setFocusedElementIdRef.current(null);
           return;
         }
         const space = spaceAtWorldPoint(
@@ -1563,6 +1568,8 @@ export function FloorplanViewer({ className }: { className?: string }) {
     setIsExitRoute,
     setBlockedPortalIds,
     setBlockedSpaceIds,
+    layers.stairs,
+    layers.spaces,
   ]);
 
   return (
