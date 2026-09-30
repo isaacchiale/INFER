@@ -3,7 +3,6 @@ import { RenderedFaces } from "@thatopen/fragments";
 import type { FragmentsModel, MeshData } from "@thatopen/fragments";
 import { elevationsForVerticalRemap } from "@/lib/storey-elevations";
 import {
-  buildPlanRouteTubePolylines,
   footprintPlanBounds,
   resolveRouteTubeLiftOptions,
   spaceStoreyIds,
@@ -11,7 +10,6 @@ import {
 } from "@/lib/route-tube";
 import { ifcPlanToThree, type Mat4Elements, type ThreeAabb } from "@/lib/viewer-camera-pose";
 import type { FootprintsDocument } from "@/types/footprints";
-import type { NavmeshRoute } from "@/state/infer-store";
 
 /**
  * `CurrentLod.GEOMETRY` from @thatopen/fragments (full detail, not the
@@ -131,39 +129,6 @@ export function buildRouteStoreyClipBands(args: {
     bands.push({ minY: Math.min(lo.y, hi.y), maxY: Math.max(lo.y, hi.y) });
   }
   return bands.length ? bands : null;
-}
-
-/**
- * The route's start and end in the live scene's Three space, lifted exactly
- * like the live route tube (buildPlanRouteTubePolylines — the same call
- * InferModelViewport's buildNavmeshRouteTube makes), so markers added to a
- * live-geometry export sit on the tube's ends. Null when either end can't be
- * lifted (no model bounds, no footprint plan bounds).
- */
-export function routeEndpointsInLiveScene(args: {
-  route: NavmeshRoute;
-  footprints: FootprintsDocument;
-  modelBounds: ThreeAabb | null;
-  coordInverse: Mat4Elements | null;
-}): { start: THREE.Vector3; end: THREE.Vector3 } | null {
-  const { route, footprints, modelBounds, coordInverse } = args;
-  const segments = route.segments?.length
-    ? route.segments
-    : [{ storeyId: route.storeyId, points: route.points }];
-  const lift = (segment: (typeof segments)[number]) =>
-    buildPlanRouteTubePolylines({
-      points: segment.points,
-      storeyId: segment.storeyId,
-      footprints,
-      modelBounds,
-      coordInverse,
-    })?.[0] ?? null;
-  const first = lift(segments[0]!);
-  const last = lift(segments[segments.length - 1]!);
-  if (!first || !last) return null;
-  const a = first[0]!;
-  const b = last[last.length - 1]!;
-  return { start: new THREE.Vector3(a.x, a.y, a.z), end: new THREE.Vector3(b.x, b.y, b.z) };
 }
 
 /**

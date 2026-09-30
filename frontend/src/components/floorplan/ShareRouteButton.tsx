@@ -13,16 +13,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { exportGLB } from "@/lib/export-glb";
 import { exportUSDZ } from "@/lib/export-usdz";
-import {
-  buildRouteShareScene,
-  buildDoorOverlay,
-  buildRouteEndMarkers,
-} from "@/lib/route-share-scene";
-import {
-  buildExportGroup,
-  buildRouteStoreyClipBands,
-  routeEndpointsInLiveScene,
-} from "@/lib/live-scene-export";
+import { buildRouteShareScene } from "@/lib/route-share-scene";
+import { buildExportGroup, buildRouteStoreyClipBands } from "@/lib/live-scene-export";
 import {
   uploadRouteShare,
   routeShareUrl,
@@ -134,8 +126,7 @@ export function ShareRouteButton({
       // left any real content beyond the route tube, so a
       // total failure falls back to the proxy instead of silently sharing
       // an empty room with a tube floating in it.
-      // Storeys the route actually touches — used both for the live path's
-      // door overlay (below) and to scope the live geometry export itself
+      // Storeys the route actually touches — scopes the live geometry export
       // to just those storeys, not whatever the 3D Viewer's own storey
       // filter currently shows (see buildRouteStoreyClipBands's doc comment).
       const storeyIds = new Set(
@@ -171,21 +162,11 @@ export function ShareRouteButton({
       } else {
         console.info("Share export: 3D Viewer not loaded, using footprint proxy");
       }
-      if (!source) {
-        // buildRouteShareScene already draws doors itself; the live path
-        // doesn't know about footprints/doors at all (it only queries
-        // fragments' geometry), so that one needs the overlay added below.
-        source = buildRouteShareScene(navmeshRoute, footprintsDocument);
-      } else {
-        source.add(buildDoorOverlay(footprintsDocument, storeyIds));
-        const ends = routeEndpointsInLiveScene({
-          route: navmeshRoute,
-          footprints: footprintsDocument,
-          modelBounds: viewerModelBounds,
-          coordInverse: viewerCoordInverse,
-        });
-        if (ends) source.add(buildRouteEndMarkers(ends.start, ends.end));
-      }
+      // The live path adds nothing on top of the model's own geometry: its
+      // real IFC doors are already in it, and an overlay placed with the
+      // proxy's plan->Three convention floated above the floor on models
+      // whose placement differs (seen on a phone as stray orange "walls").
+      if (!source) source = buildRouteShareScene(navmeshRoute, footprintsDocument);
       if (!source) {
         setError("This route has no drawable points yet.");
         return;

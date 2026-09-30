@@ -4,7 +4,6 @@ import * as THREE from "three";
 import {
   buildExportGroup,
   buildRouteStoreyClipBands,
-  routeEndpointsInLiveScene,
   type ClipBand,
   type ExportableGeometrySource,
 } from "./live-scene-export.ts";
@@ -12,7 +11,6 @@ import { RenderedFaces } from "@thatopen/fragments";
 import type { FragmentsModel, MeshData } from "@thatopen/fragments";
 import type { FootprintsDocument } from "@/types/footprints";
 import type { ThreeAabb } from "@/lib/viewer-camera-pose";
-import { buildPlanRouteTubePolylines } from "@/lib/route-tube";
 
 /** Test convenience: most cases don't care about clip bands at all. */
 function build(source: ExportableGeometrySource, clipBands: ClipBand[] | null = null) {
@@ -601,108 +599,5 @@ describe("buildRouteStoreyClipBands", () => {
     // nextElev = 3 (storey s2) here, so minY ~ -0.25, maxY ~ 3*0.78 = 2.34.
     assert.ok(Math.abs(band!.minY - -0.25) < 0.1, `expected minY near -0.25, got ${band!.minY}`);
     assert.ok(Math.abs(band!.maxY - 2.34) < 0.1, `expected maxY near 2.34, got ${band!.maxY}`);
-  });
-});
-
-describe("routeEndpointsInLiveScene", () => {
-  const footprints: FootprintsDocument = {
-    schema_version: "1.0",
-    model_id: "m1",
-    coordinate_system: "ifc_world_xy_metres",
-    storeys: [
-      { global_id: "s1", name: "L1", elevation: 0 },
-      { global_id: "s2", name: "L2", elevation: 3 },
-    ],
-    spaces: [
-      {
-        global_id: "sp1",
-        name: "Room 1",
-        storey_global_id: "s1",
-        polygon: [
-          { x: 0, y: 0 },
-          { x: 10, y: 0 },
-          { x: 10, y: 10 },
-          { x: 0, y: 10 },
-        ],
-        incomplete: false,
-        method: "ifc_mesh_xy_outline",
-      },
-    ],
-    doors: [],
-  };
-  const modelBounds: ThreeAabb = { minX: 0, maxX: 10, minY: 0, maxY: 6, minZ: -10, maxZ: 0 };
-
-  it("lands on the live tube's own first and last points for a cross-storey route", () => {
-    const route = {
-      storeyId: "s1",
-      start: { x: 1, y: 1 },
-      end: { x: 8, y: 9 },
-      endStoreyId: "s2",
-      points: null,
-      segments: [
-        {
-          storeyId: "s1",
-          points: [
-            { x: 1, y: 1 },
-            { x: 5, y: 5 },
-          ],
-        },
-        {
-          storeyId: "s2",
-          points: [
-            { x: 5, y: 5 },
-            { x: 8, y: 9 },
-          ],
-        },
-      ],
-      graphNodeIds: null,
-    } as never;
-    const ends = routeEndpointsInLiveScene({ route, footprints, modelBounds, coordInverse: null });
-    assert.ok(ends);
-    const tubeStart = buildPlanRouteTubePolylines({
-      points: [
-        { x: 1, y: 1 },
-        { x: 5, y: 5 },
-      ],
-      storeyId: "s1",
-      footprints,
-      modelBounds,
-      coordInverse: null,
-    })![0]![0]!;
-    const tubeEndLine = buildPlanRouteTubePolylines({
-      points: [
-        { x: 5, y: 5 },
-        { x: 8, y: 9 },
-      ],
-      storeyId: "s2",
-      footprints,
-      modelBounds,
-      coordInverse: null,
-    })![0]!;
-    const tubeEnd = tubeEndLine[tubeEndLine.length - 1]!;
-    assert.ok(
-      ends!.start.distanceTo(new THREE.Vector3(tubeStart.x, tubeStart.y, tubeStart.z)) < 1e-9,
-    );
-    assert.ok(ends!.end.distanceTo(new THREE.Vector3(tubeEnd.x, tubeEnd.y, tubeEnd.z)) < 1e-9);
-    assert.ok(ends!.end.y > ends!.start.y, "end is on the upper storey");
-  });
-
-  it("returns null without model bounds", () => {
-    const route = {
-      storeyId: "s1",
-      start: { x: 1, y: 1 },
-      end: { x: 2, y: 2 },
-      endStoreyId: "s1",
-      points: [
-        { x: 1, y: 1 },
-        { x: 2, y: 2 },
-      ],
-      segments: null,
-      graphNodeIds: null,
-    } as never;
-    assert.equal(
-      routeEndpointsInLiveScene({ route, footprints, modelBounds: null, coordInverse: null }),
-      null,
-    );
   });
 });

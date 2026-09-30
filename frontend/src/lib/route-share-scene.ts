@@ -17,11 +17,8 @@ const WALL_COLOR = 0xe7e2d8;
 const FURNITURE_COLOR = 0x0d9488;
 const DOOR_COLOR = 0xf59e0b;
 const TUBE_COLOR = 0x1d4ed8;
-const START_COLOR = 0x22c55e;
-const END_COLOR = 0xef4444;
 const TUBE_RADIUS_M = 0.12;
 const TUBE_HEIGHT_OFFSET_M = 0.05;
-const MARKER_RADIUS_M = 0.22;
 const ROOM_SLAB_HEIGHT_M = 0.03;
 /** Real wall height isn't in the footprint schema (2D polygons only) — a
  * typical ceiling height so the export reads as a building, not a floorplan. */
@@ -172,60 +169,11 @@ function doorMesh(door: DoorPortal, elevationM: number): THREE.Object3D | null {
 }
 
 /**
- * Door overlay for the live-geometry export path (buildExportGroup in
- * live-scene-export.ts), which — unlike buildRouteShareScene below — has no
- * idea what a FootprintsDocument is; it only knows about fragments'
- * geometry. Real IFC doors frequently have no solid geometry of their own
- * to fetch, so this reuses the same door data the proxy path (and the
- * Floorplan pane) already draws from, scoped to `storeyIds` so a Share
- * export only shows doors on the storeys the route actually crosses.
- */
-export function buildDoorOverlay(
-  footprints: FootprintsDocument,
-  storeyIds: ReadonlySet<string>,
-): THREE.Group {
-  const group = new THREE.Group();
-  const elevations = storeyElevationsM(footprints);
-  const added = new Set<string>();
-  for (const door of footprints.doors ?? []) {
-    if (door.incomplete) continue;
-    if (door.storey_global_id != null && !storeyIds.has(door.storey_global_id)) continue;
-    if (added.has(door.global_id)) continue;
-    added.add(door.global_id);
-    const elevationM = door.storey_global_id ? (elevations.get(door.storey_global_id) ?? 0) : 0;
-    const mesh = doorMesh(door, elevationM);
-    if (mesh) group.add(mesh);
-  }
-  return group;
-}
-
-function marker(position: THREE.Vector3, color: number): THREE.Mesh {
-  const geometry = new THREE.SphereGeometry(MARKER_RADIUS_M, 16, 16);
-  const material = new THREE.MeshStandardMaterial({ color, roughness: 0.3, metalness: 0.1 });
-  const mesh = new THREE.Mesh(geometry, material);
-  mesh.position.copy(position);
-  return mesh;
-}
-
-/**
- * Green start / red end spheres at two Three-space points. Shared by the
- * proxy scene (points from planPoint) and the live-geometry export (points
- * lifted the same way as the live route tube, see routeEndpointsInLiveScene).
- */
-export function buildRouteEndMarkers(start: THREE.Vector3, end: THREE.Vector3): THREE.Group {
-  const group = new THREE.Group();
-  group.name = "route-end-markers";
-  group.add(marker(start, START_COLOR), marker(end, END_COLOR));
-  return group;
-}
-
-/**
  * Null when the route has no drawable points on any storey (e.g. an
  * in-progress route with only a start pin) — nothing worth exporting yet.
  *
- * Start (green) and end (red) spheres mark direction — the tube alone
- * doesn't say which end is the destination. Plain lit material, no
- * emissive, for the same exposure reason as the tube (see routeTube).
+ * No start/end marker spheres: the tube's own ends show where the route
+ * starts and stops, and markers didn't hold up in AR testing.
  */
 export function buildRouteShareScene(
   route: NavmeshRoute,
@@ -315,25 +263,6 @@ export function buildRouteShareScene(
     const tube = routeTube(segment.points, elevationM);
     if (tube) scene.add(tube);
   }
-
-  const first = segments[0]!;
-  const last = segments[segments.length - 1]!;
-  const startPoint = first.points[0]!;
-  const endPoint = last.points[last.points.length - 1]!;
-  scene.add(
-    buildRouteEndMarkers(
-      planPoint(
-        startPoint.x,
-        startPoint.y,
-        (elevations.get(first.storeyId) ?? 0) + TUBE_HEIGHT_OFFSET_M,
-      ),
-      planPoint(
-        endPoint.x,
-        endPoint.y,
-        (elevations.get(last.storeyId) ?? 0) + TUBE_HEIGHT_OFFSET_M,
-      ),
-    ),
-  );
 
   return scene;
 }

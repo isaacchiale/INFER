@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as THREE from "three";
-import { buildRouteShareScene, buildDoorOverlay } from "./route-share-scene.ts";
+import { buildRouteShareScene } from "./route-share-scene.ts";
 import { ifcPlanToThree } from "./viewer-camera-pose.ts";
 
 const DOOR_COLOR = 0xf59e0b;
@@ -103,42 +103,6 @@ describe("buildRouteShareScene", () => {
     // must come out negative.
     assert.equal(expectedEnd.z, -5);
     assert.ok(Math.abs(end.z - -5) < 1e-5);
-  });
-
-  it("marks the start green and the end red, at the route's true endpoints, unlit (no emissive)", () => {
-    const footprints = {
-      storeys: [{ global_id: "st1", name: "L1", elevation: 0 }],
-      spaces: [],
-      doors: [],
-      walls: [],
-    } as never;
-    const route = {
-      storeyId: "st1",
-      start: { x: 0, y: 0 },
-      end: { x: 4, y: 5 },
-      endStoreyId: "st1",
-      points: [
-        { x: 0, y: 0 },
-        { x: 4, y: 5 },
-      ],
-      segments: null,
-    } as never;
-
-    const scene = buildRouteShareScene(route, footprints)!;
-    const spheres: THREE.Mesh[] = [];
-    scene.traverse((c) => {
-      if (c instanceof THREE.Mesh && c.geometry instanceof THREE.SphereGeometry) spheres.push(c);
-    });
-    const byColor = (hex: number) =>
-      spheres.find((m) => (m.material as THREE.MeshStandardMaterial).color.getHex() === hex);
-    const start = byColor(0x22c55e);
-    const end = byColor(0xef4444);
-    assert.ok(start && end, "expected a green start and a red end marker");
-    assert.ok(start.position.distanceTo(ifcPlanToThree(0, 0, TUBE_HEIGHT_OFFSET_M)) < 1e-6);
-    assert.ok(end.position.distanceTo(ifcPlanToThree(4, 5, TUBE_HEIGHT_OFFSET_M)) < 1e-6);
-    for (const m of [start, end]) {
-      assert.equal((m.material as THREE.MeshStandardMaterial).emissive.getHex(), 0);
-    }
   });
 
   it("draws a door with a measured polygon as an extruded box, not just a marker", () => {
@@ -264,53 +228,5 @@ describe("buildRouteShareScene", () => {
         (child.material as THREE.MeshStandardMaterial).color?.getHex?.() === DOOR_COLOR,
     );
     assert.equal(doorMesh, undefined);
-  });
-});
-
-describe("buildDoorOverlay", () => {
-  const footprints = {
-    storeys: [
-      { global_id: "st1", name: "L1", elevation: 0 },
-      { global_id: "st2", name: "L2", elevation: 3 },
-    ],
-    spaces: [],
-    walls: [],
-    doors: [
-      {
-        global_id: "d1",
-        name: "Door on L1",
-        storey_global_id: "st1",
-        point: { x: 1, y: 1 },
-        segment: [],
-        incomplete: false,
-        method: "ifc_mesh_xy_centroid",
-      },
-      {
-        global_id: "d2",
-        name: "Door on L2",
-        storey_global_id: "st2",
-        point: { x: 2, y: 2 },
-        segment: [],
-        incomplete: false,
-        method: "ifc_mesh_xy_centroid",
-      },
-    ],
-  } as never;
-
-  it("only includes doors on the given storeys", () => {
-    const group = buildDoorOverlay(footprints, new Set(["st1"]));
-    const meshes = group.children.filter((c) => c instanceof THREE.Mesh);
-    assert.equal(meshes.length, 1);
-  });
-
-  it("includes doors from all given storeys", () => {
-    const group = buildDoorOverlay(footprints, new Set(["st1", "st2"]));
-    const meshes = group.children.filter((c) => c instanceof THREE.Mesh);
-    assert.equal(meshes.length, 2);
-  });
-
-  it("returns an empty group when no storey matches", () => {
-    const group = buildDoorOverlay(footprints, new Set(["st-nonexistent"]));
-    assert.equal(group.children.length, 0);
   });
 });
