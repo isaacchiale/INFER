@@ -43,6 +43,8 @@ function fakeModel(opts: {
     { r: number; g: number; b: number; a: number; renderedFaces: RenderedFaces }
   >;
   objectTransform?: THREE.Matrix4;
+  /** Serve getBoxes() (fragments' world-space per-item boxes); off = API missing. */
+  withBoxes?: boolean;
 }): FragmentsModel {
   const object = new THREE.Object3D();
   if (opts.objectTransform) object.matrix.copy(opts.objectTransform);
@@ -68,6 +70,22 @@ function fakeModel(opts: {
       }
       return out;
     },
+    ...(opts.withBoxes
+      ? {
+          boxesRequested: [] as number[][],
+          async getBoxes(this: { boxesRequested: number[][] }, localIds: number[]) {
+            this.boxesRequested.push(localIds);
+            return localIds.map((id) => {
+              const box = new THREE.Box3();
+              for (const part of opts.geometryByLocalId.get(id) ?? []) {
+                const pos = new THREE.BufferAttribute(Float32Array.from(part.positions!), 3);
+                box.union(new THREE.Box3().setFromBufferAttribute(pos));
+              }
+              return box.applyMatrix4(object.matrixWorld);
+            });
+          },
+        }
+      : {}),
     async getSamples(ids: Iterable<number>) {
       const out = new Map<number, { material: number }>();
       // Material id == sample id + 1000, so a sample/material mix-up would show.
@@ -111,6 +129,16 @@ function boxMeshDataSpanningY(minY: number, maxY: number): MeshData {
     indices: Uint16Array.from(idx.array as ArrayLike<number>),
     localId: 1,
   };
+}
+
+/** Every vertex Y in `meshes`, for checks that survive merging. */
+function allY(meshes: THREE.Mesh[]): number[] {
+  const ys: number[] = [];
+  for (const mesh of meshes) {
+    const pos = mesh.geometry.getAttribute("position") as THREE.BufferAttribute;
+    for (let i = 0; i < pos.count; i++) ys.push(pos.getY(i));
+  }
+  return ys;
 }
 
 function yBounds(mesh: THREE.Mesh): { minY: number; maxY: number } {
@@ -395,13 +423,49 @@ describe("buildExportGroup — fragments models (async data API)", () => {
     assert.equal(group.children.filter((c) => (c as THREE.Mesh).isMesh).length, 1);
   });
 
-  it("includes multiple mesh parts for a single item", async () => {
+  it("includes every part of an item, merged into one mesh when they share a material", async () => {
     const model = fakeModel({
       visibleItems: [1],
       geometryByLocalId: new Map([[1, [boxMeshData(), boxMeshData()]]]),
     });
-    const { group } = await build(makeSource({ fragmentsModels: [model] }));
-    assert.equal(group.children.filter((c) => (c as THREE.Mesh).isMesh).length, 2);
+    const { group, stats } = await build(makeSource({ fragmentsModels: [model] }));
+    assert.equal(stats.partsRebuilt, 2);
+    const meshes = group.children.filter((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh[];
+    assert.equal(meshes.length, 1);
+    const box = new THREE.BoxGeometry(1, 1, 1);
+    assert.equal(
+      meshes[0]!.geometry.getAttribute("position").count,
+      2 * box.getAttribute("position").count,
+    );
+    assert.equal(meshes[0]!.geometry.getIndex()!.count, 2 * box.getIndex()!.count);
+  });
+
+  it("merges parts into one mesh per distinct material, sharing nothing across materials", async () => {
+    const red = { color: new THREE.Color(0xff0000), opacity: 1, transparent: false };
+    const blue = { color: new THREE.Color(0x0000ff), opacity: 1, transparent: false };
+    const model = fakeModel({
+      visibleItems: [1, 2, 3, 4],
+      geometryByLocalId: new Map([
+        [1, [boxMeshData()]],
+        [2, [boxMeshData()]],
+        [3, [boxMeshData()]],
+        [4, [boxMeshData()]],
+      ]),
+      styleByLocalId: new Map([
+        [1, red],
+        [2, red],
+        [3, blue],
+        [4, red],
+      ]),
+    });
+    const { group, stats } = await build(makeSource({ fragmentsModels: [model] }));
+    const meshes = group.children as THREE.Mesh[];
+    assert.equal(meshes.length, 2);
+    assert.equal(stats.meshes, 2);
+    const hexes = meshes
+      .map((m) => (m.material as THREE.MeshStandardMaterial).color.getHex())
+      .sort((a, b) => a - b);
+    assert.deepEqual(hexes, [0x0000ff, 0xff0000]);
   });
 
   it("hasBuildingGeometry is false with only plainObjects (route tube) and no fragments geometry", async () => {
@@ -411,7 +475,7 @@ describe("buildExportGroup — fragments models (async data API)", () => {
 });
 
 describe("buildExportGroup — plain objects (route tube)", () => {
-  it("rebuilds the tube with a proper integer index (not Float32) and preserves transparency", async () => {
+  it("rebuilds the tube with a proper integer index (not Float32), exported opaque", async () => {
     const tube = tubeMesh();
     const { group } = await build(makeSource({ plainObjects: [tube] }));
     const rebuilt = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
@@ -424,9 +488,12 @@ describe("buildExportGroup — plain objects (route tube)", () => {
       "index must not be a Float32Array — glTF requires an unsigned-int componentType",
     );
 
+    // The live tube is drawn at 0.85 opacity; the export is solid so AR
+    // viewers can't mis-sort it against glass.
     const material = rebuilt.material as THREE.MeshStandardMaterial;
-    assert.equal(material.transparent, true);
-    assert.ok(Math.abs(material.opacity - 0.85) < 1e-6);
+    assert.equal(material.transparent, false);
+    assert.equal(material.opacity, 1);
+    assert.equal(material.color.getHex(), 0x1d4ed8);
   });
 
   it("carries the live source material's side onto the rebuilt mesh", async () => {
@@ -537,26 +604,27 @@ describe("buildExportGroup — storey clip bands", () => {
     assert.ok(bounds.maxY <= 0.4 + 1e-6, `clipped tube maxY should be <= 0.4, got ${bounds.maxY}`);
   });
 
-  it("keeps geometry spanning two disjoint kept bands as two separate pieces, nothing in the excluded gap", async () => {
+  it("keeps geometry spanning two disjoint kept bands as two slices, nothing in the excluded gap", async () => {
     // A shaft-like item running continuously from y=0 to y=10 (e.g. floor 1
     // through floor 5), with only floor 1 (y: 0..1) and floor 5 (y: 9..10)
-    // actually visited by the route — floors 2-4 (y: 1..9) excluded. No
-    // capping means each kept slice comes back as its own separate mesh.
+    // actually visited by the route — floors 2-4 (y: 1..9) excluded.
     const model = fakeModel({
       visibleItems: [1],
       geometryByLocalId: new Map([[1, [boxMeshDataSpanningY(0, 10)]]]),
     });
-    const { group } = await build(makeSource({ fragmentsModels: [model] }), [
+    const { group, stats } = await build(makeSource({ fragmentsModels: [model] }), [
       { minY: 0, maxY: 1 },
       { minY: 9, maxY: 10 },
     ]);
-    const meshes = group.children.filter((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh[];
-    assert.equal(meshes.length, 2, "expected two separate pieces, one per kept band");
-    const boundsByMesh = meshes.map(yBounds).sort((a, b) => a.minY - b.minY);
-    assert.ok(Math.abs(boundsByMesh[0]!.minY - 0) < 1e-6);
-    assert.ok(boundsByMesh[0]!.maxY <= 1 + 1e-6);
-    assert.ok(boundsByMesh[1]!.minY >= 9 - 1e-6);
-    assert.ok(Math.abs(boundsByMesh[1]!.maxY - 10) < 1e-6);
+    assert.equal(stats.piecesKept, 2, "one clipped piece per kept band");
+    const ys = allY(group.children as THREE.Mesh[]);
+    assert.ok(
+      ys.every((y) => y <= 1 + 1e-6 || y >= 9 - 1e-6),
+      "nothing in the excluded gap",
+    );
+    assert.ok(Math.abs(Math.min(...ys) - 0) < 1e-6);
+    assert.ok(Math.abs(Math.max(...ys) - 10) < 1e-6);
+    assert.ok(ys.some((y) => Math.abs(y - 1) < 1e-6) && ys.some((y) => Math.abs(y - 9) < 1e-6));
   });
 
   it("exports the route's storeys even when the viewer is only showing a different storey", async () => {
@@ -579,13 +647,53 @@ describe("buildExportGroup — storey clip bands", () => {
       ],
     );
     assert.equal(hasBuildingGeometry, true);
-    assert.equal(stats.items, 3);
-    const spans = (group.children.filter((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh[])
-      .map(yBounds)
-      .sort((a, b) => a.minY - b.minY);
-    assert.equal(spans.length, 2, "floor 1 and floor 5 items only, not the on-screen floor 3 item");
-    assert.ok(Math.abs(spans[0]!.minY - 0) < 1e-6);
-    assert.ok(Math.abs(spans[1]!.minY - 9) < 1e-6);
+    assert.equal(
+      stats.piecesKept,
+      2,
+      "floor 1 and floor 5 items only, not the on-screen floor 3 item",
+    );
+    const ys = allY(group.children as THREE.Mesh[]);
+    assert.ok(ys.every((y) => y <= 1 + 1e-6 || y >= 9 - 1e-6));
+    assert.ok(ys.some((y) => y < 0.5) && ys.some((y) => y > 9.5));
+  });
+
+  it("skips items whose bounding box misses every band before fetching their geometry", async () => {
+    const fetched: number[][] = [];
+    const model = fakeModel({
+      withBoxes: true,
+      geometryByLocalId: new Map([
+        [1, [boxMeshDataSpanningY(0, 1)]],
+        [3, [boxMeshDataSpanningY(4, 5)]],
+        [5, [boxMeshDataSpanningY(9, 10)]],
+      ]),
+    });
+    const getItemsGeometry = model.getItemsGeometry.bind(model);
+    (model as { getItemsGeometry: typeof getItemsGeometry }).getItemsGeometry = async (
+      ids,
+      lod,
+    ) => {
+      fetched.push([...ids]);
+      return getItemsGeometry(ids, lod);
+    };
+    const { stats } = await build(makeSource({ fragmentsModels: [model] }), [
+      { minY: 0, maxY: 1 },
+      { minY: 9, maxY: 10 },
+    ]);
+    assert.deepEqual(fetched, [[1, 5]], "floor 3's item never fetched");
+    assert.equal(stats.items, 2);
+    assert.equal(stats.itemsSkipped, 1);
+  });
+
+  it("keeps every item when bounding boxes are unavailable", async () => {
+    const model = fakeModel({
+      geometryByLocalId: new Map([
+        [1, [boxMeshDataSpanningY(0, 1)]],
+        [3, [boxMeshDataSpanningY(4, 5)]],
+      ]),
+    });
+    const { stats } = await build(makeSource({ fragmentsModels: [model] }), [{ minY: 0, maxY: 1 }]);
+    assert.equal(stats.items, 2);
+    assert.equal(stats.itemsSkipped, 0);
   });
 
   it("does nothing when clipBands is null (no scope computed)", async () => {

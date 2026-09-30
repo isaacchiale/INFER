@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { RenderedFaces } from "@thatopen/fragments";
+import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 import type { FragmentsModel, MeshData } from "@thatopen/fragments";
 import { elevationsForVerticalRemap } from "@/lib/storey-elevations";
 import {
@@ -17,6 +17,13 @@ import type { FootprintsDocument } from "@/types/footprints";
  * importing the `const enum` across the package boundary.
  */
 const FULL_GEOMETRY_LOD = 0;
+
+/**
+ * `RenderedFaces.TWO` from @thatopen/fragments. A local constant, not the
+ * enum import: this module also runs in the Share export worker, and a
+ * value import pulled the entire fragments library into that bundle.
+ */
+const RENDERED_FACES_TWO = 1;
 
 export type ClipBand = { minY: number; maxY: number };
 
@@ -47,7 +54,17 @@ export type ExportGroupResult = {
   stats: ExportStats;
 };
 
-export type ExportStats = { items: number; partsRebuilt: number; piecesKept: number };
+export type ExportStats = {
+  /** Items whose geometry was fetched. */
+  items: number;
+  /** Items skipped before fetching: their bounding box misses every clip band. */
+  itemsSkipped: number;
+  partsRebuilt: number;
+  /** Clipped pieces kept, before merging. */
+  piecesKept: number;
+  /** Building meshes in the export after merging by material. */
+  meshes: number;
+};
 
 /**
  * Turns the set of storeys a route touches into Three.js world-Y clip bands
@@ -166,7 +183,7 @@ export function buildRouteStoreyClipBands(args: {
  *
  * Clipping matches applyStoreyFilter's own no-capping clippingPlanes, so an
  * item straddling a band (e.g. a wall spanning two storeys) is cropped to
- * the slice inside it, not exported whole (see clipMeshToBands below).
+ * the slice inside it, not exported whole (see clipGeometryToBands below).
  *
  * Per-item/part failures are caught and skipped (logged, not fatal) —
  * given how much has gone wrong in this pipeline already, one bad part
@@ -176,70 +193,84 @@ export async function buildExportGroup(
   source: ExportableGeometrySource,
   clipBands: ClipBand[] | null,
 ): Promise<ExportGroupResult> {
-  const group = new THREE.Group();
-  const stats: ExportStats = { items: 0, partsRebuilt: 0, piecesKept: 0 };
+  return buildExportScene(await gatherExportPayload(source, clipBands), clipBands);
+}
 
+// --- Gather (main thread) ---------------------------------------------------
+//
+// Only this half touches fragments — its data API lives on the main thread.
+// Everything it returns is plain typed arrays and numbers, so the heavy half
+// (buildExportScene: rebuild, clip, merge, then GLB/USDZ encoding) can run in
+// a Web Worker without freezing the page (see share-export-client.ts).
+
+/** Material as plain data: linear RGB, like THREE.Color's own components. */
+export type StyleData = {
+  color: [number, number, number];
+  opacity: number;
+  transparent: boolean;
+  side: THREE.Side;
+};
+
+/** One geometry part, untransformed, plus the world matrix to bake into it. */
+export type ExportPart = {
+  positions: Float32Array | Float64Array;
+  normals?: Int16Array | Float32Array;
+  indices?: Uint8Array | Uint16Array | Uint32Array;
+  /** Column-major world matrix (Matrix4.elements). */
+  matrix: number[];
+  style: StyleData | null;
+};
+
+export type ExportPayload = {
+  /** Building geometry from fragments — clipped and merged by material. */
+  parts: ExportPart[];
+  /** The live route tube(s) — clipped, never merged. */
+  tubes: ExportPart[];
+  /** Items fetched, and items skipped by the bounding-box prefilter. */
+  items: number;
+  itemsSkipped: number;
+};
+
+export async function gatherExportPayload(
+  source: ExportableGeometrySource,
+  clipBands: ClipBand[] | null,
+): Promise<ExportPayload> {
+  const payload: ExportPayload = { parts: [], tubes: [], items: 0, itemsSkipped: 0 };
   for (const model of source.fragmentsModels) {
     try {
-      await addModelGeometry(group, model, clipBands, stats);
+      await gatherModelParts(model, clipBands, payload);
     } catch (err) {
       console.warn("Share export: skipping a model whose geometry couldn't be fetched", err);
     }
   }
-
-  // The route tube is clipped by the same bands live too: applyStoreyFilter
-  // sets `renderer.clippingPlanes` globally, which — unlike
-  // `material.clippingPlanes` — applies to every material rendered, tube
-  // included, not just fragments' own materials.
   for (const object of source.plainObjects) {
     object.updateMatrixWorld(true);
     object.traverse((node) => {
       if (!(node as THREE.Mesh).isMesh) return;
       try {
-        const rebuilt = rebuildPlainMesh(node as THREE.Mesh);
-        if (!rebuilt) return;
-        for (const piece of clipMeshToBands(rebuilt, clipBands)) group.add(piece);
+        const part = plainMeshPart(node as THREE.Mesh);
+        if (part) payload.tubes.push(part);
       } catch (err) {
-        console.warn("Share export: skipping a mesh that couldn't be rebuilt", err);
+        console.warn("Share export: skipping a mesh that couldn't be read", err);
       }
     });
   }
-
-  // No baked lights: glTF/USDZ export silently drops HemisphereLight
-  // entirely (no ambient-light equivalent in the format) and doesn't
-  // reliably preserve a DirectionalLight's aim either — every mainstream
-  // glTF/USDZ viewer (AR Quick Look, Android Scene Viewer, model-viewer)
-  // already applies its own default environment lighting to arbitrary
-  // content, which is what actually makes this render correctly on a
-  // phone; relying on lights this export can't reliably carry just adds
-  // risk (see route-share-scene.ts's buildRouteShareScene for the same call).
-  return { group, hasBuildingGeometry: stats.piecesKept > 0, stats };
+  return payload;
 }
 
-type Style = { color: THREE.Color; opacity: number; transparent: boolean; side: THREE.Side };
-
-/**
- * fragments' `getItemsMaterialDefinition()` types its `color` field as
- * `THREE.Color`, but at runtime it is not reliably one — this crashed
- * every real item's material construction (`style.color.clone is not a
- * function`) for a model where fragments computes materials off-thread:
- * the value crosses a `postMessage` structured-clone boundary, which keeps
- * plain enumerable properties (`r`, `g`, `b`) but strips the class's
- * prototype methods. Reconstructing from those numeric components instead
- * of trusting the type declaration is what actually survives that.
- */
-function safeColor(color: THREE.Color): THREE.Color {
-  if (typeof color.clone === "function") return color.clone();
-  const c = color as unknown as { r: number; g: number; b: number };
-  return new THREE.Color(c.r, c.g, c.b);
+function styleData(style: Style): StyleData {
+  return {
+    color: [style.color.r, style.color.g, style.color.b],
+    opacity: style.opacity,
+    transparent: style.transparent,
+    side: style.side,
+  };
 }
 
-/** Adds this model's meshes to `group`, accumulating into `stats`. */
-async function addModelGeometry(
-  group: THREE.Group,
+async function gatherModelParts(
   model: FragmentsModel,
   clipBands: ClipBand[] | null,
-  stats: ExportStats,
+  payload: ExportPayload,
 ): Promise<void> {
   model.object.updateMatrixWorld(true);
   const modelMatrix = model.object.matrixWorld;
@@ -250,7 +281,12 @@ async function addModelGeometry(
   if (localIds.length === 0) {
     localIds = await model.getLocalIds();
   }
-  stats.items += localIds.length;
+  if (clipBands) {
+    const before = localIds.length;
+    localIds = await itemsTouchingBands(model, localIds, clipBands);
+    payload.itemsSkipped += before - localIds.length;
+  }
+  payload.items += localIds.length;
   if (localIds.length === 0) return;
 
   const [geometryPerItem, materialDefs] = await Promise.all([
@@ -272,7 +308,7 @@ async function addModelGeometry(
         // one-surface panels) needs DoubleSide or the export silently loses
         // its back face — MeshStandardMaterial defaults to FrontSide.
         side:
-          entry.definition.renderedFaces === RenderedFaces.TWO ? THREE.DoubleSide : THREE.FrontSide,
+          entry.definition.renderedFaces === RENDERED_FACES_TWO ? THREE.DoubleSide : THREE.FrontSide,
       });
     }
   }
@@ -282,21 +318,68 @@ async function addModelGeometry(
     if (!parts) continue;
     const itemStyle = styleByLocalId.get(localIds[i]!);
     for (const part of parts) {
-      try {
-        const style =
-          (part.sampleId != null ? styleBySampleId.get(part.sampleId) : undefined) ?? itemStyle;
-        const rebuilt = rebuildFromMeshData(part, modelMatrix, style);
-        if (!rebuilt) continue;
-        stats.partsRebuilt++;
-        for (const piece of clipMeshToBands(rebuilt, clipBands)) {
-          group.add(piece);
-          stats.piecesKept++;
-        }
-      } catch (err) {
-        console.warn("Share export: skipping an item part that couldn't be rebuilt", err);
-      }
+      if (!part.positions || part.positions.length === 0 || !part.transform) continue;
+      const style =
+        (part.sampleId != null ? styleBySampleId.get(part.sampleId) : undefined) ?? itemStyle;
+      // Composition order confirmed against @thatopen/components' own
+      // EdgesProjector, which consumes this exact API the same way:
+      // `mesh.applyMatrix4(transform); mesh.applyMatrix4(model.object.matrixWorld)`
+      // — i.e. modelMatrix * transform, item-local then model-world.
+      const matrix = modelMatrix.clone().multiply(part.transform);
+      payload.parts.push({
+        positions: part.positions,
+        ...(part.normals && part.normals.length > 0 ? { normals: part.normals } : {}),
+        ...(part.indices && part.indices.length > 0 ? { indices: part.indices } : {}),
+        matrix: Array.from(matrix.elements),
+        style: style ? styleData(style) : null,
+      });
     }
   }
+}
+
+/**
+ * Drops items whose world bounding box can't reach any clip band, before
+ * their geometry is fetched at all. Without this a route on 2 storeys of a
+ * 20-storey building fetched and rebuilt all 20 storeys' geometry only to
+ * clip 18 of them away. Boxes are cheap (fragments keeps them resident);
+ * on any failure every item is kept, so this can only save work, never
+ * lose geometry.
+ */
+async function itemsTouchingBands(
+  model: FragmentsModel,
+  localIds: number[],
+  clipBands: ClipBand[],
+): Promise<number[]> {
+  try {
+    const boxes = await model.getBoxes(localIds);
+    if (boxes.length !== localIds.length) return localIds;
+    return localIds.filter((_, i) => {
+      const box = boxes[i];
+      if (!box || box.isEmpty()) return true;
+      return clipBands.some((band) => box.max.y >= band.minY && box.min.y <= band.maxY);
+    });
+  } catch (err) {
+    console.warn("Share export: bounding boxes unavailable, fetching every item", err);
+    return localIds;
+  }
+}
+
+type Style = { color: THREE.Color; opacity: number; transparent: boolean; side: THREE.Side };
+
+/**
+ * fragments' `getItemsMaterialDefinition()` types its `color` field as
+ * `THREE.Color`, but at runtime it is not reliably one — this crashed
+ * every real item's material construction (`style.color.clone is not a
+ * function`) for a model where fragments computes materials off-thread:
+ * the value crosses a `postMessage` structured-clone boundary, which keeps
+ * plain enumerable properties (`r`, `g`, `b`) but strips the class's
+ * prototype methods. Reconstructing from those numeric components instead
+ * of trusting the type declaration is what actually survives that.
+ */
+function safeColor(color: THREE.Color): THREE.Color {
+  if (typeof color.clone === "function") return color.clone();
+  const c = color as unknown as { r: number; g: number; b: number };
+  return new THREE.Color(c.r, c.g, c.b);
 }
 
 /**
@@ -340,7 +423,7 @@ async function sampleStyles(
         ),
         opacity: material.a / 255,
         transparent: material.a < 255,
-        side: material.renderedFaces === RenderedFaces.TWO ? THREE.DoubleSide : THREE.FrontSide,
+        side: material.renderedFaces === RENDERED_FACES_TWO ? THREE.DoubleSide : THREE.FrontSide,
       });
     }
   } catch (err) {
@@ -398,13 +481,135 @@ function flipWinding(geometry: THREE.BufferGeometry) {
   }
 }
 
-function rebuildFromMeshData(
-  part: MeshData,
-  modelMatrix: THREE.Matrix4,
-  style: Style | undefined,
-): THREE.Mesh | null {
+// --- Build (pure; runs in the export worker) --------------------------------
+
+/**
+ * Rebuilds, clips and merges a gathered payload into an exporter-ready
+ * group. Pure three.js — no fragments, no DOM — so it runs in a Worker.
+ *
+ * Building geometry is merged into one mesh per distinct material. The
+ * first live-geometry share of a small house was 207 meshes with 207
+ * materials (a fresh material per part, even identical ones); a real
+ * building is thousands of each, i.e. thousands of draw calls in AR Quick
+ * Look / Scene Viewer and a larger file. Per-element identity isn't needed
+ * in a shared route model, so parts that look the same become one mesh.
+ */
+export function buildExportScene(
+  payload: ExportPayload,
+  clipBands: ClipBand[] | null,
+): ExportGroupResult {
+  const group = new THREE.Group();
+  const stats: ExportStats = {
+    items: payload.items,
+    itemsSkipped: payload.itemsSkipped,
+    partsRebuilt: 0,
+    piecesKept: 0,
+    meshes: 0,
+  };
+
+  const byStyle = new Map<
+    string,
+    { style: StyleData | null; geometries: THREE.BufferGeometry[] }
+  >();
+  for (const part of payload.parts) {
+    try {
+      const geometry = rebuildPartGeometry(part);
+      if (!geometry) continue;
+      stats.partsRebuilt++;
+      const key = styleKey(part.style);
+      let bucket = byStyle.get(key);
+      if (!bucket) {
+        bucket = { style: part.style, geometries: [] };
+        byStyle.set(key, bucket);
+      }
+      for (const piece of clipGeometryToBands(geometry, clipBands)) {
+        bucket.geometries.push(piece);
+        stats.piecesKept++;
+      }
+    } catch (err) {
+      console.warn("Share export: skipping an item part that couldn't be rebuilt", err);
+    }
+  }
+  for (const { style, geometries } of byStyle.values()) {
+    const material = materialFor(style);
+    for (const geometry of mergeForExport(geometries)) {
+      group.add(new THREE.Mesh(geometry, material));
+      stats.meshes++;
+    }
+  }
+
+  // The route tube is clipped by the same bands live too: applyStoreyFilter
+  // sets `renderer.clippingPlanes` globally, which — unlike
+  // `material.clippingPlanes` — applies to every material rendered, tube
+  // included, not just fragments' own materials.
+  for (const tube of payload.tubes) {
+    try {
+      const geometry = rebuildPartGeometry(tube);
+      if (!geometry) continue;
+      const material = materialFor(tube.style);
+      for (const piece of clipGeometryToBands(geometry, clipBands)) {
+        const mesh = new THREE.Mesh(piece, material);
+        mesh.name = "route-tube";
+        group.add(mesh);
+      }
+    } catch (err) {
+      console.warn("Share export: skipping a mesh that couldn't be rebuilt", err);
+    }
+  }
+
+  // No baked lights: glTF/USDZ export silently drops HemisphereLight
+  // entirely (no ambient-light equivalent in the format) and doesn't
+  // reliably preserve a DirectionalLight's aim either — every mainstream
+  // glTF/USDZ viewer (AR Quick Look, Android Scene Viewer, model-viewer)
+  // already applies its own default environment lighting to arbitrary
+  // content, which is what actually makes this render correctly on a
+  // phone; relying on lights this export can't reliably carry just adds
+  // risk (see route-share-scene.ts's buildRouteShareScene for the same call).
+  return { group, hasBuildingGeometry: stats.piecesKept > 0, stats };
+}
+
+function styleKey(style: StyleData | null): string {
+  if (!style) return "default";
+  const [r, g, b] = style.color.map((c) => Math.round(c * 1e4));
+  return `${r},${g},${b}|${Math.round(style.opacity * 1e3)}|${style.transparent ? 1 : 0}|${style.side}`;
+}
+
+function materialFor(style: StyleData | null): THREE.MeshStandardMaterial {
+  return new THREE.MeshStandardMaterial({
+    color: style ? new THREE.Color(...style.color) : new THREE.Color(0x808080),
+    opacity: style?.opacity ?? 1,
+    transparent: style?.transparent ?? false,
+    side: style?.side ?? THREE.FrontSide,
+  });
+}
+
+/**
+ * Merges same-material geometries into as few as possible. Every input is
+ * normalised to exactly position + normal + Uint32 index first, since
+ * mergeGeometries needs identical attribute sets and indexing. Falls back to
+ * the inputs unmerged if three refuses the merge, so this can only reduce
+ * mesh count, never drop geometry.
+ */
+function mergeForExport(geometries: THREE.BufferGeometry[]): THREE.BufferGeometry[] {
+  if (geometries.length <= 1) return geometries;
+  const normalised = geometries.map((geometry) => {
+    const out = new THREE.BufferGeometry();
+    out.setAttribute("position", geometry.getAttribute("position"));
+    if (!geometry.getAttribute("normal")) geometry.computeVertexNormals();
+    out.setAttribute("normal", geometry.getAttribute("normal"));
+    const count = (geometry.getAttribute("position") as THREE.BufferAttribute).count;
+    const index = geometry.getIndex();
+    const indices = new Uint32Array(index ? index.count : count);
+    for (let i = 0; i < indices.length; i++) indices[i] = index ? index.getX(i) : i;
+    out.setIndex(new THREE.BufferAttribute(indices, 1));
+    return out;
+  });
+  const merged = mergeGeometries(normalised, false);
+  return merged ? [merged] : geometries;
+}
+
+function rebuildPartGeometry(part: ExportPart): THREE.BufferGeometry | null {
   if (!part.positions || part.positions.length === 0) return null;
-  if (!part.transform) return null;
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute(
@@ -413,7 +618,11 @@ function rebuildFromMeshData(
   );
 
   if (part.normals && part.normals.length > 0) {
-    geometry.setAttribute("normal", new THREE.BufferAttribute(floatNormals(part.normals), 3));
+    const normals =
+      part.normals instanceof Int16Array
+        ? floatNormals(part.normals)
+        : Float32Array.from(part.normals);
+    geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
   } else {
     geometry.computeVertexNormals();
   }
@@ -425,22 +634,10 @@ function rebuildFromMeshData(
     geometry.setIndex(new THREE.BufferAttribute(part.indices.slice(), 1));
   }
 
-  // Composition order confirmed against @thatopen/components' own
-  // EdgesProjector, which consumes this exact API the same way:
-  // `mesh.applyMatrix4(transform); mesh.applyMatrix4(model.object.matrixWorld)`
-  // — i.e. modelMatrix * transform, item-local then model-world.
-  const worldMatrix = modelMatrix.clone().multiply(part.transform);
+  const worldMatrix = new THREE.Matrix4().fromArray(part.matrix);
   geometry.applyMatrix4(worldMatrix);
   if (worldMatrix.determinant() < 0) flipWinding(geometry);
-
-  const material = new THREE.MeshStandardMaterial({
-    color: style ? style.color.clone() : new THREE.Color(0x808080),
-    opacity: style?.opacity ?? 1,
-    transparent: style?.transparent ?? false,
-    side: style?.side ?? THREE.FrontSide,
-  });
-
-  return new THREE.Mesh(geometry, material);
+  return geometry;
 }
 
 // --- Storey clip bands ---
@@ -460,36 +657,41 @@ const CLIP_PLANE_NORMAL_MIN = new THREE.Vector3(0, 1, 0);
 const CLIP_PLANE_NORMAL_MAX = new THREE.Vector3(0, -1, 0);
 
 /**
- * Clips a mesh against every band and keeps whatever survives any of them —
- * `null` bands means "keep everything" (returns `[mesh]` unchanged). A mesh
+ * Clips a geometry against every band and keeps whatever survives any of
+ * them — `null` bands means "keep everything" (returned unchanged). One
  * that spans two *kept* bands with an *excluded* gap between (e.g. a shaft
  * running through floor 1 and floor 5 on a route that skips floors 2-4)
  * correctly comes back as two separate pieces, one per band, with nothing
- * invented in the gap — each independent call to clipMeshToBand already
+ * invented in the gap — each independent call to clipGeometryToBand already
  * culls whatever's outside its own band, so no dedup/merge step is needed
  * here beyond collecting the non-null results.
  */
-function clipMeshToBands(mesh: THREE.Mesh, clipBands: ClipBand[] | null): THREE.Mesh[] {
-  if (!clipBands) return [mesh];
-  const pieces: THREE.Mesh[] = [];
+function clipGeometryToBands(
+  geometry: THREE.BufferGeometry,
+  clipBands: ClipBand[] | null,
+): THREE.BufferGeometry[] {
+  if (!clipBands) return [geometry];
+  const pieces: THREE.BufferGeometry[] = [];
   for (const band of clipBands) {
-    const piece = clipMeshToBand(mesh, band);
+    const piece = clipGeometryToBand(geometry, band);
     if (piece) pieces.push(piece);
   }
   return pieces;
 }
 
 /**
- * Clips a mesh's geometry to `clipBand` in place-equivalent fashion
- * (returns a new mesh sharing the material; the input mesh/geometry are
- * left untouched). Returns the same mesh unchanged when it's already
+ * Clips a geometry to `clipBand` (returns a new geometry; the input is
+ * left untouched). Returns the same geometry unchanged when it's already
  * fully inside the band (the common case — most items live on one storey
  * and never approach the clip planes), null when it's fully outside
- * (culled entirely), and a new mesh with recomputed normals when it
+ * (culled entirely), and a new geometry with recomputed normals when it
  * actually straddles a plane and needs real clipping.
  */
-function clipMeshToBand(mesh: THREE.Mesh, clipBand: ClipBand): THREE.Mesh | null {
-  const positionAttr = mesh.geometry.getAttribute("position") as THREE.BufferAttribute;
+function clipGeometryToBand(
+  source: THREE.BufferGeometry,
+  clipBand: ClipBand,
+): THREE.BufferGeometry | null {
+  const positionAttr = source.getAttribute("position") as THREE.BufferAttribute;
   const positions = positionAttr.array as Float32Array;
   if (positions.length === 0) return null;
 
@@ -500,10 +702,10 @@ function clipMeshToBand(mesh: THREE.Mesh, clipBand: ClipBand): THREE.Mesh | null
     if (y < minY) minY = y;
     if (y > maxY) maxY = y;
   }
-  if (minY >= clipBand.minY && maxY <= clipBand.maxY) return mesh;
+  if (minY >= clipBand.minY && maxY <= clipBand.maxY) return source;
   if (maxY < clipBand.minY || minY > clipBand.maxY) return null;
 
-  const indexAttr = mesh.geometry.getIndex();
+  const indexAttr = source.getIndex();
   const indices = indexAttr ? (indexAttr.array as Uint8Array | Uint16Array | Uint32Array) : null;
 
   // Plane equation n·x + c = 0; a point is kept where distanceToPoint >= 0
@@ -529,10 +731,10 @@ function clipMeshToBand(mesh: THREE.Mesh, clipBand: ClipBand): THREE.Mesh | null
   // untouched.
   geometry.computeVertexNormals();
 
-  return new THREE.Mesh(geometry, mesh.material);
+  return geometry;
 }
 
-/** Sutherland-Hodgman polygon clip applied per-triangle, against each plane in sequence — no capping (see clipMeshToBand's doc comment). */
+/** Sutherland-Hodgman polygon clip applied per-triangle, against each plane in sequence — no capping (see clipGeometryToBand's doc comment). */
 function clipTrianglesToPlanes(
   positions: Float32Array,
   indices: Uint8Array | Uint16Array | Uint32Array | null,
@@ -643,60 +845,33 @@ function cloneIndexAttribute(index: THREE.BufferAttribute): THREE.BufferAttribut
   return new THREE.BufferAttribute(out, 1);
 }
 
-function extractStyle(material: THREE.Material): Style {
-  const mat = material as unknown as {
-    color?: unknown;
-    opacity?: number;
-    transparent?: boolean;
-    side?: THREE.Side;
-  };
-  return {
-    color: mat.color instanceof THREE.Color ? mat.color.clone() : new THREE.Color(0x808080),
-    opacity: typeof mat.opacity === "number" ? mat.opacity : 1,
-    transparent: Boolean(mat.transparent),
-    // Carries over the live tube material's own side (currently always
-    // FrontSide in practice — TubeGeometry is a closed tube — but reading it
-    // rather than hardcoding keeps this consistent with the fragments path
-    // above if that ever changes).
-    side: mat.side ?? THREE.FrontSide,
-  };
-}
-
-function rebuildPlainMesh(mesh: THREE.Mesh): THREE.Mesh | null {
+/**
+ * The live route tube as an ExportPart. Exported opaque whatever the live
+ * material says (the viewer draws it at 0.85 opacity): transparent surfaces
+ * are depth-sorted per object in AR viewers and regularly draw in the wrong
+ * order against glass and each other, and the proxy path's tube is opaque
+ * already — so both paths now look the same.
+ */
+function plainMeshPart(mesh: THREE.Mesh): ExportPart | null {
   const src = mesh.geometry;
   const positionAttr = src.getAttribute("position");
   if (!hasBackingArray(positionAttr) || positionAttr.count === 0) return null;
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute(
-    "position",
-    new THREE.BufferAttribute(extractAttribute(positionAttr, 3), 3),
-  );
-
   const normalAttr = src.getAttribute("normal");
-  if (hasBackingArray(normalAttr)) {
-    geometry.setAttribute("normal", new THREE.BufferAttribute(extractAttribute(normalAttr, 3), 3));
-  } else {
-    geometry.computeVertexNormals();
-  }
-
-  const uvAttr = src.getAttribute("uv");
-  if (hasBackingArray(uvAttr)) {
-    geometry.setAttribute("uv", new THREE.BufferAttribute(extractAttribute(uvAttr, 2), 2));
-  }
-
   const index = src.getIndex();
-  if (index && hasBackingArray(index)) {
-    geometry.setIndex(cloneIndexAttribute(index));
-  }
-
-  geometry.applyMatrix4(mesh.matrixWorld);
-
-  const srcMaterial = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
-  const style = srcMaterial
-    ? extractStyle(srcMaterial)
-    : { color: new THREE.Color(0x808080), opacity: 1, transparent: false, side: THREE.FrontSide };
-  const material = new THREE.MeshStandardMaterial(style);
-
-  return new THREE.Mesh(geometry, material);
+  const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+  const color = (material as { color?: unknown } | undefined)?.color;
+  return {
+    positions: extractAttribute(positionAttr, 3),
+    ...(hasBackingArray(normalAttr) ? { normals: extractAttribute(normalAttr, 3) } : {}),
+    ...(index && hasBackingArray(index)
+      ? { indices: cloneIndexAttribute(index).array as Uint8Array | Uint16Array | Uint32Array }
+      : {}),
+    matrix: Array.from(mesh.matrixWorld.elements),
+    style: {
+      color: color instanceof THREE.Color ? [color.r, color.g, color.b] : [0.5, 0.5, 0.5],
+      opacity: 1,
+      transparent: false,
+      side: (material as { side?: THREE.Side } | undefined)?.side ?? THREE.FrontSide,
+    },
+  };
 }

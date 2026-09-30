@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { Check, Copy, Share2 } from "lucide-react";
 import { toast } from "sonner";
 import QRCode from "qrcode";
-import type { Object3D } from "three";
+import * as THREE from "three";
 import {
   Dialog,
   DialogContent,
@@ -11,11 +11,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { exportGLB } from "@/lib/export-glb";
-import { exportUSDZ } from "@/lib/export-usdz";
 import { buildRouteShareScene } from "@/lib/route-share-scene";
 import { buildRouteArrows, collectRouteTubes } from "@/lib/route-arrows";
-import { buildExportGroup, buildRouteStoreyClipBands } from "@/lib/live-scene-export";
+import { buildRouteStoreyClipBands, gatherExportPayload } from "@/lib/live-scene-export";
+import { serializeMeshes, type ShareExportOutput } from "@/lib/share-export-core";
+import { exportShareOffThread } from "@/lib/share-export-client";
 import {
   uploadRouteShare,
   routeShareUrl,
@@ -136,8 +136,22 @@ export function ShareRouteButton({
           : [navmeshRoute.storeyId],
       );
 
+      // Direction cue: chevrons gliding along the tube, built from the
+      // tube's own curve (the live one, or the proxy scene's).
+      const arrowExtras = (tubeRoots: THREE.Object3D[]) => {
+        const arrows = buildRouteArrows(collectRouteTubes(tubeRoots));
+        return arrows
+          ? {
+              extras: serializeMeshes(arrows.group),
+              clips: [THREE.AnimationClip.toJSON(arrows.clip)],
+            }
+          : { extras: [], clips: [] };
+      };
+
+      // Only the fragments reads happen here; rebuilding, clipping, merging
+      // and GLB/USDZ encoding run in a worker (share-export-client.ts).
       const exportableSource = viewerExportRef.current?.();
-      let source: Object3D | null = null;
+      let output: ShareExportOutput | null = null;
       let liveGeometryUsed = false;
       if (exportableSource) {
         const clipBands = buildRouteStoreyClipBands({
@@ -146,16 +160,18 @@ export function ShareRouteButton({
           modelBounds: viewerModelBounds,
           coordInverse: viewerCoordInverse,
         });
-        const { group, hasBuildingGeometry, stats } = await buildExportGroup(
-          exportableSource,
+        const payload = await gatherExportPayload(exportableSource, clipBands);
+        const live = await exportShareOffThread({
+          payload,
           clipBands,
-        );
-        if (hasBuildingGeometry) {
-          source = group;
+          ...arrowExtras(exportableSource.plainObjects),
+        });
+        if (live.hasBuildingGeometry) {
+          output = live;
           liveGeometryUsed = true;
         } else {
           console.warn("Share export: live IFC geometry empty, falling back to footprint proxy", {
-            ...stats,
+            ...live.stats,
             clipBands,
             storeyIds: [...storeyIds],
           });
@@ -167,32 +183,32 @@ export function ShareRouteButton({
       // real IFC doors are already in it, and an overlay placed with the
       // proxy's plan->Three convention floated above the floor on models
       // whose placement differs (seen on a phone as stray orange "walls").
-      if (!source) source = buildRouteShareScene(navmeshRoute, footprintsDocument);
-      if (!source) {
-        setError("This route has no drawable points yet.");
-        return;
+      if (!output) {
+        const scene = buildRouteShareScene(navmeshRoute, footprintsDocument);
+        if (!scene) {
+          setError("This route has no drawable points yet.");
+          return;
+        }
+        const arrows = arrowExtras([scene]);
+        output = await exportShareOffThread({
+          payload: null,
+          clipBands: null,
+          extras: [...serializeMeshes(scene), ...arrows.extras],
+          clips: arrows.clips,
+        });
       }
+      if (output.stats) console.info("Share export", output.stats);
+      if (output.usdzError)
+        console.warn("Share export: USDZ failed, sharing GLB only", output.usdzError);
       setUsedLiveGeometry(liveGeometryUsed);
-      // Always build both, regardless of which device this dialog is open
-      // on: the "View in AR" button below only matters on an iPhone, but
-      // the shareable link/QR is typically generated from a *different*
-      // device (a laptop) and then scanned by the iPhone — gating the USDZ
-      // export on "is this device an iPhone" would mean it never gets
-      // built for that flow, and the scanned link would always fall back
-      // to the GLB download. The export itself is cheap, so building it
-      // unconditionally costs little.
-      // Direction cue: chevrons gliding along the tube. The live path's tube
-      // is rebuilt as plain geometry in the export, so its curve comes from
-      // the live tube objects; the proxy scene still holds TubeGeometry.
-      const tubeRoots =
-        liveGeometryUsed && exportableSource ? exportableSource.plainObjects : [source];
-      const arrows = buildRouteArrows(collectRouteTubes(tubeRoots));
-      if (arrows) source.add(arrows.group);
-      const clips = arrows ? [arrows.clip] : [];
-      const [glb, usdz] = await Promise.all([exportGLB(source, clips), exportUSDZ(source, clips)]);
+      // Both formats are always built, regardless of which device this
+      // dialog is open on: the link/QR is typically generated on a laptop
+      // and scanned by an iPhone, which needs the USDZ.
+      const glb = new Blob([output.glb!], { type: "model/gltf-binary" });
+      const usdz = output.usdz ? new Blob([output.usdz], { type: "model/vnd.usdz+zip" }) : null;
       setGlbBlob(glb);
       setUsdzBlob(usdz);
-      if (iPhone) setUsdzUrl(URL.createObjectURL(usdz));
+      if (iPhone && usdz) setUsdzUrl(URL.createObjectURL(usdz));
       cacheRef.current = {
         route: navmeshRoute,
         glbBlob: glb,
