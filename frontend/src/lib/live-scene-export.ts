@@ -308,7 +308,9 @@ async function gatherModelParts(
         // one-surface panels) needs DoubleSide or the export silently loses
         // its back face — MeshStandardMaterial defaults to FrontSide.
         side:
-          entry.definition.renderedFaces === RENDERED_FACES_TWO ? THREE.DoubleSide : THREE.FrontSide,
+          entry.definition.renderedFaces === RENDERED_FACES_TWO
+            ? THREE.DoubleSide
+            : THREE.FrontSide,
       });
     }
   }
