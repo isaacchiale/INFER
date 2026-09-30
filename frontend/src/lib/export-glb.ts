@@ -1,4 +1,4 @@
-import type { Object3D } from "three";
+import type { AnimationClip, Object3D } from "three";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 
 /**
@@ -9,7 +9,7 @@ import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
  * scene nor the route tube uses one, so a cap would be a no-op today and
  * only a silent fidelity ceiling if textures are ever added.
  */
-export function exportGLB(object: Object3D): Promise<Blob> {
+export function exportGLB(object: Object3D, animations: AnimationClip[] = []): Promise<Blob> {
   return new Promise((resolve, reject) => {
     new GLTFExporter().parse(
       object,
@@ -21,7 +21,7 @@ export function exportGLB(object: Object3D): Promise<Blob> {
         }
       },
       (error) => reject(error instanceof Error ? error : new Error(String(error))),
-      { binary: true },
+      { binary: true, animations },
     );
   });
 }

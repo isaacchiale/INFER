@@ -1,4 +1,4 @@
-import type { Object3D } from "three";
+import type { AnimationClip, Object3D } from "three";
 import { USDZExporter } from "three/addons/exporters/USDZExporter.js";
 
 /**
@@ -15,7 +15,9 @@ import { USDZExporter } from "three/addons/exporters/USDZExporter.js";
  * function was the wrong layer; the fix belongs where the export scene is
  * built, not patched afterward.
  */
-export async function exportUSDZ(object: Object3D): Promise<Blob> {
-  const bytes = await new USDZExporter().parseAsync(object);
+export async function exportUSDZ(object: Object3D, animations: AnimationClip[] = []): Promise<Blob> {
+  // Animations are baked into USD xformOp time samples; AR Quick Look plays
+  // and loops them automatically.
+  const bytes = await new USDZExporter().parseAsync(object, { animations });
   return new Blob([bytes], { type: "model/vnd.usdz+zip" });
 }

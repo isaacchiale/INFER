@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { exportGLB } from "@/lib/export-glb";
 import { exportUSDZ } from "@/lib/export-usdz";
 import { buildRouteShareScene } from "@/lib/route-share-scene";
+import { buildRouteArrows, collectRouteTubes } from "@/lib/route-arrows";
 import { buildExportGroup, buildRouteStoreyClipBands } from "@/lib/live-scene-export";
 import {
   uploadRouteShare,
@@ -180,7 +181,15 @@ export function ShareRouteButton({
       // built for that flow, and the scanned link would always fall back
       // to the GLB download. The export itself is cheap, so building it
       // unconditionally costs little.
-      const [glb, usdz] = await Promise.all([exportGLB(source), exportUSDZ(source)]);
+      // Direction cue: chevrons gliding along the tube. The live path's tube
+      // is rebuilt as plain geometry in the export, so its curve comes from
+      // the live tube objects; the proxy scene still holds TubeGeometry.
+      const tubeRoots =
+        liveGeometryUsed && exportableSource ? exportableSource.plainObjects : [source];
+      const arrows = buildRouteArrows(collectRouteTubes(tubeRoots));
+      if (arrows) source.add(arrows.group);
+      const clips = arrows ? [arrows.clip] : [];
+      const [glb, usdz] = await Promise.all([exportGLB(source, clips), exportUSDZ(source, clips)]);
       setGlbBlob(glb);
       setUsdzBlob(usdz);
       if (iPhone) setUsdzUrl(URL.createObjectURL(usdz));
