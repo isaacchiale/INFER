@@ -37,6 +37,11 @@ function fakeModel(opts: {
   allLocalIds?: number[];
   geometryByLocalId: Map<number, MeshData[]>;
   styleByLocalId?: Map<number, FakeStyle>;
+  /** Per-sample material, like fragments' getSamples()/getMaterials(). */
+  materialBySampleId?: Map<
+    number,
+    { r: number; g: number; b: number; a: number; renderedFaces: RenderedFaces }
+  >;
   objectTransform?: THREE.Matrix4;
 }): FragmentsModel {
   const object = new THREE.Object3D();
@@ -60,6 +65,21 @@ function fakeModel(opts: {
       for (const id of localIds) {
         const style = styles.get(id);
         if (style) out.push({ definition: style, localIds: [id] });
+      }
+      return out;
+    },
+    async getSamples(ids: Iterable<number>) {
+      const out = new Map<number, { material: number }>();
+      // Material id == sample id + 1000, so a sample/material mix-up would show.
+      for (const id of ids)
+        if (opts.materialBySampleId?.has(id)) out.set(id, { material: id + 1000 });
+      return out;
+    },
+    async getMaterials(ids: Iterable<number>) {
+      const out = new Map<number, unknown>();
+      for (const id of ids) {
+        const m = opts.materialBySampleId?.get(id - 1000);
+        if (m) out.set(id, m);
       }
       return out;
     },
@@ -137,6 +157,97 @@ describe("buildExportGroup — fragments models (async data API)", () => {
     const meshes = group.children.filter((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh[];
     assert.equal(meshes.length, 1);
     assert.equal((meshes[0]!.material as THREE.MeshStandardMaterial).color.getHex(), 0xff0000);
+  });
+
+  it("colours each part of an item from its own sample's material, not one colour per item", async () => {
+    // A door: leaf (sample 10, brown) + glass (sample 11, translucent blue),
+    // while the per-item definition (the buggy fragments call) says black.
+    const leaf: MeshData = { ...boxMeshData(), sampleId: 10 };
+    const glass: MeshData = { ...boxMeshData(), sampleId: 11 };
+    const model = fakeModel({
+      visibleItems: [1],
+      geometryByLocalId: new Map([[1, [leaf, glass]]]),
+      styleByLocalId: new Map([
+        [1, { color: new THREE.Color(0, 0, 0), opacity: 1, transparent: false }],
+      ]),
+      materialBySampleId: new Map([
+        [10, { r: 150, g: 90, b: 40, a: 255, renderedFaces: RenderedFaces.ONE }],
+        [11, { r: 120, g: 180, b: 220, a: 90, renderedFaces: RenderedFaces.TWO }],
+      ]),
+    });
+
+    const { group } = await build(makeSource({ fragmentsModels: [model] }));
+    const mats = (group.children as THREE.Mesh[]).map(
+      (m) => m.material as THREE.MeshStandardMaterial,
+    );
+    assert.equal(mats.length, 2);
+    const hex = mats.map((m) => m.color.getHexString(THREE.SRGBColorSpace));
+    assert.deepEqual(hex, ["965a28", "78b4dc"]);
+    assert.equal(mats[0]!.transparent, false);
+    assert.equal(mats[1]!.transparent, true);
+    assert.ok(Math.abs(mats[1]!.opacity - 90 / 255) < 1e-6);
+    assert.equal(mats[1]!.side, THREE.DoubleSide);
+  });
+
+  it("falls back to the item's colour for a part with no sample material", async () => {
+    const model = fakeModel({
+      visibleItems: [1],
+      geometryByLocalId: new Map([[1, [{ ...boxMeshData(), sampleId: 99 }]]]),
+      styleByLocalId: new Map([
+        [1, { color: new THREE.Color(0xff0000), opacity: 1, transparent: false }],
+      ]),
+      materialBySampleId: new Map(),
+    });
+    const { group } = await build(makeSource({ fragmentsModels: [model] }));
+    const mesh = group.children[0] as THREE.Mesh;
+    assert.equal((mesh.material as THREE.MeshStandardMaterial).color.getHex(), 0xff0000);
+  });
+
+  it("exports plain float normals, not fragments' Int16 quantized ones", async () => {
+    const part = boxMeshData();
+    const normals = new THREE.BoxGeometry(1, 1, 1).getAttribute("normal").array;
+    part.normals = Int16Array.from(normals as ArrayLike<number>, (v) => Math.round(v * 32767));
+    const model = fakeModel({ visibleItems: [1], geometryByLocalId: new Map([[1, [part]]]) });
+
+    const { group } = await build(makeSource({ fragmentsModels: [model] }));
+    const normal = (group.children[0] as THREE.Mesh).geometry.getAttribute(
+      "normal",
+    ) as THREE.BufferAttribute;
+    assert.ok(normal.array instanceof Float32Array);
+    assert.equal(normal.normalized, false);
+    for (let i = 0; i < normal.count; i++) {
+      const len = Math.hypot(normal.getX(i), normal.getY(i), normal.getZ(i));
+      assert.ok(Math.abs(len - 1) < 1e-3, `normal ${i} length ${len}`);
+    }
+  });
+
+  it("keeps faces pointing outward when the baked transform mirrors the part", async () => {
+    const part = boxMeshData();
+    part.normals = Int16Array.from(
+      new THREE.BoxGeometry(1, 1, 1).getAttribute("normal").array as ArrayLike<number>,
+      (v) => Math.round(v * 32767),
+    );
+    part.transform = new THREE.Matrix4().makeScale(-1, 1, 1);
+    const model = fakeModel({ visibleItems: [1], geometryByLocalId: new Map([[1, [part]]]) });
+
+    const { group } = await build(makeSource({ fragmentsModels: [model] }));
+    const geo = (group.children[0] as THREE.Mesh).geometry;
+    const pos = geo.getAttribute("position") as THREE.BufferAttribute;
+    const nrm = geo.getAttribute("normal") as THREE.BufferAttribute;
+    const idx = geo.getIndex()!;
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    for (let t = 0; t < idx.count; t += 3) {
+      a.fromBufferAttribute(pos, idx.getX(t));
+      b.fromBufferAttribute(pos, idx.getX(t + 1));
+      c.fromBufferAttribute(pos, idx.getX(t + 2));
+      const faceNormal = new THREE.Vector3()
+        .subVectors(c, b)
+        .cross(new THREE.Vector3().subVectors(a, b));
+      const vertexNormal = new THREE.Vector3().fromBufferAttribute(nrm, idx.getX(t));
+      assert.ok(faceNormal.dot(vertexNormal) > 0, `triangle ${t / 3} winds against its normal`);
+    }
   });
 
   it("carries a double-sided source material (RenderedFaces.TWO) into DoubleSide on export", async () => {

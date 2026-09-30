@@ -257,7 +257,10 @@ async function addModelGeometry(
     model.getItemsGeometry(localIds, FULL_GEOMETRY_LOD),
     model.getItemsMaterialDefinition(localIds),
   ]);
+  const styleBySampleId = await sampleStyles(model, geometryPerItem);
 
+  // Per-item fallback only — see sampleStyles for why it can't be trusted
+  // as the primary source.
   const styleByLocalId = new Map<number, Style>();
   for (const entry of materialDefs) {
     for (const localId of entry.localIds) {
@@ -277,9 +280,11 @@ async function addModelGeometry(
   for (let i = 0; i < localIds.length; i++) {
     const parts = geometryPerItem[i];
     if (!parts) continue;
-    const style = styleByLocalId.get(localIds[i]!);
+    const itemStyle = styleByLocalId.get(localIds[i]!);
     for (const part of parts) {
       try {
+        const style =
+          (part.sampleId != null ? styleBySampleId.get(part.sampleId) : undefined) ?? itemStyle;
         const rebuilt = rebuildFromMeshData(part, modelMatrix, style);
         if (!rebuilt) continue;
         stats.partsRebuilt++;
@@ -291,6 +296,105 @@ async function addModelGeometry(
         console.warn("Share export: skipping an item part that couldn't be rebuilt", err);
       }
     }
+  }
+}
+
+/**
+ * The exact colour of every geometry part, the way the live viewer draws it:
+ * part → sample → material (fragments' own 0–255 sRGB bytes).
+ *
+ * `getItemsMaterialDefinition()` can't be the primary source: its worker
+ * implementation reads `meshes.samples(itemIndex)` — an *item* index used
+ * as a *sample* index — and keeps one material per item. So a multi-part
+ * item (a door's frame, leaf, glass and handle) gets a single colour, often
+ * one belonging to an unrelated sample; on a phone that showed up as doors
+ * and glass panes exported solid black.
+ *
+ * Empty map (callers fall back per item) if the lookup API isn't available.
+ */
+async function sampleStyles(
+  model: FragmentsModel,
+  geometryPerItem: MeshData[][],
+): Promise<Map<number, Style>> {
+  const styles = new Map<number, Style>();
+  const sampleIds = new Set<number>();
+  for (const parts of geometryPerItem) {
+    for (const part of parts ?? []) if (part.sampleId != null) sampleIds.add(part.sampleId);
+  }
+  if (sampleIds.size === 0) return styles;
+  try {
+    const samples = await model.getSamples([...sampleIds]);
+    const materialIds = new Set<number>();
+    for (const sample of samples.values()) materialIds.add(sample.material);
+    const materials = await model.getMaterials([...materialIds]);
+    for (const [sampleId, sample] of samples) {
+      const material = materials.get(sample.material);
+      if (!material) continue;
+      styles.set(sampleId, {
+        // Same conversion fragments' own ParserHelper.parseMaterial uses.
+        color: new THREE.Color().setRGB(
+          material.r / 255,
+          material.g / 255,
+          material.b / 255,
+          THREE.SRGBColorSpace,
+        ),
+        opacity: material.a / 255,
+        transparent: material.a < 255,
+        side: material.renderedFaces === RenderedFaces.TWO ? THREE.DoubleSide : THREE.FrontSide,
+      });
+    }
+  } catch (err) {
+    console.warn("Share export: per-part colours unavailable, using per-item colours", err);
+  }
+  return styles;
+}
+
+/**
+ * fragments hands normals over as Int16 (signed-normalized). Exported
+ * as-is they force the `KHR_mesh_quantization` glTF extension, and
+ * USDZExporter writes the raw integers straight into the USD file — either
+ * way phone viewers light those surfaces wrongly, often solid black. Plain
+ * float normals are what every viewer reads correctly.
+ */
+function floatNormals(normals: Int16Array): Float32Array {
+  const out = new Float32Array(normals.length);
+  for (let i = 0; i < normals.length; i++) out[i] = Math.max(normals[i]! / 32767, -1);
+  return out;
+}
+
+/**
+ * A mirroring transform (negative determinant — common for mirrored IFC
+ * instances) flips triangle winding once it's baked into the vertices.
+ * Three.js compensates for a mirrored *object* at draw time, but baked
+ * geometry has no object transform left to compensate for, so front faces
+ * would point inward and render dark/culled. Reverse each triangle instead.
+ */
+function flipWinding(geometry: THREE.BufferGeometry) {
+  const index = geometry.getIndex();
+  if (index) {
+    const a = index.array;
+    for (let i = 0; i + 2 < a.length; i += 3) {
+      const t = a[i + 1]!;
+      a[i + 1] = a[i + 2]!;
+      a[i + 2] = t;
+    }
+    index.needsUpdate = true;
+    return;
+  }
+  for (const name of Object.keys(geometry.attributes)) {
+    const attr = geometry.getAttribute(name) as THREE.BufferAttribute;
+    const size = attr.itemSize;
+    const a = attr.array;
+    for (let v = 0; v + 2 < attr.count; v += 3) {
+      for (let k = 0; k < size; k++) {
+        const i1 = (v + 1) * size + k;
+        const i2 = (v + 2) * size + k;
+        const t = a[i1]!;
+        a[i1] = a[i2]!;
+        a[i2] = t;
+      }
+    }
+    attr.needsUpdate = true;
   }
 }
 
@@ -309,10 +413,7 @@ function rebuildFromMeshData(
   );
 
   if (part.normals && part.normals.length > 0) {
-    // Signed-normalized — matches fragments' own live-scene normals (see
-    // MeshManager.setNormals in @thatopen/fragments: `new
-    // THREE.BufferAttribute(normals, 3, true)`), not raw float components.
-    geometry.setAttribute("normal", new THREE.BufferAttribute(part.normals, 3, true));
+    geometry.setAttribute("normal", new THREE.BufferAttribute(floatNormals(part.normals), 3));
   } else {
     geometry.computeVertexNormals();
   }
@@ -320,8 +421,8 @@ function rebuildFromMeshData(
   if (part.indices && part.indices.length > 0) {
     // Already a proper integer typed array (Uint8/16/32Array) straight from
     // fragments — no Float32-index bug risk here the way the old raw-array
-    // extraction path had.
-    geometry.setIndex(new THREE.BufferAttribute(part.indices, 1));
+    // extraction path had. Copied, since flipWinding may rewrite it in place.
+    geometry.setIndex(new THREE.BufferAttribute(part.indices.slice(), 1));
   }
 
   // Composition order confirmed against @thatopen/components' own
@@ -330,6 +431,7 @@ function rebuildFromMeshData(
   // — i.e. modelMatrix * transform, item-local then model-world.
   const worldMatrix = modelMatrix.clone().multiply(part.transform);
   geometry.applyMatrix4(worldMatrix);
+  if (worldMatrix.determinant() < 0) flipWinding(geometry);
 
   const material = new THREE.MeshStandardMaterial({
     color: style ? style.color.clone() : new THREE.Color(0x808080),
