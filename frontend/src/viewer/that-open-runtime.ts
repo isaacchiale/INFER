@@ -1215,24 +1215,19 @@ export async function createThatOpenRuntime(
     void fragments.core.update(true);
   };
 
-  // Scene lights aren't included here — buildExportGroup adds its own
-  // fixed pair unconditionally, since the live scene's lights (including the
-  // shadow-casting sun + hemisphere ambient above) are an internal
-  // ShadowedScene.setup() implementation detail with no stable handle anyway.
+  // Scene lights aren't included here — the export deliberately carries no
+  // lights (glTF/USDZ can't reliably represent them; viewers light it
+  // themselves), see buildExportGroup.
   const getExportableObjects = (): ExportableGeometrySource | null => {
     if (fragments.list.size === 0) return null;
     const fragmentsModels: FragmentsModel[] = [];
     for (const [, model] of fragments.list) fragmentsModels.push(model);
     const plainObjects: THREE.Object3D[] = [];
     if (routeTubeGroup.children.length > 0) plainObjects.push(routeTubeGroup);
-    // Only while actually clipping (band + IFC display mode, matching
-    // applyStoreyFilter's own guard) — "all" and navmesh mode both render
-    // full-height with no clip planes active.
-    const clipBand =
-      storeyFilter.kind === "band" && geometryDisplayMode === "ifc"
-        ? { minY: storeyFilter.minY, maxY: storeyFilter.maxY }
-        : null;
-    return { fragmentsModels, plainObjects, clipBand };
+    // No storey clip band from the viewer's own filter: a shared route is
+    // scoped to the storeys it visits (buildRouteStoreyClipBands), not to
+    // whatever the viewer happens to be showing.
+    return { fragmentsModels, plainObjects };
   };
 
   return {

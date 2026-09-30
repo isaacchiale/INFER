@@ -99,7 +99,12 @@ export function planPoint(x: number, y: number, elevationM: number): THREE.Vecto
  * same negation planPoint applies explicitly. Flipping the shape's Y here
  * too would cancel it back out and reintroduce the mirror bug.
  */
-export function prism(polygon: Point2D[], elevationM: number, heightM: number, color: number): THREE.Mesh {
+export function prism(
+  polygon: Point2D[],
+  elevationM: number,
+  heightM: number,
+  color: number,
+): THREE.Mesh {
   const shape = new THREE.Shape(polygon.map((p) => new THREE.Vector2(p.x, p.y)));
   const geometry = new THREE.ExtrudeGeometry(shape, {
     depth: Math.max(heightM, 0.01),
@@ -121,15 +126,18 @@ function routeTube(points: Point2D[], elevationM: number): THREE.Mesh | null {
   const curve = new THREE.CatmullRomCurve3(points.map((p) => planPoint(p.x, p.y, y)));
   const segments = Math.max(points.length * 4, 8);
   const geometry = new THREE.TubeGeometry(curve, segments, TUBE_RADIUS_M, 8, false);
-  // A subtle emissive glow — matches the "glowing 3D markers" look the
-  // evacuation-load view already established elsewhere in the app, and
-  // keeps the route reading clearly even in AR Quick Look's ambient lighting.
+  // No emissive here on purpose: an earlier version glowed, but glTF export
+  // silently drops this scene's HemisphereLight (glTF has no ambient-light
+  // equivalent) and the exported directional lights' aim isn't reliably
+  // preserved either — so in a real AR viewer the glowing tube/markers were
+  // the only reliably lit thing on screen, and phone camera auto-exposure
+  // crushed everything else (rooms, walls) to near-black around them. Flat
+  // saturated color reads fine under any viewer's own default lighting/IBL
+  // without risking that.
   const material = new THREE.MeshStandardMaterial({
     color: TUBE_COLOR,
     roughness: 0.35,
     metalness: 0.15,
-    emissive: TUBE_COLOR,
-    emissiveIntensity: 0.5,
   });
   return new THREE.Mesh(geometry, material);
 }
@@ -147,8 +155,6 @@ function doorMesh(door: DoorPortal, elevationM: number): THREE.Object3D | null {
     return tuneMaterial(prism(door.polygon, elevationM, DOOR_HEIGHT_M, DOOR_COLOR), {
       metalness: 0.2,
       roughness: 0.5,
-      emissive: DOOR_COLOR,
-      emissiveIntensity: 0.12,
     });
   }
   if (door.point) {
@@ -157,8 +163,6 @@ function doorMesh(door: DoorPortal, elevationM: number): THREE.Object3D | null {
       color: DOOR_COLOR,
       metalness: 0.2,
       roughness: 0.5,
-      emissive: DOOR_COLOR,
-      emissiveIntensity: 0.12,
     });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.position.copy(planPoint(door.point.x, door.point.y, elevationM + DOOR_HEIGHT_M / 2));
@@ -195,23 +199,33 @@ export function buildDoorOverlay(
   return group;
 }
 
-function marker(point: Point2D, elevationM: number, color: number): THREE.Mesh {
+function marker(position: THREE.Vector3, color: number): THREE.Mesh {
   const geometry = new THREE.SphereGeometry(MARKER_RADIUS_M, 16, 16);
-  const material = new THREE.MeshStandardMaterial({
-    color,
-    roughness: 0.3,
-    metalness: 0.1,
-    emissive: color,
-    emissiveIntensity: 0.7,
-  });
+  const material = new THREE.MeshStandardMaterial({ color, roughness: 0.3, metalness: 0.1 });
   const mesh = new THREE.Mesh(geometry, material);
-  mesh.position.copy(planPoint(point.x, point.y, elevationM + TUBE_HEIGHT_OFFSET_M));
+  mesh.position.copy(position);
   return mesh;
+}
+
+/**
+ * Green start / red end spheres at two Three-space points. Shared by the
+ * proxy scene (points from planPoint) and the live-geometry export (points
+ * lifted the same way as the live route tube, see routeEndpointsInLiveScene).
+ */
+export function buildRouteEndMarkers(start: THREE.Vector3, end: THREE.Vector3): THREE.Group {
+  const group = new THREE.Group();
+  group.name = "route-end-markers";
+  group.add(marker(start, START_COLOR), marker(end, END_COLOR));
+  return group;
 }
 
 /**
  * Null when the route has no drawable points on any storey (e.g. an
  * in-progress route with only a start pin) — nothing worth exporting yet.
+ *
+ * Start (green) and end (red) spheres mark direction — the tube alone
+ * doesn't say which end is the destination. Plain lit material, no
+ * emissive, for the same exposure reason as the tube (see routeTube).
  */
 export function buildRouteShareScene(
   route: NavmeshRoute,
@@ -222,16 +236,14 @@ export function buildRouteShareScene(
 
   const elevations = storeyElevationsM(footprints);
   const scene = new THREE.Scene();
-  scene.add(new THREE.HemisphereLight(0xfff4e6, 0x444444, 1.4));
-  // Warm key light plus a cooler fill from the opposite side — a plain
-  // single directional light left every prism looking flat-shaded on one
-  // face; the second light gives walls/rooms a soft gradient instead.
-  const sun = new THREE.DirectionalLight(0xfff1e0, 1.15);
-  sun.position.set(3, 8, 4);
-  scene.add(sun);
-  const fill = new THREE.DirectionalLight(0xcfe0ff, 0.45);
-  fill.position.set(-4, 5, -3);
-  scene.add(fill);
+  // No baked lights: glTF export silently drops HemisphereLight entirely
+  // (no ambient-light equivalent in the format) and doesn't reliably
+  // preserve a DirectionalLight's aim either. Every mainstream glTF/USDZ
+  // viewer (AR Quick Look, Android Scene Viewer, model-viewer) already
+  // applies its own default environment lighting to arbitrary content —
+  // that's what actually renders this correctly on a phone, and it's why
+  // this scene's flat saturated colors are chosen to read fine under any
+  // such lighting without this export needing to bring its own.
 
   // A wall with no storey_global_id is shown "on every storey" elsewhere in
   // the app (FloorplanViewer); here every segment renders simultaneously in
@@ -306,9 +318,21 @@ export function buildRouteShareScene(
 
   const first = segments[0]!;
   const last = segments[segments.length - 1]!;
-  scene.add(marker(first.points[0]!, elevations.get(first.storeyId) ?? 0, START_COLOR));
+  const startPoint = first.points[0]!;
+  const endPoint = last.points[last.points.length - 1]!;
   scene.add(
-    marker(last.points[last.points.length - 1]!, elevations.get(last.storeyId) ?? 0, END_COLOR),
+    buildRouteEndMarkers(
+      planPoint(
+        startPoint.x,
+        startPoint.y,
+        (elevations.get(first.storeyId) ?? 0) + TUBE_HEIGHT_OFFSET_M,
+      ),
+      planPoint(
+        endPoint.x,
+        endPoint.y,
+        (elevations.get(last.storeyId) ?? 0) + TUBE_HEIGHT_OFFSET_M,
+      ),
+    ),
   );
 
   return scene;

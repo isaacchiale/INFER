@@ -4,20 +4,30 @@ import * as THREE from "three";
 import { buildRouteShareScene, buildDoorOverlay } from "./route-share-scene.ts";
 import { ifcPlanToThree } from "./viewer-camera-pose.ts";
 
-const START_COLOR = 0x22c55e;
-const END_COLOR = 0xef4444;
 const DOOR_COLOR = 0xf59e0b;
 const TUBE_HEIGHT_OFFSET_M = 0.05;
 
-function markerAt(scene: THREE.Scene, colorHex: number): THREE.Mesh {
-  const mesh = scene.children.find(
-    (child): child is THREE.Mesh =>
-      child instanceof THREE.Mesh &&
-      child.geometry instanceof THREE.SphereGeometry &&
-      (child.material as THREE.MeshStandardMaterial).color.getHex() === colorHex,
-  );
-  assert.ok(mesh, `expected a marker mesh with color 0x${colorHex.toString(16)}`);
-  return mesh;
+/** The tube's cross-section is a regular ring of vertices around the
+ * centerline at each point along the curve — averaging one full ring
+ * exactly cancels the radius offset, recovering the true centerline point. */
+function tubeRingCenter(
+  tube: THREE.Mesh,
+  ringIndex: number,
+  radialSegments: number,
+): THREE.Vector3 {
+  const position = tube.geometry.getAttribute("position") as THREE.BufferAttribute;
+  const center = new THREE.Vector3();
+  for (let i = 0; i < radialSegments; i++) {
+    const vertexIndex = ringIndex * (radialSegments + 1) + i;
+    center.add(
+      new THREE.Vector3(
+        position.getX(vertexIndex),
+        position.getY(vertexIndex),
+        position.getZ(vertexIndex),
+      ),
+    );
+  }
+  return center.divideScalar(radialSegments);
 }
 
 describe("buildRouteShareScene", () => {
@@ -34,7 +44,7 @@ describe("buildRouteShareScene", () => {
     assert.equal(buildRouteShareScene(route, footprints), null);
   });
 
-  it("places start/end markers using the app's real plan<->Three convention (z = -planY), not a mirrored one", () => {
+  it("places the route tube using the app's real plan<->Three convention (z = -planY), not a mirrored one", () => {
     const footprints = {
       storeys: [{ global_id: "st1", name: "L1", elevation: 0 }],
       spaces: [],
@@ -59,28 +69,76 @@ describe("buildRouteShareScene", () => {
     const expectedStart = ifcPlanToThree(0, 0, TUBE_HEIGHT_OFFSET_M);
     const expectedEnd = ifcPlanToThree(0, 5, TUBE_HEIGHT_OFFSET_M);
 
-    // The regression this guards: an earlier version built tube/marker
-    // points as `new THREE.Vector3(p.x, y, p.y)` (z = +planY) while the
-    // room-slab geometry got the correct z = -planY for free via its own
+    // The regression this guards: an earlier version built tube points as
+    // `new THREE.Vector3(p.x, y, p.y)` (z = +planY) while the room-slab
+    // geometry got the correct z = -planY for free via its own
     // rotateX(-90deg) extrude trick — the two disagreed, so the exported
     // path looked mirrored/backwards relative to the rooms around it.
     // Asserting against ifcPlanToThree's own output (rather than a
     // hardcoded number) means this test still passes if that shared
     // function's convention ever legitimately changes.
-    const start = markerAt(scene, START_COLOR);
-    assert.equal(start.position.x, expectedStart.x);
-    assert.equal(start.position.y, expectedStart.y);
-    assert.equal(start.position.z, expectedStart.z);
+    const tube = scene!.children.find(
+      (child): child is THREE.Mesh =>
+        child instanceof THREE.Mesh && child.geometry instanceof THREE.TubeGeometry,
+    );
+    assert.ok(tube, "expected a route tube mesh");
 
-    const end = markerAt(scene, END_COLOR);
-    assert.equal(end.position.x, expectedEnd.x);
-    assert.equal(end.position.y, expectedEnd.y);
-    assert.equal(end.position.z, expectedEnd.z);
+    // routeTube() passes Math.max(points.length * 4, 8) as tubularSegments
+    // and the literal 8 as radialSegments — a 2-point route gives exactly 8
+    // rings (0..8), the first and last being the curve's true endpoints.
+    const radialSegments = 8;
+    const tubularSegments = 8;
+    const start = tubeRingCenter(tube, 0, radialSegments);
+    const end = tubeRingCenter(tube, tubularSegments, radialSegments);
+
+    assert.ok(Math.abs(start.x - expectedStart.x) < 1e-5);
+    assert.ok(Math.abs(start.y - expectedStart.y) < 1e-5);
+    assert.ok(Math.abs(start.z - expectedStart.z) < 1e-5);
+
+    assert.ok(Math.abs(end.x - expectedEnd.x) < 1e-5);
+    assert.ok(Math.abs(end.y - expectedEnd.y) < 1e-5);
+    assert.ok(Math.abs(end.z - expectedEnd.z) < 1e-5);
 
     // The specific sign that broke: for a positive plan-Y point, world Z
     // must come out negative.
     assert.equal(expectedEnd.z, -5);
-    assert.equal(end.position.z, -5);
+    assert.ok(Math.abs(end.z - -5) < 1e-5);
+  });
+
+  it("marks the start green and the end red, at the route's true endpoints, unlit (no emissive)", () => {
+    const footprints = {
+      storeys: [{ global_id: "st1", name: "L1", elevation: 0 }],
+      spaces: [],
+      doors: [],
+      walls: [],
+    } as never;
+    const route = {
+      storeyId: "st1",
+      start: { x: 0, y: 0 },
+      end: { x: 4, y: 5 },
+      endStoreyId: "st1",
+      points: [
+        { x: 0, y: 0 },
+        { x: 4, y: 5 },
+      ],
+      segments: null,
+    } as never;
+
+    const scene = buildRouteShareScene(route, footprints)!;
+    const spheres: THREE.Mesh[] = [];
+    scene.traverse((c) => {
+      if (c instanceof THREE.Mesh && c.geometry instanceof THREE.SphereGeometry) spheres.push(c);
+    });
+    const byColor = (hex: number) =>
+      spheres.find((m) => (m.material as THREE.MeshStandardMaterial).color.getHex() === hex);
+    const start = byColor(0x22c55e);
+    const end = byColor(0xef4444);
+    assert.ok(start && end, "expected a green start and a red end marker");
+    assert.ok(start.position.distanceTo(ifcPlanToThree(0, 0, TUBE_HEIGHT_OFFSET_M)) < 1e-6);
+    assert.ok(end.position.distanceTo(ifcPlanToThree(4, 5, TUBE_HEIGHT_OFFSET_M)) < 1e-6);
+    for (const m of [start, end]) {
+      assert.equal((m.material as THREE.MeshStandardMaterial).emissive.getHex(), 0);
+    }
   });
 
   it("draws a door with a measured polygon as an extruded box, not just a marker", () => {

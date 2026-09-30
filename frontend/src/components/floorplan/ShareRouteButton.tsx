@@ -13,8 +13,16 @@ import {
 import { Button } from "@/components/ui/button";
 import { exportGLB } from "@/lib/export-glb";
 import { exportUSDZ } from "@/lib/export-usdz";
-import { buildRouteShareScene, buildDoorOverlay } from "@/lib/route-share-scene";
-import { buildExportGroup } from "@/lib/live-scene-export";
+import {
+  buildRouteShareScene,
+  buildDoorOverlay,
+  buildRouteEndMarkers,
+} from "@/lib/route-share-scene";
+import {
+  buildExportGroup,
+  buildRouteStoreyClipBands,
+  routeEndpointsInLiveScene,
+} from "@/lib/live-scene-export";
 import {
   uploadRouteShare,
   routeShareUrl,
@@ -74,7 +82,7 @@ export function ShareRouteButton({
   const [reachabilityWarning, setReachabilityWarning] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const { viewerExportRef } = useViewerPose();
+  const { viewerExportRef, viewerModelBounds, viewerCoordInverse } = useViewerPose();
   const iPhone = useMemo(() => isIPhone(), []);
   const cacheRef = useRef<ShareCache | null>(null);
   const abortUploadRef = useRef<(() => void) | null>(null);
@@ -123,18 +131,45 @@ export function ShareRouteButton({
       // or if that pane is closed, in which case the proxy is still the
       // only option. buildExportGroup silently skips anything it can't
       // safely fetch/rebuild — hasBuildingGeometry tells us whether that
-      // left any real content beyond the route tube and fixed lights, so a
+      // left any real content beyond the route tube, so a
       // total failure falls back to the proxy instead of silently sharing
       // an empty room with a tube floating in it.
+      // Storeys the route actually touches — used both for the live path's
+      // door overlay (below) and to scope the live geometry export itself
+      // to just those storeys, not whatever the 3D Viewer's own storey
+      // filter currently shows (see buildRouteStoreyClipBands's doc comment).
+      const storeyIds = new Set(
+        navmeshRoute.segments?.length
+          ? navmeshRoute.segments.map((s) => s.storeyId)
+          : [navmeshRoute.storeyId],
+      );
+
       const exportableSource = viewerExportRef.current?.();
       let source: Object3D | null = null;
       let liveGeometryUsed = false;
       if (exportableSource) {
-        const { group, hasBuildingGeometry } = await buildExportGroup(exportableSource);
+        const clipBands = buildRouteStoreyClipBands({
+          footprints: footprintsDocument,
+          storeyIds,
+          modelBounds: viewerModelBounds,
+          coordInverse: viewerCoordInverse,
+        });
+        const { group, hasBuildingGeometry, stats } = await buildExportGroup(
+          exportableSource,
+          clipBands,
+        );
         if (hasBuildingGeometry) {
           source = group;
           liveGeometryUsed = true;
+        } else {
+          console.warn("Share export: live IFC geometry empty, falling back to footprint proxy", {
+            ...stats,
+            clipBands,
+            storeyIds: [...storeyIds],
+          });
         }
+      } else {
+        console.info("Share export: 3D Viewer not loaded, using footprint proxy");
       }
       if (!source) {
         // buildRouteShareScene already draws doors itself; the live path
@@ -142,12 +177,14 @@ export function ShareRouteButton({
         // fragments' geometry), so that one needs the overlay added below.
         source = buildRouteShareScene(navmeshRoute, footprintsDocument);
       } else {
-        const storeyIds = new Set(
-          navmeshRoute.segments?.length
-            ? navmeshRoute.segments.map((s) => s.storeyId)
-            : [navmeshRoute.storeyId],
-        );
         source.add(buildDoorOverlay(footprintsDocument, storeyIds));
+        const ends = routeEndpointsInLiveScene({
+          route: navmeshRoute,
+          footprints: footprintsDocument,
+          modelBounds: viewerModelBounds,
+          coordInverse: viewerCoordInverse,
+        });
+        if (ends) source.add(buildRouteEndMarkers(ends.start, ends.end));
       }
       if (!source) {
         setError("This route has no drawable points yet.");
@@ -296,7 +333,11 @@ export function ShareRouteButton({
     }
     if (id) {
       const revoked = await deleteRouteShare(id);
-      toast(revoked ? "Link revoked" : "Couldn't reach the server to revoke — it'll still expire on its own");
+      toast(
+        revoked
+          ? "Link revoked"
+          : "Couldn't reach the server to revoke — it'll still expire on its own",
+      );
     }
   };
 

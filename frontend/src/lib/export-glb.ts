@@ -2,16 +2,13 @@ import type { Object3D } from "three";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 
 /**
- * Cap embedded texture resolution on export. Three's GLTFExporter has no
- * mesh-compression option (no Draco/meshopt path) short of pulling in a
- * separate encoder — but the real cost for a share of the live IFC geometry
- * is baked material textures, not this route's own geometry (a tube plus a
- * handful of room slabs), so bounding those is the lever actually worth
- * pulling without adding a new dependency to a phone-facing download.
+ * Export a Three.js object graph to a binary GLB Blob.
+ *
+ * No `maxTextureSize` cap: fragments' MaterialDefinition (color, opacity,
+ * transparent, renderedFaces) carries no texture map, and neither the proxy
+ * scene nor the route tube uses one, so a cap would be a no-op today and
+ * only a silent fidelity ceiling if textures are ever added.
  */
-const MAX_TEXTURE_SIZE = 1024;
-
-/** Export a Three.js object graph to a binary GLB Blob. */
 export function exportGLB(object: Object3D): Promise<Blob> {
   return new Promise((resolve, reject) => {
     new GLTFExporter().parse(
@@ -24,7 +21,7 @@ export function exportGLB(object: Object3D): Promise<Blob> {
         }
       },
       (error) => reject(error instanceof Error ? error : new Error(String(error))),
-      { binary: true, maxTextureSize: MAX_TEXTURE_SIZE },
+      { binary: true },
     );
   });
 }

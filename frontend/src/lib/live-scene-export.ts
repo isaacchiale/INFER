@@ -1,5 +1,17 @@
 import * as THREE from "three";
+import { RenderedFaces } from "@thatopen/fragments";
 import type { FragmentsModel, MeshData } from "@thatopen/fragments";
+import { elevationsForVerticalRemap } from "@/lib/storey-elevations";
+import {
+  buildPlanRouteTubePolylines,
+  footprintPlanBounds,
+  resolveRouteTubeLiftOptions,
+  spaceStoreyIds,
+  storeysMetres,
+} from "@/lib/route-tube";
+import { ifcPlanToThree, type Mat4Elements, type ThreeAabb } from "@/lib/viewer-camera-pose";
+import type { FootprintsDocument } from "@/types/footprints";
+import type { NavmeshRoute } from "@/state/infer-store";
 
 /**
  * `CurrentLod.GEOMETRY` from @thatopen/fragments (full detail, not the
@@ -8,26 +20,20 @@ import type { FragmentsModel, MeshData } from "@thatopen/fragments";
  */
 const FULL_GEOMETRY_LOD = 0;
 
+export type ClipBand = { minY: number; maxY: number };
+
 export type ExportableGeometrySource = {
   /** Real loaded fragments models — geometry is fetched live and async, see buildExportGroup's doc comment for why. */
   fragmentsModels: FragmentsModel[];
   /** Plain Three.js objects that don't go through the fragments query API (currently: the route tube group). */
   plainObjects: THREE.Object3D[];
-  /**
-   * The live viewer's active storey clip band (Three.js world Y), or null
-   * when viewing "all levels". Matches that-open-runtime.ts's own
-   * `renderer.clippingPlanes` exactly — see clipMeshToBand's doc comment
-   * for why the export needs to replicate this itself rather than relying
-   * on `visibleItems` alone.
-   */
-  clipBand: { minY: number; maxY: number } | null;
 };
 
 export type ExportGroupResult = {
   group: THREE.Group;
   /**
-   * True if any real building geometry (not just the route tube and the
-   * fixed lights) actually made it into the group. The route tube is
+   * True if any real building geometry (not just the route tube) actually
+   * made it into the group. The route tube is
    * always present whenever the Share button is even enabled, so callers
    * must check this — not just "does the group have any mesh children" —
    * to tell a real export apart from an empty room with a tube floating in
@@ -35,7 +41,130 @@ export type ExportGroupResult = {
    * that.
    */
   hasBuildingGeometry: boolean;
+  /**
+   * Counts across all fragments models, so a caller that falls back to the
+   * proxy can log *why* (no items at all vs. everything clipped away vs.
+   * every part failing to rebuild) instead of falling back silently.
+   */
+  stats: ExportStats;
 };
+
+export type ExportStats = { items: number; partsRebuilt: number; piecesKept: number };
+
+/**
+ * Turns the set of storeys a route touches into Three.js world-Y clip bands
+ * for buildExportGroup, so the live-geometry export only includes the
+ * storeys the route actually visits — not whatever the 3D Viewer's own
+ * storey filter currently happens to show (which could be the entire
+ * multi-storey building on an "all levels" view, completely unrelated to
+ * the route). Works for any number of storeys, contiguous or not, e.g. a
+ * route riding stairs from floor 1 to floor 5: each visited floor gets its
+ * own band and nothing is invented for the floors in between.
+ *
+ * Reuses `resolveRouteTubeLiftOptions` (route-tube.ts) — the exact same
+ * function that keeps the live on-screen route tube correctly placed,
+ * including the coordination-matrix / centre-delta fallback logic — rather
+ * than calling `ifcPlanToThree` bare the way the flat proxy path does.
+ * `route-share-scene.ts`'s bare `planPoint()` is fine there because
+ * everything in that scene goes through the same bare call self-consistently;
+ * here the resulting Y has to line up with the *live fragments geometry's*
+ * real world-Y (positioned via each item's true model transform), which a
+ * bare call does not reliably do once a model has a coordination matrix.
+ *
+ * The per-storey band formula (next storey's elevation, or +3.5m if
+ * topmost; band = [elev - 0.25, elev + max(nextElev - elev, 1.5) * 0.78])
+ * matches InferModelViewport's own single-storey clip-band effect exactly,
+ * so "one storey's slice" means the same thing here as it does in the live
+ * viewer's storey filter.
+ *
+ * Returns null (meaning: don't clip, export everything visible) whenever
+ * the inputs can't support a reliable band — missing model bounds, no
+ * storeys, or no footprint data to build plan bounds from — rather than
+ * risk clipping away a real export down to nothing.
+ */
+export function buildRouteStoreyClipBands(args: {
+  footprints: FootprintsDocument;
+  storeyIds: ReadonlySet<string>;
+  modelBounds: ThreeAabb | null;
+  coordInverse: Mat4Elements | null;
+}): ClipBand[] | null {
+  const { footprints, storeyIds, modelBounds, coordInverse } = args;
+  if (!modelBounds || storeyIds.size === 0) return null;
+
+  const planBounds = footprintPlanBounds(footprints);
+  if (!planBounds) return null;
+
+  const modelHeightM = modelBounds.maxY - modelBounds.minY;
+  const ranked = storeysMetres(footprints, modelHeightM).sort((a, b) => a.elevation - b.elevation);
+  if (!ranked.length) return null;
+
+  const storeyElevationsM = elevationsForVerticalRemap(ranked, spaceStoreyIds(footprints));
+  const liftOpts = resolveRouteTubeLiftOptions({
+    planBounds,
+    probeElevationM: storeyElevationsM.length
+      ? Math.min(...storeyElevationsM)
+      : ranked[0]!.elevation,
+    modelBounds,
+    storeyElevationsM,
+    coordInverse,
+  });
+  // resolveRouteTubeLiftOptions bakes in ROUTE_TUBE_HEIGHT_OFFSET_M (0.7m —
+  // how far the *tube* floats above the floor for visibility). A clip band
+  // needs the true storey elevation, not that tube-specific lift — same
+  // fix InferModelViewport.tsx's own single-storey clip-band effect applies
+  // ("No height offset — clip against true storey elevations").
+  liftOpts.heightOffsetM = 0;
+
+  const midX = (planBounds.minX + planBounds.maxX) / 2;
+  const midY = (planBounds.minY + planBounds.maxY) / 2;
+
+  const bands: ClipBand[] = [];
+  for (let i = 0; i < ranked.length; i++) {
+    const storey = ranked[i]!;
+    if (!storeyIds.has(storey.global_id)) continue;
+    const nextElev = i + 1 < ranked.length ? ranked[i + 1]!.elevation : storey.elevation + 3.5;
+    const storeyHeight = Math.max(nextElev - storey.elevation, 1.5);
+    const minElevM = storey.elevation - 0.25;
+    const maxElevM = storey.elevation + storeyHeight * 0.78;
+    const lo = ifcPlanToThree(midX, midY, minElevM, liftOpts);
+    const hi = ifcPlanToThree(midX, midY, maxElevM, liftOpts);
+    bands.push({ minY: Math.min(lo.y, hi.y), maxY: Math.max(lo.y, hi.y) });
+  }
+  return bands.length ? bands : null;
+}
+
+/**
+ * The route's start and end in the live scene's Three space, lifted exactly
+ * like the live route tube (buildPlanRouteTubePolylines — the same call
+ * InferModelViewport's buildNavmeshRouteTube makes), so markers added to a
+ * live-geometry export sit on the tube's ends. Null when either end can't be
+ * lifted (no model bounds, no footprint plan bounds).
+ */
+export function routeEndpointsInLiveScene(args: {
+  route: NavmeshRoute;
+  footprints: FootprintsDocument;
+  modelBounds: ThreeAabb | null;
+  coordInverse: Mat4Elements | null;
+}): { start: THREE.Vector3; end: THREE.Vector3 } | null {
+  const { route, footprints, modelBounds, coordInverse } = args;
+  const segments = route.segments?.length
+    ? route.segments
+    : [{ storeyId: route.storeyId, points: route.points }];
+  const lift = (segment: (typeof segments)[number]) =>
+    buildPlanRouteTubePolylines({
+      points: segment.points,
+      storeyId: segment.storeyId,
+      footprints,
+      modelBounds,
+      coordInverse,
+    })?.[0] ?? null;
+  const first = lift(segments[0]!);
+  const last = lift(segments[segments.length - 1]!);
+  if (!first || !last) return null;
+  const a = first[0]!;
+  const b = last[last.length - 1]!;
+  return { start: new THREE.Vector3(a.x, a.y, a.z), end: new THREE.Vector3(b.x, b.y, b.z) };
+}
 
 /**
  * Builds a fully clean, standalone Three.js group safe to hand to
@@ -56,37 +185,44 @@ export type ExportGroupResult = {
  * The only reliable source is fragments' own async data API —
  * `model.getItemsGeometry()` / `model.getItemsMaterialDefinition()` —
  * which fetch real position/normal/index/color data on demand rather than
- * reading whatever three.js happens to still have cached. `model.visibleItems`
- * (items with at least one tile currently rendered) scopes the export to
- * what's actually on screen, which also naturally respects any
- * excluded/hidden elements, rather than always exporting the whole
- * multi-storey building regardless of what the viewer shows. It does *not*
- * by itself replicate the live viewer's storey-band clip though — an item
- * merely visible on the current storey is exported whole even if it
- * physically extends past the band (e.g. a wall spanning two storeys) —
- * so `source.clipBand`, when set, additionally crops each mesh's geometry
- * to that band (see clipMeshToBand below), matching applyStoreyFilter's
- * own no-capping clippingPlanes exactly.
+ * reading whatever three.js happens to still have cached.
+ *
+ * Which items get fetched depends on `clipBands`:
+ * - Set (the route's own storeys, see buildRouteStoreyClipBands): every item
+ *   in the model, cropped to those bands. NOT `model.visibleItems` — that
+ *   is "items with at least one tile rendered on screen", i.e. it depends
+ *   on the 3D Viewer's camera framing and storey filter. Intersecting it
+ *   with the route's bands exported only whatever happened to be on screen,
+ *   and nothing at all when the route's storeys weren't being shown — which
+ *   silently dropped the share onto the footprint proxy.
+ * - Null (no scope could be computed): `visibleItems`, falling back to
+ *   every item if nothing has rendered yet, so an unscoped export is at
+ *   least bounded by what the viewer shows instead of the whole building.
+ *
+ * Clipping matches applyStoreyFilter's own no-capping clippingPlanes, so an
+ * item straddling a band (e.g. a wall spanning two storeys) is cropped to
+ * the slice inside it, not exported whole (see clipMeshToBands below).
  *
  * Per-item/part failures are caught and skipped (logged, not fatal) —
  * given how much has gone wrong in this pipeline already, one bad part
  * should degrade the export, not blank it.
  */
-export async function buildExportGroup(source: ExportableGeometrySource): Promise<ExportGroupResult> {
+export async function buildExportGroup(
+  source: ExportableGeometrySource,
+  clipBands: ClipBand[] | null,
+): Promise<ExportGroupResult> {
   const group = new THREE.Group();
-  let hasBuildingGeometry = false;
-  const clipBand = source.clipBand;
+  const stats: ExportStats = { items: 0, partsRebuilt: 0, piecesKept: 0 };
 
   for (const model of source.fragmentsModels) {
     try {
-      const added = await addModelGeometry(group, model, clipBand);
-      hasBuildingGeometry = hasBuildingGeometry || added;
+      await addModelGeometry(group, model, clipBands, stats);
     } catch (err) {
       console.warn("Share export: skipping a model whose geometry couldn't be fetched", err);
     }
   }
 
-  // The route tube is clipped by the same band live too: applyStoreyFilter
+  // The route tube is clipped by the same bands live too: applyStoreyFilter
   // sets `renderer.clippingPlanes` globally, which — unlike
   // `material.clippingPlanes` — applies to every material rendered, tube
   // included, not just fragments' own materials.
@@ -95,42 +231,62 @@ export async function buildExportGroup(source: ExportableGeometrySource): Promis
     object.traverse((node) => {
       if (!(node as THREE.Mesh).isMesh) return;
       try {
-        let rebuilt: THREE.Mesh | null = rebuildPlainMesh(node as THREE.Mesh);
-        if (rebuilt && clipBand) rebuilt = clipMeshToBand(rebuilt, clipBand);
-        if (rebuilt) group.add(rebuilt);
+        const rebuilt = rebuildPlainMesh(node as THREE.Mesh);
+        if (!rebuilt) return;
+        for (const piece of clipMeshToBands(rebuilt, clipBands)) group.add(piece);
       } catch (err) {
         console.warn("Share export: skipping a mesh that couldn't be rebuilt", err);
       }
     });
   }
 
-  group.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.5));
-  const sun = new THREE.DirectionalLight(0xffffff, 1.2);
-  sun.position.set(3, 8, 4);
-  group.add(sun);
-
-  return { group, hasBuildingGeometry };
+  // No baked lights: glTF/USDZ export silently drops HemisphereLight
+  // entirely (no ambient-light equivalent in the format) and doesn't
+  // reliably preserve a DirectionalLight's aim either — every mainstream
+  // glTF/USDZ viewer (AR Quick Look, Android Scene Viewer, model-viewer)
+  // already applies its own default environment lighting to arbitrary
+  // content, which is what actually makes this render correctly on a
+  // phone; relying on lights this export can't reliably carry just adds
+  // risk (see route-share-scene.ts's buildRouteShareScene for the same call).
+  return { group, hasBuildingGeometry: stats.piecesKept > 0, stats };
 }
 
-type Style = { color: THREE.Color; opacity: number; transparent: boolean };
+type Style = { color: THREE.Color; opacity: number; transparent: boolean; side: THREE.Side };
 
-/** Returns true if at least one mesh was added. */
+/**
+ * fragments' `getItemsMaterialDefinition()` types its `color` field as
+ * `THREE.Color`, but at runtime it is not reliably one — this crashed
+ * every real item's material construction (`style.color.clone is not a
+ * function`) for a model where fragments computes materials off-thread:
+ * the value crosses a `postMessage` structured-clone boundary, which keeps
+ * plain enumerable properties (`r`, `g`, `b`) but strips the class's
+ * prototype methods. Reconstructing from those numeric components instead
+ * of trusting the type declaration is what actually survives that.
+ */
+function safeColor(color: THREE.Color): THREE.Color {
+  if (typeof color.clone === "function") return color.clone();
+  const c = color as unknown as { r: number; g: number; b: number };
+  return new THREE.Color(c.r, c.g, c.b);
+}
+
+/** Adds this model's meshes to `group`, accumulating into `stats`. */
 async function addModelGeometry(
   group: THREE.Group,
   model: FragmentsModel,
-  clipBand: { minY: number; maxY: number } | null,
-): Promise<boolean> {
+  clipBands: ClipBand[] | null,
+  stats: ExportStats,
+): Promise<void> {
   model.object.updateMatrixWorld(true);
   const modelMatrix = model.object.matrixWorld;
 
-  // Prefer what's actually rendered (respects the storey filter and any
-  // excluded elements); fall back to everything if nothing has rendered
-  // yet — e.g. exporting immediately after load, before a frame has ticked.
-  let localIds = Array.from(model.visibleItems);
+  // See buildExportGroup's doc comment for why a scoped export must not
+  // start from visibleItems.
+  let localIds = clipBands ? [] : Array.from(model.visibleItems);
   if (localIds.length === 0) {
     localIds = await model.getLocalIds();
   }
-  if (localIds.length === 0) return false;
+  stats.items += localIds.length;
+  if (localIds.length === 0) return;
 
   const [geometryPerItem, materialDefs] = await Promise.all([
     model.getItemsGeometry(localIds, FULL_GEOMETRY_LOD),
@@ -141,32 +297,36 @@ async function addModelGeometry(
   for (const entry of materialDefs) {
     for (const localId of entry.localIds) {
       styleByLocalId.set(localId, {
-        color: entry.definition.color,
+        color: safeColor(entry.definition.color),
         opacity: entry.definition.opacity,
         transparent: entry.definition.transparent,
+        // A genuinely double-sided source element (glass panes, thin
+        // one-surface panels) needs DoubleSide or the export silently loses
+        // its back face — MeshStandardMaterial defaults to FrontSide.
+        side:
+          entry.definition.renderedFaces === RenderedFaces.TWO ? THREE.DoubleSide : THREE.FrontSide,
       });
     }
   }
 
-  let added = false;
   for (let i = 0; i < localIds.length; i++) {
     const parts = geometryPerItem[i];
     if (!parts) continue;
     const style = styleByLocalId.get(localIds[i]!);
     for (const part of parts) {
       try {
-        let rebuilt: THREE.Mesh | null = rebuildFromMeshData(part, modelMatrix, style);
-        if (rebuilt && clipBand) rebuilt = clipMeshToBand(rebuilt, clipBand);
-        if (rebuilt) {
-          group.add(rebuilt);
-          added = true;
+        const rebuilt = rebuildFromMeshData(part, modelMatrix, style);
+        if (!rebuilt) continue;
+        stats.partsRebuilt++;
+        for (const piece of clipMeshToBands(rebuilt, clipBands)) {
+          group.add(piece);
+          stats.piecesKept++;
         }
       } catch (err) {
         console.warn("Share export: skipping an item part that couldn't be rebuilt", err);
       }
     }
   }
-  return added;
 }
 
 function rebuildFromMeshData(
@@ -178,7 +338,10 @@ function rebuildFromMeshData(
   if (!part.transform) return null;
 
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(Float32Array.from(part.positions), 3));
+  geometry.setAttribute(
+    "position",
+    new THREE.BufferAttribute(Float32Array.from(part.positions), 3),
+  );
 
   if (part.normals && part.normals.length > 0) {
     // Signed-normalized — matches fragments' own live-scene normals (see
@@ -207,12 +370,13 @@ function rebuildFromMeshData(
     color: style ? style.color.clone() : new THREE.Color(0x808080),
     opacity: style?.opacity ?? 1,
     transparent: style?.transparent ?? false,
+    side: style?.side ?? THREE.FrontSide,
   });
 
   return new THREE.Mesh(geometry, material);
 }
 
-// --- Storey clip band ---
+// --- Storey clip bands ---
 //
 // The live viewer isolates one storey with `renderer.clippingPlanes` /
 // `material.clippingPlanes` (see applyStoreyFilter in that-open-runtime.ts)
@@ -220,13 +384,33 @@ function rebuildFromMeshData(
 // just isn't drawn, the object reads as an open/hollow cross-section, not a
 // sealed cut face. `model.visibleItems` (what scopes the export to begin
 // with) marks an item visible if ANY part of it renders, so an item that
-// merely *straddles* the band — e.g. a wall spanning two storeys — was
+// merely *straddles* a band — e.g. a wall spanning two storeys — was
 // being exported whole, unclipped, even though the live view only shows
 // the slice inside the band. These functions replicate that same
 // no-capping clip on the exported geometry so the two match.
 
 const CLIP_PLANE_NORMAL_MIN = new THREE.Vector3(0, 1, 0);
 const CLIP_PLANE_NORMAL_MAX = new THREE.Vector3(0, -1, 0);
+
+/**
+ * Clips a mesh against every band and keeps whatever survives any of them —
+ * `null` bands means "keep everything" (returns `[mesh]` unchanged). A mesh
+ * that spans two *kept* bands with an *excluded* gap between (e.g. a shaft
+ * running through floor 1 and floor 5 on a route that skips floors 2-4)
+ * correctly comes back as two separate pieces, one per band, with nothing
+ * invented in the gap — each independent call to clipMeshToBand already
+ * culls whatever's outside its own band, so no dedup/merge step is needed
+ * here beyond collecting the non-null results.
+ */
+function clipMeshToBands(mesh: THREE.Mesh, clipBands: ClipBand[] | null): THREE.Mesh[] {
+  if (!clipBands) return [mesh];
+  const pieces: THREE.Mesh[] = [];
+  for (const band of clipBands) {
+    const piece = clipMeshToBand(mesh, band);
+    if (piece) pieces.push(piece);
+  }
+  return pieces;
+}
 
 /**
  * Clips a mesh's geometry to `clipBand` in place-equivalent fashion
@@ -237,7 +421,7 @@ const CLIP_PLANE_NORMAL_MAX = new THREE.Vector3(0, -1, 0);
  * (culled entirely), and a new mesh with recomputed normals when it
  * actually straddles a plane and needs real clipping.
  */
-function clipMeshToBand(mesh: THREE.Mesh, clipBand: { minY: number; maxY: number }): THREE.Mesh | null {
+function clipMeshToBand(mesh: THREE.Mesh, clipBand: ClipBand): THREE.Mesh | null {
   const positionAttr = mesh.geometry.getAttribute("position") as THREE.BufferAttribute;
   const positions = positionAttr.array as Float32Array;
   if (positions.length === 0) return null;
@@ -393,11 +577,21 @@ function cloneIndexAttribute(index: THREE.BufferAttribute): THREE.BufferAttribut
 }
 
 function extractStyle(material: THREE.Material): Style {
-  const mat = material as unknown as { color?: unknown; opacity?: number; transparent?: boolean };
+  const mat = material as unknown as {
+    color?: unknown;
+    opacity?: number;
+    transparent?: boolean;
+    side?: THREE.Side;
+  };
   return {
     color: mat.color instanceof THREE.Color ? mat.color.clone() : new THREE.Color(0x808080),
     opacity: typeof mat.opacity === "number" ? mat.opacity : 1,
     transparent: Boolean(mat.transparent),
+    // Carries over the live tube material's own side (currently always
+    // FrontSide in practice — TubeGeometry is a closed tube — but reading it
+    // rather than hardcoding keeps this consistent with the fragments path
+    // above if that ever changes).
+    side: mat.side ?? THREE.FrontSide,
   };
 }
 
@@ -407,7 +601,10 @@ function rebuildPlainMesh(mesh: THREE.Mesh): THREE.Mesh | null {
   if (!hasBackingArray(positionAttr) || positionAttr.count === 0) return null;
 
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(extractAttribute(positionAttr, 3), 3));
+  geometry.setAttribute(
+    "position",
+    new THREE.BufferAttribute(extractAttribute(positionAttr, 3), 3),
+  );
 
   const normalAttr = src.getAttribute("normal");
   if (hasBackingArray(normalAttr)) {
@@ -429,7 +626,9 @@ function rebuildPlainMesh(mesh: THREE.Mesh): THREE.Mesh | null {
   geometry.applyMatrix4(mesh.matrixWorld);
 
   const srcMaterial = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
-  const style = srcMaterial ? extractStyle(srcMaterial) : { color: new THREE.Color(0x808080), opacity: 1, transparent: false };
+  const style = srcMaterial
+    ? extractStyle(srcMaterial)
+    : { color: new THREE.Color(0x808080), opacity: 1, transparent: false, side: THREE.FrontSide };
   const material = new THREE.MeshStandardMaterial(style);
 
   return new THREE.Mesh(geometry, material);

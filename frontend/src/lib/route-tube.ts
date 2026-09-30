@@ -32,7 +32,7 @@ import type { ConnectivityGraph, RouteResult } from "@/types/graph";
 /** Height of tube centreline above slab (metres). */
 export const ROUTE_TUBE_HEIGHT_OFFSET_M = 0.7;
 
-function footprintPlanBounds(doc: FootprintsDocument): PlanBounds | null {
+export function footprintPlanBounds(doc: FootprintsDocument): PlanBounds | null {
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
@@ -64,7 +64,7 @@ function footprintPlanBounds(doc: FootprintsDocument): PlanBounds | null {
   return { minX, maxX, minY, maxY };
 }
 
-function storeysMetres(
+export function storeysMetres(
   doc: FootprintsDocument,
   modelHeightM?: number,
 ): Array<{ global_id: string; elevation: number }> {
@@ -84,7 +84,7 @@ function storeysMetres(
   }));
 }
 
-function spaceStoreyIds(doc: FootprintsDocument): string[] {
+export function spaceStoreyIds(doc: FootprintsDocument): string[] {
   const ids: string[] = [];
   for (const s of doc.spaces) {
     if (s.incomplete || s.polygon.length < 3 || !s.storey_global_id) continue;

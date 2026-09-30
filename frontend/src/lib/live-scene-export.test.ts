@@ -1,8 +1,23 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as THREE from "three";
-import { buildExportGroup, type ExportableGeometrySource } from "./live-scene-export.ts";
+import {
+  buildExportGroup,
+  buildRouteStoreyClipBands,
+  routeEndpointsInLiveScene,
+  type ClipBand,
+  type ExportableGeometrySource,
+} from "./live-scene-export.ts";
+import { RenderedFaces } from "@thatopen/fragments";
 import type { FragmentsModel, MeshData } from "@thatopen/fragments";
+import type { FootprintsDocument } from "@/types/footprints";
+import type { ThreeAabb } from "@/lib/viewer-camera-pose";
+import { buildPlanRouteTubePolylines } from "@/lib/route-tube";
+
+/** Test convenience: most cases don't care about clip bands at all. */
+function build(source: ExportableGeometrySource, clipBands: ClipBand[] | null = null) {
+  return buildExportGroup(source, clipBands);
+}
 
 /**
  * Minimal stand-in for a real FragmentsModel, shaped to match the actual
@@ -12,11 +27,18 @@ import type { FragmentsModel, MeshData } from "@thatopen/fragments";
  * uses this exact API the same way: `mesh.applyMatrix4(transform);
  * mesh.applyMatrix4(model.object.matrixWorld)`).
  */
+type FakeStyle = {
+  color: THREE.Color;
+  opacity: number;
+  transparent: boolean;
+  renderedFaces?: RenderedFaces;
+};
+
 function fakeModel(opts: {
   visibleItems?: number[];
   allLocalIds?: number[];
   geometryByLocalId: Map<number, MeshData[]>;
-  styleByLocalId?: Map<number, { color: THREE.Color; opacity: number; transparent: boolean }>;
+  styleByLocalId?: Map<number, FakeStyle>;
   objectTransform?: THREE.Matrix4;
 }): FragmentsModel {
   const object = new THREE.Object3D();
@@ -36,7 +58,7 @@ function fakeModel(opts: {
     async getItemsMaterialDefinition(localIds: number[]) {
       const styles = opts.styleByLocalId;
       if (!styles) return [];
-      const out: { definition: { color: THREE.Color; opacity: number; transparent: boolean }; localIds: number[] }[] = [];
+      const out: { definition: FakeStyle; localIds: number[] }[] = [];
       for (const id of localIds) {
         const style = styles.get(id);
         if (style) out.push({ definition: style, localIds: [id] });
@@ -74,7 +96,9 @@ function boxMeshDataSpanningY(minY: number, maxY: number): MeshData {
 }
 
 function yBounds(mesh: THREE.Mesh): { minY: number; maxY: number } {
-  const bbox = new THREE.Box3().setFromBufferAttribute(mesh.geometry.getAttribute("position") as THREE.BufferAttribute);
+  const bbox = new THREE.Box3().setFromBufferAttribute(
+    mesh.geometry.getAttribute("position") as THREE.BufferAttribute,
+  );
   return { minY: bbox.min.y, maxY: bbox.max.y };
 }
 
@@ -85,18 +109,19 @@ function tubeMesh(): THREE.Mesh {
     new THREE.Vector3(2, 1, 0),
   ]);
   const geometry = new THREE.TubeGeometry(curve, 8, 0.1, 6, false);
-  return new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color: 0x1d4ed8, transparent: true, opacity: 0.85 }));
+  return new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ color: 0x1d4ed8, transparent: true, opacity: 0.85 }),
+  );
 }
 
 function makeSource(opts: {
   fragmentsModels?: FragmentsModel[];
   plainObjects?: THREE.Object3D[];
-  clipBand?: { minY: number; maxY: number } | null;
 }): ExportableGeometrySource {
   return {
     fragmentsModels: opts.fragmentsModels ?? [],
     plainObjects: opts.plainObjects ?? [],
-    clipBand: opts.clipBand ?? null,
   };
 }
 
@@ -109,11 +134,77 @@ describe("buildExportGroup — fragments models (async data API)", () => {
       styleByLocalId: new Map([[1, { color, opacity: 1, transparent: false }]]),
     });
 
-    const { group, hasBuildingGeometry } = await buildExportGroup(makeSource({ fragmentsModels: [model] }));
+    const { group, hasBuildingGeometry } = await build(makeSource({ fragmentsModels: [model] }));
     assert.equal(hasBuildingGeometry, true);
     const meshes = group.children.filter((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh[];
     assert.equal(meshes.length, 1);
     assert.equal((meshes[0]!.material as THREE.MeshStandardMaterial).color.getHex(), 0xff0000);
+  });
+
+  it("carries a double-sided source material (RenderedFaces.TWO) into DoubleSide on export", async () => {
+    const model = fakeModel({
+      visibleItems: [1],
+      geometryByLocalId: new Map([[1, [boxMeshData()]]]),
+      styleByLocalId: new Map([
+        [
+          1,
+          {
+            color: new THREE.Color(0xffffff),
+            opacity: 1,
+            transparent: false,
+            renderedFaces: RenderedFaces.TWO,
+          },
+        ],
+      ]),
+    });
+
+    const { group } = await build(makeSource({ fragmentsModels: [model] }));
+    const mesh = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
+    assert.equal((mesh.material as THREE.MeshStandardMaterial).side, THREE.DoubleSide);
+  });
+
+  it("defaults a single-sided source material (RenderedFaces.ONE) to FrontSide", async () => {
+    const model = fakeModel({
+      visibleItems: [1],
+      geometryByLocalId: new Map([[1, [boxMeshData()]]]),
+      styleByLocalId: new Map([
+        [
+          1,
+          {
+            color: new THREE.Color(0xffffff),
+            opacity: 1,
+            transparent: false,
+            renderedFaces: RenderedFaces.ONE,
+          },
+        ],
+      ]),
+    });
+
+    const { group } = await build(makeSource({ fragmentsModels: [model] }));
+    const mesh = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
+    assert.equal((mesh.material as THREE.MeshStandardMaterial).side, THREE.FrontSide);
+  });
+
+  it("rebuilds an item whose material color crossed a structured-clone boundary (plain {r,g,b}, no .clone)", async () => {
+    // fragments computes materials off-thread for some models; the value
+    // that reaches getItemsMaterialDefinition() then crosses a postMessage
+    // structured-clone boundary, which keeps plain enumerable properties
+    // but strips the THREE.Color prototype (no .clone method) — this
+    // crashed every real item's material construction for such a model.
+    const plainColor = { r: 0.2, g: 0.4, b: 0.6 } as unknown as THREE.Color;
+    const model = fakeModel({
+      visibleItems: [1],
+      geometryByLocalId: new Map([[1, [boxMeshData()]]]),
+      styleByLocalId: new Map([[1, { color: plainColor, opacity: 1, transparent: false }]]),
+    });
+
+    const { group, hasBuildingGeometry } = await build(makeSource({ fragmentsModels: [model] }));
+    assert.equal(hasBuildingGeometry, true, "should not silently drop the item");
+    const mesh = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
+    const color = (mesh.material as THREE.MeshStandardMaterial).color;
+    assert.ok(Math.abs(color.r - 0.2) < 1e-6);
+    assert.ok(Math.abs(color.g - 0.4) < 1e-6);
+    assert.ok(Math.abs(color.b - 0.6) < 1e-6);
   });
 
   it("composes the item's own transform with the model's world transform (modelMatrix * itemTransform)", async () => {
@@ -126,9 +217,11 @@ describe("buildExportGroup — fragments models (async data API)", () => {
       objectTransform: modelTransform,
     });
 
-    const { group } = await buildExportGroup(makeSource({ fragmentsModels: [model] }));
+    const { group } = await build(makeSource({ fragmentsModels: [model] }));
     const mesh = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
-    const bbox = new THREE.Box3().setFromBufferAttribute(mesh.geometry.getAttribute("position") as THREE.BufferAttribute);
+    const bbox = new THREE.Box3().setFromBufferAttribute(
+      mesh.geometry.getAttribute("position") as THREE.BufferAttribute,
+    );
     const center = bbox.getCenter(new THREE.Vector3());
     assert.ok(Math.abs(center.x - 105) < 1e-6, `expected x~105, got ${center.x}`);
   });
@@ -139,7 +232,7 @@ describe("buildExportGroup — fragments models (async data API)", () => {
       allLocalIds: [7],
       geometryByLocalId: new Map([[7, [boxMeshData()]]]),
     });
-    const { hasBuildingGeometry } = await buildExportGroup(makeSource({ fragmentsModels: [model] }));
+    const { hasBuildingGeometry } = await build(makeSource({ fragmentsModels: [model] }));
     assert.equal(hasBuildingGeometry, true);
   });
 
@@ -149,7 +242,7 @@ describe("buildExportGroup — fragments models (async data API)", () => {
       geometryByLocalId: new Map([[1, [boxMeshData()]]]),
       // no styleByLocalId at all
     });
-    const { group } = await buildExportGroup(makeSource({ fragmentsModels: [model] }));
+    const { group } = await build(makeSource({ fragmentsModels: [model] }));
     const mesh = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
     const material = mesh.material as THREE.MeshStandardMaterial;
     assert.equal(material.opacity, 1);
@@ -162,7 +255,7 @@ describe("buildExportGroup — fragments models (async data API)", () => {
       visibleItems: [1],
       geometryByLocalId: new Map([[1, [badPart]]]),
     });
-    const { group, hasBuildingGeometry } = await buildExportGroup(makeSource({ fragmentsModels: [model] }));
+    const { group, hasBuildingGeometry } = await build(makeSource({ fragmentsModels: [model] }));
     assert.equal(hasBuildingGeometry, false);
     assert.equal(group.children.filter((c) => (c as THREE.Mesh).isMesh).length, 0);
   });
@@ -186,7 +279,9 @@ describe("buildExportGroup — fragments models (async data API)", () => {
       },
     } as unknown as FragmentsModel;
 
-    const { group, hasBuildingGeometry } = await buildExportGroup(makeSource({ fragmentsModels: [broken, good] }));
+    const { group, hasBuildingGeometry } = await build(
+      makeSource({ fragmentsModels: [broken, good] }),
+    );
     assert.equal(hasBuildingGeometry, true);
     assert.equal(group.children.filter((c) => (c as THREE.Mesh).isMesh).length, 1);
   });
@@ -196,12 +291,12 @@ describe("buildExportGroup — fragments models (async data API)", () => {
       visibleItems: [1],
       geometryByLocalId: new Map([[1, [boxMeshData(), boxMeshData()]]]),
     });
-    const { group } = await buildExportGroup(makeSource({ fragmentsModels: [model] }));
+    const { group } = await build(makeSource({ fragmentsModels: [model] }));
     assert.equal(group.children.filter((c) => (c as THREE.Mesh).isMesh).length, 2);
   });
 
   it("hasBuildingGeometry is false with only plainObjects (route tube) and no fragments geometry", async () => {
-    const { hasBuildingGeometry } = await buildExportGroup(makeSource({ plainObjects: [tubeMesh()] }));
+    const { hasBuildingGeometry } = await build(makeSource({ plainObjects: [tubeMesh()] }));
     assert.equal(hasBuildingGeometry, false);
   });
 });
@@ -209,7 +304,7 @@ describe("buildExportGroup — fragments models (async data API)", () => {
 describe("buildExportGroup — plain objects (route tube)", () => {
   it("rebuilds the tube with a proper integer index (not Float32) and preserves transparency", async () => {
     const tube = tubeMesh();
-    const { group } = await buildExportGroup(makeSource({ plainObjects: [tube] }));
+    const { group } = await build(makeSource({ plainObjects: [tube] }));
     const rebuilt = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
     assert.ok(rebuilt, "tube should be rebuilt");
 
@@ -225,13 +320,21 @@ describe("buildExportGroup — plain objects (route tube)", () => {
     assert.ok(Math.abs(material.opacity - 0.85) < 1e-6);
   });
 
+  it("carries the live source material's side onto the rebuilt mesh", async () => {
+    const tube = tubeMesh();
+    (tube.material as THREE.MeshBasicMaterial).side = THREE.DoubleSide;
+    const { group } = await build(makeSource({ plainObjects: [tube] }));
+    const rebuilt = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
+    assert.equal((rebuilt.material as THREE.MeshStandardMaterial).side, THREE.DoubleSide);
+  });
+
   it("doesn't reparent or mutate the live tube object", async () => {
     const scene = new THREE.Scene();
     const tube = tubeMesh();
     scene.add(tube);
     const originalGeometry = tube.geometry;
 
-    await buildExportGroup(makeSource({ plainObjects: [tube] }));
+    await build(makeSource({ plainObjects: [tube] }));
 
     assert.equal(tube.parent, scene);
     assert.equal(tube.geometry, originalGeometry);
@@ -244,35 +347,41 @@ describe("buildExportGroup — plain objects (route tube)", () => {
 
     let result: Awaited<ReturnType<typeof buildExportGroup>> | undefined;
     await assert.doesNotReject(async () => {
-      result = await buildExportGroup(makeSource({ plainObjects: [tube] }));
+      result = await build(makeSource({ plainObjects: [tube] }));
     });
     assert.equal(result!.group.children.filter((c) => (c as THREE.Mesh).isMesh).length, 0);
   });
 });
 
 describe("buildExportGroup — general", () => {
-  it("always includes exactly two lights regardless of input", async () => {
-    const { group } = await buildExportGroup(makeSource({}));
+  it("never bakes any lights into the export", async () => {
+    // glTF/USDZ export silently drops HemisphereLight (no ambient-light
+    // equivalent in the format) and doesn't reliably preserve a
+    // DirectionalLight's aim either — every mainstream glTF/USDZ viewer
+    // already applies its own default environment lighting to arbitrary
+    // content, so this export deliberately brings none of its own. See
+    // buildExportGroup's own comment for the full reasoning.
+    const { group } = await build(makeSource({}));
     const lights = group.children.filter((c) => (c as THREE.Light).isLight);
-    assert.equal(lights.length, 2);
+    assert.equal(lights.length, 0);
   });
 
-  it("returns an empty (lights-only), non-building group for a fully empty source", async () => {
-    const { group, hasBuildingGeometry } = await buildExportGroup(makeSource({}));
+  it("returns a fully empty, non-building group for a fully empty source", async () => {
+    const { group, hasBuildingGeometry } = await build(makeSource({}));
     assert.equal(hasBuildingGeometry, false);
-    assert.equal(group.children.filter((c) => (c as THREE.Mesh).isMesh).length, 0);
+    assert.equal(group.children.length, 0);
   });
 });
 
-describe("buildExportGroup — storey clip band", () => {
+describe("buildExportGroup — storey clip bands", () => {
   it("leaves a fully-inside item's geometry untouched (fast path, no clip performed)", async () => {
     const model = fakeModel({
       visibleItems: [1],
       geometryByLocalId: new Map([[1, [boxMeshDataSpanningY(0, 1)]]]),
     });
-    const { group } = await buildExportGroup(
-      makeSource({ fragmentsModels: [model], clipBand: { minY: -5, maxY: 5 } }),
-    );
+    const { group } = await build(makeSource({ fragmentsModels: [model] }), [
+      { minY: -5, maxY: 5 },
+    ]);
     const mesh = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
     const bounds = yBounds(mesh);
     assert.ok(Math.abs(bounds.minY - 0) < 1e-6);
@@ -288,9 +397,7 @@ describe("buildExportGroup — storey clip band", () => {
       visibleItems: [1],
       geometryByLocalId: new Map([[1, [boxMeshDataSpanningY(-1, 3)]]]),
     });
-    const { group } = await buildExportGroup(
-      makeSource({ fragmentsModels: [model], clipBand: { minY: 0, maxY: 1 } }),
-    );
+    const { group } = await build(makeSource({ fragmentsModels: [model] }), [{ minY: 0, maxY: 1 }]);
     const mesh = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
     assert.ok(mesh, "expected a clipped mesh to remain, not be fully culled");
     const bounds = yBounds(mesh);
@@ -303,33 +410,299 @@ describe("buildExportGroup — storey clip band", () => {
       visibleItems: [1],
       geometryByLocalId: new Map([[1, [boxMeshDataSpanningY(10, 11)]]]),
     });
-    const { group, hasBuildingGeometry } = await buildExportGroup(
-      makeSource({ fragmentsModels: [model], clipBand: { minY: 0, maxY: 1 } }),
-    );
+    const { group, hasBuildingGeometry } = await build(makeSource({ fragmentsModels: [model] }), [
+      { minY: 0, maxY: 1 },
+    ]);
     assert.equal(hasBuildingGeometry, false);
     assert.equal(group.children.filter((c) => (c as THREE.Mesh).isMesh).length, 0);
   });
 
   it("also clips the route tube (a global renderer clip plane applies to it live too, not just fragments materials)", async () => {
     // Tube spans y=0..1 (see tubeMesh's curve points); isolate y: 0..0.4.
-    const { group } = await buildExportGroup(
-      makeSource({ plainObjects: [tubeMesh()], clipBand: { minY: 0, maxY: 0.4 } }),
-    );
+    const { group } = await build(makeSource({ plainObjects: [tubeMesh()] }), [
+      { minY: 0, maxY: 0.4 },
+    ]);
     const mesh = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
     assert.ok(mesh, "expected a clipped tube mesh to remain");
     const bounds = yBounds(mesh);
     assert.ok(bounds.maxY <= 0.4 + 1e-6, `clipped tube maxY should be <= 0.4, got ${bounds.maxY}`);
   });
 
-  it("does nothing when clipBand is null (no active storey filter)", async () => {
+  it("keeps geometry spanning two disjoint kept bands as two separate pieces, nothing in the excluded gap", async () => {
+    // A shaft-like item running continuously from y=0 to y=10 (e.g. floor 1
+    // through floor 5), with only floor 1 (y: 0..1) and floor 5 (y: 9..10)
+    // actually visited by the route — floors 2-4 (y: 1..9) excluded. No
+    // capping means each kept slice comes back as its own separate mesh.
+    const model = fakeModel({
+      visibleItems: [1],
+      geometryByLocalId: new Map([[1, [boxMeshDataSpanningY(0, 10)]]]),
+    });
+    const { group } = await build(makeSource({ fragmentsModels: [model] }), [
+      { minY: 0, maxY: 1 },
+      { minY: 9, maxY: 10 },
+    ]);
+    const meshes = group.children.filter((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh[];
+    assert.equal(meshes.length, 2, "expected two separate pieces, one per kept band");
+    const boundsByMesh = meshes.map(yBounds).sort((a, b) => a.minY - b.minY);
+    assert.ok(Math.abs(boundsByMesh[0]!.minY - 0) < 1e-6);
+    assert.ok(boundsByMesh[0]!.maxY <= 1 + 1e-6);
+    assert.ok(boundsByMesh[1]!.minY >= 9 - 1e-6);
+    assert.ok(Math.abs(boundsByMesh[1]!.maxY - 10) < 1e-6);
+  });
+
+  it("exports the route's storeys even when the viewer is only showing a different storey", async () => {
+    // Viewer isolated to floor 3 (only item 3 is on screen); the route is
+    // on floors 1 and 5. Scoping by visibleItems exported nothing here and
+    // silently fell back to the footprint proxy.
+    const model = fakeModel({
+      visibleItems: [3],
+      geometryByLocalId: new Map([
+        [1, [boxMeshDataSpanningY(0, 1)]],
+        [3, [boxMeshDataSpanningY(4, 5)]],
+        [5, [boxMeshDataSpanningY(9, 10)]],
+      ]),
+    });
+    const { group, hasBuildingGeometry, stats } = await build(
+      makeSource({ fragmentsModels: [model] }),
+      [
+        { minY: 0, maxY: 1 },
+        { minY: 9, maxY: 10 },
+      ],
+    );
+    assert.equal(hasBuildingGeometry, true);
+    assert.equal(stats.items, 3);
+    const spans = (group.children.filter((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh[])
+      .map(yBounds)
+      .sort((a, b) => a.minY - b.minY);
+    assert.equal(spans.length, 2, "floor 1 and floor 5 items only, not the on-screen floor 3 item");
+    assert.ok(Math.abs(spans[0]!.minY - 0) < 1e-6);
+    assert.ok(Math.abs(spans[1]!.minY - 9) < 1e-6);
+  });
+
+  it("does nothing when clipBands is null (no scope computed)", async () => {
     const model = fakeModel({
       visibleItems: [1],
       geometryByLocalId: new Map([[1, [boxMeshDataSpanningY(-1, 3)]]]),
     });
-    const { group } = await buildExportGroup(makeSource({ fragmentsModels: [model], clipBand: null }));
+    const { group } = await build(makeSource({ fragmentsModels: [model] }), null);
     const mesh = group.children.find((c) => (c as THREE.Mesh).isMesh) as THREE.Mesh;
     const bounds = yBounds(mesh);
     assert.ok(Math.abs(bounds.minY - -1) < 1e-6);
     assert.ok(Math.abs(bounds.maxY - 3) < 1e-6);
+  });
+});
+
+describe("buildRouteStoreyClipBands", () => {
+  // Five evenly-spaced storeys (3m apart), one room on the ground floor
+  // (needed for footprintPlanBounds) and one on the top floor, so a route
+  // "from floor 1 to floor 5" has real plan bounds to work from.
+  const footprints: FootprintsDocument = {
+    schema_version: "1.0",
+    model_id: "m1",
+    coordinate_system: "ifc_world_xy_metres",
+    storeys: [
+      { global_id: "s1", name: "L1", elevation: 0 },
+      { global_id: "s2", name: "L2", elevation: 3 },
+      { global_id: "s3", name: "L3", elevation: 6 },
+      { global_id: "s4", name: "L4", elevation: 9 },
+      { global_id: "s5", name: "L5", elevation: 12 },
+    ],
+    spaces: [
+      {
+        global_id: "sp1",
+        name: "Room 1",
+        storey_global_id: "s1",
+        polygon: [
+          { x: 0, y: 0 },
+          { x: 5, y: 0 },
+          { x: 5, y: 5 },
+          { x: 0, y: 5 },
+        ],
+        incomplete: false,
+        method: "ifc_mesh_xy_outline",
+      },
+      {
+        global_id: "sp5",
+        name: "Room 5",
+        storey_global_id: "s5",
+        polygon: [
+          { x: 0, y: 0 },
+          { x: 5, y: 0 },
+          { x: 5, y: 5 },
+          { x: 0, y: 5 },
+        ],
+        incomplete: false,
+        method: "ifc_mesh_xy_outline",
+      },
+    ],
+    doors: [],
+  };
+  const modelBounds: ThreeAabb = { minX: 0, maxX: 5, minY: 0, maxY: 15, minZ: -5, maxZ: 0 };
+
+  it("returns null when modelBounds is null", () => {
+    const bands = buildRouteStoreyClipBands({
+      footprints,
+      storeyIds: new Set(["s1"]),
+      modelBounds: null,
+      coordInverse: null,
+    });
+    assert.equal(bands, null);
+  });
+
+  it("returns null when no storeys are requested", () => {
+    const bands = buildRouteStoreyClipBands({
+      footprints,
+      storeyIds: new Set(),
+      modelBounds,
+      coordInverse: null,
+    });
+    assert.equal(bands, null);
+  });
+
+  it("returns one band per requested storey, skipping the ones in between", () => {
+    // A route from floor 1 to floor 5 riding stairs — only those two
+    // storeys requested, floors 2-4 deliberately left out.
+    const bands = buildRouteStoreyClipBands({
+      footprints,
+      storeyIds: new Set(["s1", "s5"]),
+      modelBounds,
+      coordInverse: null,
+    });
+    assert.ok(bands, "expected two bands, not null");
+    assert.equal(bands!.length, 2);
+  });
+
+  it("orders bands consistently with storey elevation (the higher storey's band sits above the lower one's)", () => {
+    const bands = buildRouteStoreyClipBands({
+      footprints,
+      storeyIds: new Set(["s1", "s5"]),
+      modelBounds,
+      coordInverse: null,
+    });
+    assert.ok(bands);
+    const [first, second] = [...bands!].sort((a, b) => a.minY - b.minY);
+    assert.ok(first!.maxY <= second!.minY + 1e-6, "floor 1's band must not overlap floor 5's");
+  });
+
+  it("keeps a single storey's band roughly centred on its own elevation when there's no coordination matrix", () => {
+    // No coordInverse -> the no-coord fallback path, which (with
+    // modelBounds.minY aligned to the lowest storey's elevation, both 0
+    // here) passes storey elevation through to Three Y directly.
+    const bands = buildRouteStoreyClipBands({
+      footprints,
+      storeyIds: new Set(["s1"]),
+      modelBounds,
+      coordInverse: null,
+    });
+    assert.ok(bands);
+    assert.equal(bands!.length, 1);
+    const [band] = bands!;
+    // Formula: minElevM = elev - 0.25, maxElevM = elev + max(nextElev-elev, 1.5)*0.78,
+    // nextElev = 3 (storey s2) here, so minY ~ -0.25, maxY ~ 3*0.78 = 2.34.
+    assert.ok(Math.abs(band!.minY - -0.25) < 0.1, `expected minY near -0.25, got ${band!.minY}`);
+    assert.ok(Math.abs(band!.maxY - 2.34) < 0.1, `expected maxY near 2.34, got ${band!.maxY}`);
+  });
+});
+
+describe("routeEndpointsInLiveScene", () => {
+  const footprints: FootprintsDocument = {
+    schema_version: "1.0",
+    model_id: "m1",
+    coordinate_system: "ifc_world_xy_metres",
+    storeys: [
+      { global_id: "s1", name: "L1", elevation: 0 },
+      { global_id: "s2", name: "L2", elevation: 3 },
+    ],
+    spaces: [
+      {
+        global_id: "sp1",
+        name: "Room 1",
+        storey_global_id: "s1",
+        polygon: [
+          { x: 0, y: 0 },
+          { x: 10, y: 0 },
+          { x: 10, y: 10 },
+          { x: 0, y: 10 },
+        ],
+        incomplete: false,
+        method: "ifc_mesh_xy_outline",
+      },
+    ],
+    doors: [],
+  };
+  const modelBounds: ThreeAabb = { minX: 0, maxX: 10, minY: 0, maxY: 6, minZ: -10, maxZ: 0 };
+
+  it("lands on the live tube's own first and last points for a cross-storey route", () => {
+    const route = {
+      storeyId: "s1",
+      start: { x: 1, y: 1 },
+      end: { x: 8, y: 9 },
+      endStoreyId: "s2",
+      points: null,
+      segments: [
+        {
+          storeyId: "s1",
+          points: [
+            { x: 1, y: 1 },
+            { x: 5, y: 5 },
+          ],
+        },
+        {
+          storeyId: "s2",
+          points: [
+            { x: 5, y: 5 },
+            { x: 8, y: 9 },
+          ],
+        },
+      ],
+      graphNodeIds: null,
+    } as never;
+    const ends = routeEndpointsInLiveScene({ route, footprints, modelBounds, coordInverse: null });
+    assert.ok(ends);
+    const tubeStart = buildPlanRouteTubePolylines({
+      points: [
+        { x: 1, y: 1 },
+        { x: 5, y: 5 },
+      ],
+      storeyId: "s1",
+      footprints,
+      modelBounds,
+      coordInverse: null,
+    })![0]![0]!;
+    const tubeEndLine = buildPlanRouteTubePolylines({
+      points: [
+        { x: 5, y: 5 },
+        { x: 8, y: 9 },
+      ],
+      storeyId: "s2",
+      footprints,
+      modelBounds,
+      coordInverse: null,
+    })![0]!;
+    const tubeEnd = tubeEndLine[tubeEndLine.length - 1]!;
+    assert.ok(
+      ends!.start.distanceTo(new THREE.Vector3(tubeStart.x, tubeStart.y, tubeStart.z)) < 1e-9,
+    );
+    assert.ok(ends!.end.distanceTo(new THREE.Vector3(tubeEnd.x, tubeEnd.y, tubeEnd.z)) < 1e-9);
+    assert.ok(ends!.end.y > ends!.start.y, "end is on the upper storey");
+  });
+
+  it("returns null without model bounds", () => {
+    const route = {
+      storeyId: "s1",
+      start: { x: 1, y: 1 },
+      end: { x: 2, y: 2 },
+      endStoreyId: "s1",
+      points: [
+        { x: 1, y: 1 },
+        { x: 2, y: 2 },
+      ],
+      segments: null,
+      graphNodeIds: null,
+    } as never;
+    assert.equal(
+      routeEndpointsInLiveScene({ route, footprints, modelBounds: null, coordInverse: null }),
+      null,
+    );
   });
 });
